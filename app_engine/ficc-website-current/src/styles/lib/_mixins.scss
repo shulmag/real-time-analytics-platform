@@ -1,0 +1,123 @@
+@use "./theme" as *;
+
+
+// Breakpoints
+@mixin screen($size: md) {
+  // Tablet Portrait
+  @if $size == sm {
+    @media (min-width: 768px) {
+      @content;
+    }
+    // Tablet Landscape / Small Desktop
+  } @else if $size == md {
+    @media (min-width: 1024px) {
+      @content;
+    }
+    // Large Desktop
+  } @else if $size == lg {
+    @media (min-width: 1650px) {
+      @content;
+    }
+    // Large Desktop
+  } @else {
+    @warn "@include screen([sm, md, lg])";
+  }
+}
+
+// Hover, only in Desktop
+@mixin hover($pseudo: null) {
+  
+  @if $pseudo {
+    @media (pointer: fine) {
+      &:hover::#{$pseudo} {
+        @content;
+      }
+    }
+    &:focus::#{$pseudo} {
+      @content;
+    }
+  } @else {
+    @media (pointer: fine) {
+      &:hover {
+        @content;
+      }
+    }
+    &:focus {
+      @content;
+    }
+  }
+}
+
+
+/*
+ * Grid
+ */
+
+@mixin col($arg: false) {
+  @if ($arg) {
+    grid-column: $arg;
+  } @else {
+    grid-column: 1 / -1;
+  }
+}
+
+
+/*
+ * Spacing
+ */
+
+%buffer {
+  padding-block-start: 60px;
+
+  @include screen {
+    padding-block-start: 120px;
+  }
+}
+
+@mixin region-buffer {
+  @extend %buffer;
+}
+
+
+/*
+ * Decorations
+ */
+
+@mixin underline {
+  display: inline-block;
+  color: color('text.secondary');
+
+  &::after {
+    display: block;
+    inline-size: 100%;
+    block-size: 2px;
+    position: relative;
+    top: -.1em;
+    inset-block-start: -.1em;
+    content: '';
+    background: color('accent');
+  }
+}
+
+
+/* 
+ * Image Ratio
+ */
+
+ @mixin ratio($arg) {
+  contain: content;
+  overflow: hidden;
+
+  &::before {
+    display: block;
+    inline-size: 100%;
+    content: '';
+    padding-block-start: $arg;
+  }
+
+  img {
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+  }
+}

@@ -1,0 +1,30 @@
+'''
+Description: Functions that allow filtering of the entire list of CUSIPs.
+'''
+from tqdm import tqdm
+
+import pandas as pd
+
+from auxiliary_variables import GOOGLE_CLOUD_BUCKET, NOT_OUTSTANDING_CUSIPS_PICKLE_FILENAME, STORAGE_CLIENT, TESTING
+from auxiliary_functions import download_pickle_file, get_feature_value
+
+
+def is_outstanding(reference_data):
+    '''This condition is taken directly from `ficc/app_engine/demo/server/modules/data_preparation_for_pricing.py::get_data_for_single_cusip(...).'''
+    outstanding_indicator = get_feature_value(reference_data, 'outstanding_indicator')
+    return pd.notna(outstanding_indicator) and outstanding_indicator == True    # must use `==` instead of `is` since the data type is `np.bool_` and `is` checks if it is the exact same object as the Python boolean literal
+
+
+def get_not_outstanding_cusips_set():
+    not_outstanding_cusips_set = download_pickle_file(STORAGE_CLIENT, GOOGLE_CLOUD_BUCKET, NOT_OUTSTANDING_CUSIPS_PICKLE_FILENAME)
+    return set() if not_outstanding_cusips_set is None else not_outstanding_cusips_set
+
+
+def remove_not_outstanding_cusips(cusip_list: list, use_pickle_file: bool = True):
+    '''Use the pickle file storing all of the not outstanding CUSIPs to filter out `cusip_list`.'''
+    assert use_pickle_file is True, 'Do not yet have functionality for not using the pickle file, i.e., `use_pickle_file` must be `True`'
+    not_outstanding_cusips_set = get_not_outstanding_cusips_set()
+    num_cusips = len(cusip_list)
+    cusip_list = [cusip for cusip in tqdm(cusip_list, total=len(cusip_list), disable=not TESTING) if cusip not in not_outstanding_cusips_set]
+    print(f'{num_cusips - len(cusip_list)} CUSIPs were removed because these CUSIPs are not outstanding')
+    return cusip_list

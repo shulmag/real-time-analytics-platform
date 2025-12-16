@@ -1,0 +1,156 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "b047f41b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import functions_framework\n",
+    "\n",
+    "import os\n",
+    "import logging as python_logging    # to not confuse with google.cloud.logging\n",
+    "from functools import wraps\n",
+    "import time\n",
+    "from datetime import date, timedelta, datetime\n",
+    "from dateutil.relativedelta import relativedelta\n",
+    "import json\n",
+    "import requests\n",
+    "\n",
+    "from pytz import timezone\n",
+    "import multiprocess as mp    # using `multiprocess` instead of `multiprocessing` because function to be called in `map` is in the same file as the function which is calling it: https://stackoverflow.com/questions/41385708/multiprocessing-example-giving-attributeerror\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "from pandas.api.types import is_datetime64_any_dtype as is_datetime\n",
+    "import pickle\n",
+    "\n",
+    "from google.cloud import bigquery, secretmanager, storage, logging\n",
+    "\n",
+    "import os\n",
+    "from google.cloud import bigquery"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "65b4dba9",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# # TODO: comment the below line out when not running the function locally\n",
+    "os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/user/ficc/ficc/mitas_creds.json'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "eaf519b0",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "PROJECT_ID = 'eng-reactor-287421'\n",
+    "LOCATION = 'US'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "5e84c5ea",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def _get_credentials(secret_id, version_id, project_id=PROJECT_ID):\n",
+    "    '''Directly taken from `access_secret_version(...)` from cloud function `update_msrb_real_time_trade_messages`.'''\n",
+    "    client = secretmanager.SecretManagerServiceClient()    # create the Secret Manager client\n",
+    "    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'    # build the resource name of the secret version\n",
+    "    response = client.access_secret_version(request={'name': name})\n",
+    "    payload = response.payload.data.decode('UTF-8')\n",
+    "    return payload\n",
+    "\n",
+    "\n",
+    "def get_latest_username():\n",
+    "    '''Get the latest username from SecretManagerServiceClient.'''\n",
+    "    return _get_credentials('msrb_username', 'latest')\n",
+    "\n",
+    "\n",
+    "def get_latest_password():\n",
+    "    '''Get the latest password from SecretManagerServiceClient.'''\n",
+    "    return _get_credentials('msrb_password', 'latest')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "ed482d83",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_msrb_trade_messages(beginning_sequence_number):\n",
+    "    '''Directly taken from `get_msrb_trade_messages(...)` from cloud function `update_msrb_real_time_trade_messages`.'''\n",
+    "    base_url = 'https://rtrsprodsubscription.msrb.org'    # if not TESTING else 'https://rtrsbetasubscription.msrb.org'    # the testing URL is so that we can query MSRB as frequently as possible; it may not have all of the trade messages but can still be used for testing\n",
+    "    url = f'{base_url}/rtrssubscriptionwebservice/api/Subscription.GetNext?beginSequence={beginning_sequence_number}'\n",
+    "    headers = {'credentials': get_latest_username() + ',' + get_latest_password(),\n",
+    "               'accept': 'application/json'}\n",
+    "    response = requests.request('GET', url, headers=headers)\n",
+    "    if not response.ok:\n",
+    "        python_logging.warning(f'Getting MSRB trade messages using URL {url} failed with status code: {response.status_code} and reason: {response.reason}, so we do not proceed further. Headers used when making API call: {headers}. Headers from the returned response: {response.headers}')    # ensure that the correct credentials are being passed in\n",
+    "        return pd.DataFrame()\n",
+    "    response = json.loads(response.text)\n",
+    "    trade_messages = response.get('Subscription')\n",
+    "    if trade_messages is None:    # TODO: figure out whether this implies that there are no new messages or whether there is some other issue; avoids AttributeError: 'NoneType' object has no attribute 'get'\n",
+    "        print('response.get(\"Subscription\") returns `None` so we do not proceed further')\n",
+    "        return pd.DataFrame()\n",
+    "    num_messages = trade_messages.get('RecordCount')\n",
+    "    print(f'Number of messages from MSRB: {num_messages}')\n",
+    "    trade_messages = trade_messages.get('Records')\n",
+    "    # timestamp = datetime.now(eastern).strftime('%Y-%m-%d_%H:%M:%S')\n",
+    "    # filename = f'real_time_msrb_file_{timestamp}' + FILENAME_ADDENDUM\n",
+    "    # upload_to_storage(f'{filename}.json', json.dumps(trade_messages))\n",
+    "    # if num_messages > 0:\n",
+    "    #     rows = [trade_message_to_database_record(message['Message']) for message in trade_messages]\n",
+    "    #     if rows != []:\n",
+    "    #         upload_msrb_json_to_bigquery(rows)    # NOTE: this cannot be done asynchronously since the function below mutates `rows`\n",
+    "    #         rows = [convert_date_object_to_date_type(row) for row in rows]\n",
+    "    #         return pd.DataFrame(rows)\n",
+    "    #     else:\n",
+    "    #         send_error_email('msrb_api.py trade_message_to_full_db_record Error', str(trade_messages))\n",
+    "    # else:\n",
+    "    #     print(f'No new trade messages since sequence number: {beginning_sequence_number}')\n",
+    "    return trade_messages"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1afb5f50",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "get_msrb_trade_messages(4000)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.8"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

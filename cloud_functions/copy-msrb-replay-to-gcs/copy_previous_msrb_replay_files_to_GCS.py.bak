@@ -1,0 +1,37 @@
+'''
+Author: Developer Ray
+Create Date: 2025-01-03
+Last Editor: Developer Ray
+Last Edit Date: 2025-01-03
+Description: Fill in past MSRB replay files.
+'''
+import time
+from datetime import datetime, date
+
+from main import YEAR_MONTH_DAY, \
+                 BUSINESS_DAY, \
+                 SECONDS_TO_WAIT_BEFORE_NEXT_CALL, \
+                 get_last_data_entry, \
+                 get_msrb_replay_file, \
+                 upload_to_storage, \
+                 get_storage_filepath
+
+
+def copy_previous_msrb_replay_files_to_GCS(start_date: date = None, end_date: date = None):
+    '''Copy all MSRB replay files from `start_date` to `end_date` inclusive into Google Cloud Storage.'''
+    if start_date is None: start_date = get_last_data_entry().date() + (BUSINESS_DAY * 1)
+    if end_date is None: end_date = datetime.now().date()
+    current_date = end_date
+    num_replay_files_uploaded_to_storage = 0
+    while current_date >= start_date:
+        msrb_replay_file_for_current_date = get_msrb_replay_file(current_date.strftime(YEAR_MONTH_DAY), print_instead_of_warn=True)
+        if msrb_replay_file_for_current_date is not None:
+            upload_to_storage(get_storage_filepath(current_date), msrb_replay_file_for_current_date)
+            num_replay_files_uploaded_to_storage += 1
+        current_date -= (BUSINESS_DAY * 1)
+        time.sleep(SECONDS_TO_WAIT_BEFORE_NEXT_CALL)    # to not hit MSRB API too quickly
+    print(f'Uploaded {num_replay_files_uploaded_to_storage} to Google Cloud Storage between {start_date} and {end_date}')
+
+
+if __name__ == '__main__':
+    copy_previous_msrb_replay_files_to_GCS()

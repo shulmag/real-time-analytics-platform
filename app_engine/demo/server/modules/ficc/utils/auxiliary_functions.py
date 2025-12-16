@@ -1,0 +1,263 @@
+'''
+Description: This file contains function to help the functions to process training data.
+'''
+import time
+# import logging as python_logging    # to not confuse with google.cloud.logging
+from functools import wraps
+
+import pandas as pd
+import numpy as np
+import redis
+from datetime import datetime, timedelta
+
+
+MAX_RUNS = 10
+
+
+def remove_hours_and_fractional_seconds_beyond_3_digits(time):
+    # time = str(time).split('.')[0]    # remove the fractional seconds
+    time = str(time)[:-3]    # total of 6 digits after the decimal, so we keep everything but the last 3
+    return time[time.find(':') + 1:]    # remove the hours
+
+
+def function_timer(function_to_time):
+    '''This function is to be used as a decorator. It will print out the execution time of `function_to_time`.'''
+    @wraps(function_to_time)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        print(f'INFO: Begin execution of {function_to_time.__name__}')    # python_logging.info(f'Begin execution of {function_to_time.__name__}')
+        start_time = time.time()
+        result = function_to_time(*args, **kwargs)
+        end_time = time.time()
+        print(f'INFO: Execution time of {function_to_time.__name__}: {remove_hours_and_fractional_seconds_beyond_3_digits(timedelta(seconds=end_time - start_time))}')    # python_logging.info(f'Execution time of {function_to_time.__name__}: {remove_hours_and_fractional_seconds_beyond_3_digits(timedelta(seconds=end_time - start_time))}')
+        return result
+    return wrapper
+
+
+def run_multiple_times_before_failing(error_types: tuple, max_runs: int = MAX_RUNS, exponential_backoff: bool = False):
+    '''This function returns a decorator. It will run `function` over and over again until it does not 
+    raise an Exception for a maximum of `max_runs` times. If `exponential_backoff` is set to `True`, then 
+    the wait time is increased exponentially, otherwise it is a constant value.
+    NOTE: max_runs = 1 is the same functionality as not having this decorator.'''
+    def decorator(function):
+        @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+        def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+            runs_so_far = 0
+            while runs_so_far < max_runs:
+                try:
+                    return function(*args, **kwargs)
+                except error_types as e:
+                    runs_so_far += 1
+                    if runs_so_far >= max_runs:
+                        print(f'WARNING: Already caught {type(e)}: {e}, {max_runs} times in {function.__name__}, so will now raise the error')    # python_logging.warning(f'Already caught {type(e)}: {e}, {max_runs} times in {function.__name__}, so will now raise the error')
+                        raise e
+                    print(f'WARNING: Caught {type(e)}: {e}, and will retry {function.__name__} {max_runs - runs_so_far} more times')    # python_logging.warning(f'Caught {type(e)}: {e}, and will retry {function.__name__} {max_runs - runs_so_far} more times')
+                    delay = min(2 ** (runs_so_far - 1), 10) if exponential_backoff else 1
+                    time.sleep(delay)    # have a delay to prevent overloading the server
+        return wrapper
+    return decorator
+
+
+def run_five_times_before_raising_redis_connector_error(function: callable) -> callable:
+    return run_multiple_times_before_failing((redis.exceptions.ConnectionError, redis.exceptions.TimeoutError, redis.exceptions.BusyLoadingError), 5)(function)
+
+
+def run_async_multiple_times_before_failing(error_types: tuple, max_runs: int = MAX_RUNS):
+    '''This function returns a decorator. It will run `async_function` over and over again until it does not 
+    raise an Exception for a maximum of `max_runs` times. Note that `async_function` must be an asynchronous 
+    function, as declared with the `async` keyword before `def`.
+    NOTE: max_runs = 1 is the same functionality as not having this decorator.'''
+    def decorator(async_function):
+        @wraps(async_function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+        async def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+            runs_so_far = 0
+            while runs_so_far < max_runs:
+                try:
+                    result = await async_function(*args, **kwargs)
+                    return result
+                except error_types as e:
+                    runs_so_far += 1
+                    if runs_so_far >= max_runs: raise e
+                    print(f'WARNING: Caught {type(e)}: {e}, and will retry {async_function.__name__} {max_runs - runs_so_far} more times')    # python_logging.warning(f'Caught {type(e)}: {e}, and will retry {async_function.__name__} {max_runs - runs_so_far} more times')
+                    time.sleep(1)    # have a one second delay to prevent overloading the server
+        return wrapper
+    return decorator
+
+
+def cache_output(function, verbose=False):
+    '''This function is to be used as a decorator. It will cache the key and value for the following functions: 
+    `trade_list_to_array`, `trade_history_features.py::create_trade_history_dict`, `dollar_history_features.py::create_trade_history_dict`, 
+    `get_ficc_ycl_for_target_trade`, and `current_treasury_rate`.'''
+    cache = {}
+    current_datetime_in_cache = None    # used to clear the cache when the current_datetime is not the same as the previous datetime used to create the cache
+    @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def memoizer(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        nonlocal cache, current_datetime_in_cache
+        cusip = args[0]['cusip']    # assumes that args[0] is a pandas series that contains 'cusip' as a key
+        current_datetime = args[1]    # assumes that args[1] is a datetime
+        if current_datetime is None or current_datetime != current_datetime_in_cache:
+            cache = {}
+            current_datetime_in_cache = current_datetime
+        if cusip not in cache:
+            cache[cusip] = function(*args, **kwargs)
+        else:
+            if verbose: print(f'Found CUSIP {cusip} for datetime {current_datetime_in_cache} in cache for {function.__name__}')
+        return cache[cusip]
+    return memoizer
+
+
+def cache_output_verbose(function):
+    '''This function is to be used as a decorator. It returns `cache_output` with the `verbose` flag set to `True`.'''
+    return cache_output(function, True)
+
+
+def double_quote_a_string(potential_string):
+    '''Quote a string twice: e.g., double_quote_a_string('hello') -> "'hello'". This 
+    function is used to put string arguments into formatted string expressions and 
+    maintain the quotation.'''
+    return f'"{str(potential_string)}"' if type(potential_string) == str else potential_string
+
+
+def sqltodf(sql, bq_client):
+    bqr = bq_client.query(sql).result()
+    return bqr.to_dataframe()
+
+
+def drop_extra_columns(df):
+    df.drop(columns=['sp_stand_alone',
+                     'sp_icr_school',
+                     'sp_icr_school',
+                     'sp_icr_school',
+                     'sp_watch_long',
+                     'sp_outlook_long',
+                     'sp_prelim_long',
+                     'MSRB_maturity_date',
+                     'MSRB_INST_ORDR_DESC',
+                     'MSRB_valid_from_date',
+                     'MSRB_valid_to_date',
+                     'upload_date',
+                     'sequence_number',
+                     'ref_valid_from_date',
+                     'ref_valid_to_date',
+                     'additional_next_sink_date',
+                     'last_period_accrues_from_date',
+                     'primary_market_settlement_date',
+                     'assumed_settlement_date',
+                     'sale_date', 
+                     'q', 
+                     'd'],
+                  inplace=True)
+    return df
+
+
+def convert_dates(df):
+    '''Convert all columns with 'DATE' in the name to a datetime.'''
+    date_cols = [col for col in list(df.columns) if 'DATE' in col.upper()]
+    for col in date_cols:
+        try:
+            df[col] = pd.to_datetime(df[col])
+        except Exception as e:
+            print(f'When trying to convert {col} to a datetime, we get the following error. {type(e)}: {e}')
+            for _, row in df[['cusip', col]].iterrows():
+                date = row[col]
+                try:
+                    pd.to_datetime(date)    # try to convert to datetime
+                except Exception:
+                    print(f'Error occurred for CUSIP: {row["cusip"]} for date: {date}')
+            raise e
+    return df
+
+
+def process_ratings(df, process_ratings):
+    # MR is for missing ratings
+    df.sp_long.fillna('MR', inplace=True)
+    if process_ratings == True:
+        df = df[df.sp_long.isin(['BBB+','A-','A','A+','AA-','AA','AA+','AAA','NR','MR'])] 
+    df['rating'] = df['sp_long']
+    return df
+
+
+def compare_dates(date1, date2):
+    '''This function compares two date objects whether they are in Timestamp or datetime.date. 
+    The different types are causing a future warning. If date1 occurs after date2, return 1. 
+    If date1 equals date2, return 0. Otherwise, return -1.'''
+    if type(date1) == pd.Timestamp:
+        date1 = date1.date()
+    if type(date2) == pd.Timestamp:
+        date2 = date2.date()
+    
+    if date1 > date2:
+        return 1
+    elif date1 == date2:
+        return 0
+    else:    # date1 < date2
+        return -1
+
+
+def dates_are_equal(date1, date2):
+    '''Call `compare_dates` to check if two dates are equal.'''
+    return compare_dates(date1, date2) == 0
+
+
+def convert_object_to_category(df):
+    '''Converts the columns with object datatypes to category data types.'''
+    print('Converting object data type to categorical data type')
+    for col_name in df.columns:
+        if col_name.endswith('event') or col_name.endswith('redemption') or col_name.endswith('history') or col_name.endswith('date') or col_name.endswith('issue'):
+            continue
+
+        if df[col_name].dtype == 'object' and col_name not in ['organization_primary_name', 'security_description', 'recent', 'issue_text', 'series_name', 'recent_trades_by_series']:
+            df[col_name] = df[col_name].astype('category')
+    return df
+
+
+def calculate_a_over_e(df):
+    if not pd.isnull(df.previous_coupon_payment_date):
+        A = (df.settlement_date - df.previous_coupon_payment_date).days
+        return A / df.days_in_interest_payment
+    else:
+        return df['accrued_days'] / 360
+
+
+def create_current_trade_array(row):
+    '''This function is only used in production to calculate the current trade array.
+    The array is added in the begining the trade history.
+    Parameters:
+    input: dataframe row
+    output: numpy array'''
+    current_trade_array = []
+    trade_type_mapping = {'D':[0,0],'S': [0,1],'P': [1,0]}
+
+    current_trade_array.append(row['yield'] * 100 - row['ficc_ycl'])
+    current_trade_array.append((row['yield'] - row['treasury_rate']) * 100)
+    current_trade_array.append(row['quantity'])
+    current_trade_array += trade_type_mapping[row['trade_type']]
+    current_trade_array.append(np.log10(1 + (datetime.now() - row['trade_datetime']).total_seconds()))
+    
+    return np.append(np.array([current_trade_array]), row['trade_history'][:4], axis=0)
+
+
+def append_last_trade(row):
+    '''This function is only used in production to calculate the current trade array.
+    The array is added in the begining the trade history.
+    Paramaterts:
+    input: dataframe row
+    output: numpy array'''
+    last_trade = []
+    last_trade.append(row['last_yield_spread'])
+    last_trade.append(row['ficc_ycl'])
+    last_trade.append(row['rtrs_control_number'])                 
+    last_trade.append(row['yield'] )
+    last_trade.append(row['dollar_price'])
+    last_trade.append(row['last_seconds_ago'])
+    last_trade.append(float(row['par_traded']))
+    last_trade.append(row['calc_date'])
+    last_trade.append(row['maturity_date'])
+    last_trade.append(row['next_call_date'])
+    last_trade.append(row['par_call_date'])
+    last_trade.append(row['last_refund_date'])
+    last_trade.append(row['trade_datetime'])
+    last_trade.append(row['calc_day_cat'])
+    last_trade.append(row['settlement_date'])
+    last_trade.append(row['trade_type'])
+    
+    return np.append(np.array([last_trade]), row['previous_trades_features'], axis=0)

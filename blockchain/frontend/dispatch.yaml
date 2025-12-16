@@ -1,0 +1,6 @@
+dispatch:
+  - url: "pricing.ficc.ai/*"
+    service: default
+  
+  - url: "stellar.ficc.ai/*"
+    service: blockchain

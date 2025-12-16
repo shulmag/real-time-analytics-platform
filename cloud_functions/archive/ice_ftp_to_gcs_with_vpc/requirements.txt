@@ -1,0 +1,45 @@
+blinker==1.8.2
+cachetools==5.5.0
+certifi==2024.8.30
+charset-normalizer==3.3.2
+click==8.1.7
+Flask==3.0.3
+google-api-core==2.19.2
+google-auth==2.34.0
+google-cloud-bigquery==3.25.0
+google-cloud-core==2.4.1
+google-cloud-secret-manager==2.20.2
+google-cloud-storage==2.18.2
+google-crc32c==1.6.0
+google-resumable-media==2.7.2
+googleapis-common-protos==1.65.0
+grpc-google-iam-v1==0.13.1
+grpcio==1.66.1
+grpcio-status==1.66.1
+idna==3.10
+itsdangerous==2.2.0
+Jinja2==3.1.4
+MarkupSafe==2.1.5
+packaging==24.1
+proto-plus==1.24.0
+protobuf==5.28.1
+pyasn1==0.6.1
+pyasn1_modules==0.4.1
+pyasynchat==1.0.4
+pyasyncore==1.0.4
+pyftpdlib==2.0.0
+python-dateutil==2.9.0.post0
+pytz==2021.3
+requests==2.32.3
+rsa==4.9
+six==1.16.0
+urllib3==2.2.3
+Werkzeug==3.0.4
+
+# pyftpdlib
+# google-cloud-bigquery
+# google-cloud-storage
+# google-cloud-secret-manager
+# pytz==2021.3
+# requests
+# flask

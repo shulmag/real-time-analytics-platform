@@ -1,0 +1,8 @@
+@use "../lib/colors";
+@use "../lib/shadows";
+
+
+:root {
+  @include colors.light;
+  @include shadows.main;
+}

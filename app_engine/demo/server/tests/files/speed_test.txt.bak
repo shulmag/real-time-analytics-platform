@@ -1,0 +1,4 @@
+For batch pricing 300 CUSIPs, mean speed: 6.581 seconds with std dev: 1.883 seconds, median speed: 6.181 seconds, for 100 runs
+For batch pricing 1000 CUSIPs, mean speed: 13.088 seconds with std dev: 0.95 seconds, median speed: 13.205 seconds, for 100 runs
+For batch pricing 3000 CUSIPs, mean speed: 40.052 seconds with std dev: 1.139 seconds, median speed: 40.231 seconds, for 100 runs
+For batch pricing 10000 CUSIPs, mean speed: 70.396 seconds with std dev: 13.025 seconds, median speed: 66.042 seconds, for 100 runs

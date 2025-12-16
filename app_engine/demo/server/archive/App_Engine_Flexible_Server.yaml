@@ -1,0 +1,27 @@
+runtime: python
+env: flex
+service: server-new    # re-deploying with a different name so that Google can monitor
+entrypoint: gunicorn -b :$PORT main:app --timeout 0
+
+runtime_config:
+  python_version: 3.7
+
+vpc_access_connector:
+  name: "projects/eng-reactor-287421/locations/us-central1/connectors/redis-connector"
+  egress_setting: all-traffic
+
+# manual_scaling:
+#   instances: 1
+
+automatic_scaling:
+  min_num_instances: 1
+  max_num_instances: 10
+
+resources:
+  cpu: 32
+  memory_gb: 128
+  disk_size_gb: 20
+  volumes:
+  - name: tmp
+    volume_type: tmpfs
+    size_gb: 5

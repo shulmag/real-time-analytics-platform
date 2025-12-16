@@ -1,0 +1,87 @@
+/*
+ * @Date: 2021-09-29 13:05:31 
+ */
+import React from 'react';
+import { Card } from 'react-bootstrap';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Legend,
+  Label
+} from 'recharts';
+
+function RealtimeYieldCurve({ yield_data }) {
+  const chartData = yield_data.x.map((xVal, i) => ({
+    maturity: xVal,
+    yield: yield_data.yield[i]
+  }));
+
+  return (
+    <div className="d-flex justify-content-center">
+        <Card className="shadow-sm w-100" style={{ maxWidth: '40vw' }}>
+        <Card.Header className="bg-light py-2 d-flex justify-content-between align-items-center">
+          <h6 className="mb-0">Real Time Yield Curve</h6>
+        </Card.Header>
+        <Card.Body className="p-3" style={{ height: '40vh', width: '40vw' }}>
+          <ResponsiveContainer>
+            <LineChart 
+            data={chartData}
+            margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
+              
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis
+                dataKey="maturity"
+                type="number"
+                domain={[0,30]}
+                ticks={[0,5, 10, 15, 20, 25, 30]}
+                tick={{ fontSize: 12 }}
+                tickFormatter={(v) => `${v}`}
+                interval={0}
+              >
+                <Label
+                  value="Years to Maturity"
+                  offset={-10}
+                  position="insideBottom"
+                  style={{ fill: '#000000ff', fontSize: 15 }}
+                />
+              </XAxis>
+              <YAxis
+                domain={[0, 6]}
+                tick={{ fontSize: 12 }}
+                ticks={[0,1, 2, 3, 4, 5, 6]}
+                tickFormatter={(v) => v.toString()}
+                interval={0}
+              >
+                <Label
+                  angle={-90}
+                  position="insideLeft"
+                  offset={10}
+                  value="Yield (%)"
+                  style={{ fill: '#000000ff', fontSize: 15 }}
+                />
+              </YAxis>
+              <Tooltip 
+                labelFormatter={(label) => `Maturity: ${Number(label).toFixed(1)} years`}
+                formatter={(value) => [`${value.toFixed(3)}%`, 'Yield']} />
+              <Line
+                type="monotone"
+                dataKey="yield"
+                stroke={'#3182ce'}
+                strokeWidth={2}
+                dot={false}
+                isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </Card.Body>
+      </Card>
+    </div>
+  );
+}
+
+export default RealtimeYieldCurve;

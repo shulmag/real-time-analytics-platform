@@ -1,0 +1,58 @@
+/*
+ * @Date: 2021-09-29 13:05:31 
+ */
+import React from "react";
+import "../App.css";
+import Plot from 'react-plotly.js';
+
+function YieldCurve({yield_data}) {
+    return (
+      <Plot
+        data={[
+          {type: 'line', 
+          name: 'Yield Curve',
+            x:yield_data.x,
+            y:yield_data.yield,
+            line: {
+              color: '#79d274',
+              width: 4}
+          }
+        ]}
+
+        layout={{
+          width: 500,
+          height: 400,
+          showlegend: true,  
+          modeBarButtonsToRemove: ['toImage'],
+          paper_bgcolor:'rgb(48,48,48)',
+          plot_bgcolor: 'rgb(48,48,48)',
+          font: {
+            family: 'Helvetica,Arial',
+            size: 18,
+            color: '#59e4fd'
+          },
+          margin: {
+            t: 0
+          },
+          legend: {
+            xanchor: 'right',
+            yanchor: 'bottom'
+          },
+          autosize: true, // set autosize to rescale
+          xaxis: {
+            rangemode:'normal',
+            autorange: true,
+            automargin: true,
+            title: 'Years to Maturity'
+          },
+          yaxis: {
+            automargin: true,
+            title: 'Yield ',
+            range: [0, 5],
+            dtick: 0.5,
+            hoverformat: ',.3f'
+        }}}
+      />
+    );
+}
+export default YieldCurve;

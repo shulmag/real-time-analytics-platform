@@ -1,0 +1,94 @@
+# -*- coding: utf-8 -*-
+# @Author: shayaan
+# @Date:   2021-09-27 12:54:26
+# @Last Modified by:   shayaan
+# @Last Modified time: 2021-09-27 15:44:26
+
+import pandas as pd
+from google.cloud import secretmanager
+from pandas.tseries.holiday import USFederalHolidayCalendar
+import requests
+import json
+import redis
+import pickle5 as pickle
+import smtplib, ssl
+from email.mime.text import MIMEText
+from datetime import datetime
+
+REDIS_CLIENT = redis.Redis(host='10.146.62.92', port=6379, db=0)
+bday_us = pd.offsets.CustomBusinessDay(calendar=USFederalHolidayCalendar())
+
+def get_data():
+    return pickle.loads(REDIS_CLIENT.get('current_yield_data'))
+
+###functions to email error message if delta above threshold
+def access_secret_version(project_id, secret_id, version_id):
+    # Create the Secret Manager client.
+    client = secretmanager.SecretManagerServiceClient()
+    # Build the resource name of the secret version.
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    # Access the secret version.
+    response = client.access_secret_version(request={"name": name})
+    payload = response.payload.data.decode("UTF-8")
+    return(payload)
+
+def send_error_email(subject,error_message):
+    sender_email = access_secret_version('eng-reactor-287421','notifications_username','latest')
+    password = access_secret_version('eng-reactor-287421','notifications_password','latest')
+    receiver_email = "eng@ficc.ai"
+    
+    msg = MIMEText(error_message)
+    msg['Subject'] = subject
+    msg['From'] = sender_email
+    msg['To'] = receiver_email
+
+    smtp_server = "smtp.gmail.com"
+    port = 587
+    sender_email = "notifications@ficc.ai"
+
+    with smtplib.SMTP(smtp_server,port) as server:
+        try:
+            server.starttls()
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+        except Exception as e:
+            print(e)
+        finally:
+            server.quit() 
+
+
+def get_access_token(audience):
+    token_response = requests.get(
+        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=' + audience,
+        headers={'Metadata-Flavor': 'Google'})
+        
+    return token_response.content.decode("utf-8")
+
+def get_yield_value(maturity,target_date):    
+    url = "https://us-central1-eng-reactor-287421.cloudfunctions.net/daily_yield_curve"
+    token = get_access_token(url)
+    request_json = {"maturity":maturity,"target_date":target_date}
+    param_json = json.dumps(request_json)
+    param = json.loads(param_json)
+
+    r = requests.post(url, json=param,headers={"Authorization":"Bearer {}".format(token)})
+    
+    return(json.loads(r.text)['result'])
+
+def main():
+    data = get_data()
+    indexes = list(data['sp_index_data'].keys())    
+    index_data = data['sp_index_data']
+    maturity_data = data['sp_index_maturity_data'].sort_index().iloc[-1]
+    most_recent_business_day = (datetime.now() - bday_us).strftime('%Y-%m-%d')
+
+
+    for index in indexes:
+        sp_index_data = index_data[index].sort_index().iloc[-1].values[0]
+        maturity = maturity_data[index]
+        calculated_ytw = get_yield_value(maturity,most_recent_business_day)
+        delta_yield = abs(sp_index_data - calculated_ytw)
+        print(f'index: {index}, calculated_yield:{calculated_ytw}, delta:{delta_yield}')
+        if delta_yield > 10:
+            send_error_email('WARNING! Yield curve delta than 10 bps', 
+            'The yield curve calculated for {} on {} is more that 10 bps away'.format(index,most_recent_business_day))

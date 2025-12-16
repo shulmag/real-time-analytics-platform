@@ -1,0 +1,77 @@
+'''
+Description: Goes to MMD and scrapes the published values for the yield curves. This gives us a historical MMD curve.
+'''
+import requests
+import datetime
+
+import pandas as pd
+from bs4 import BeautifulSoup
+import decimal
+
+from google.cloud import bigquery
+
+
+TESTING = False
+
+BQ_CLIENT = bigquery.Client()
+
+
+def bq_field(name, variety):
+    return bigquery.SchemaField(name, variety)
+
+
+def bq_string(name):
+    return bq_field(name, 'string')
+
+
+def bq_numeric(name):
+    return bq_field(name, 'numeric')
+
+
+def bq_date(name):
+    return bq_field(name, 'date')
+
+
+def bq_int(name):
+    return bq_field(name, 'integer')
+
+
+def main(args):
+    r = requests.get('https://www.tm3.com/homepage/homepage.jsf')
+    soup = BeautifulSoup(r.content, 'lxml')
+    date = soup.find('span', id='mmdScalesTimeId').text.split(',')[1]
+    date = date.replace(' ', '')
+    date = datetime.datetime.strptime(date, '%m/%d/%Y').date()
+
+    table = soup.find('table', id='mmdScalesWidgetId')
+
+    headers = [header.text for header in table.find_all('th')]
+    results = [{headers[i]: cell.text for i, cell in enumerate(row.find_all('td'))} for row in table.find_all('tr')]
+
+    df = pd.DataFrame(results)[1:]
+    df['AAA'] = df['"AAA"']
+    df.drop(columns=['"AAA"'], inplace=True)
+
+    for c in ['AAA', 'Insured', 'NY', 'CA']:
+        df[c] = df[c].astype(str).map(decimal.Decimal)
+    df.Maturity = df.Maturity.astype(int)
+    df['date'] = date
+    df = df[['date', 'Maturity', 'AAA', 'Insured', 'NY', 'CA']]
+
+    job_config = bigquery.LoadJobConfig(schema=[bq_date('date'),
+                                                bq_int('Maturity'),
+                                                bq_numeric('AAA'),
+                                                bq_numeric('Insured'),
+                                                bq_numeric('NY'),
+                                                bq_numeric('CA')])
+
+    table_id = 'eng-reactor-287421.yield_curves.mmd_approximation'
+    load_job = BQ_CLIENT.load_table_from_dataframe(df, table_id, job_config=job_config)
+    load_job.result()    # waits for the job to complete
+
+    print(f'Uploaded the following dataframe to {table_id}:\n{df.to_markdown()}')
+
+    if TESTING:
+        destination_table = BQ_CLIENT.get_table(table_id)
+        print(f'Loaded {destination_table.num_rows} rows')
+    return 'SUCCESS'

@@ -1,0 +1,213 @@
+'''
+Description: Makes asynchronous calls for large batch pricing.
+'''
+from functools import partial
+import random
+
+import aiohttp
+import asyncio
+import async_timeout
+
+import pandas as pd
+
+from modules.auxiliary_variables import SERVER_URL_MAP, DEFAULT_QUANTITY, DEFAULT_TRADE_TYPE
+
+
+def get_server_key(username: str) -> str:
+    '''If the user uses the UI, then only an access token is passed in, not a username and password. This means that 
+    `username` would be `None` in this case, and this traffic will be routed to the main server for batch pricing (not 
+    the user-specific server). The user-specific server will be used for API calls only.'''
+    if username is None: return 'other'
+    if username.endswith('@vanguard.com'): return 'vanguard'
+    if username == 'investortools_cf@ficc.ai': return 'investortools'
+    return 'other'
+
+
+def get_servers(username: str) -> list:
+    server_key = get_server_key(username)
+    return SERVER_URL_MAP[server_key]
+
+
+def keep_keys_if_values_are_not_none(keys: list, values: list) -> dict:
+    '''Returns a dictionary where keys from `keys` are paired with corresponding values from `values`,
+    but only if the value is not `None`.
+
+    >>> keep_keys_if_values_are_not_none(['a', 'b', 'c'], [1, None, 3])
+    {'a': 1, 'c': 3}
+    >>> keep_keys_if_values_are_not_none(['x', 'y', 'z'], [None, None, None])
+    {}
+    >>> keep_keys_if_values_are_not_none(['one', 'two'], [10, 20])
+    {'one': 10, 'two': 20}
+    >>> keep_keys_if_values_are_not_none([], [])
+    {}
+    >>> keep_keys_if_values_are_not_none(['a', 'b'], [None, 2])
+    {'b': 2}
+    >>> keep_keys_if_values_are_not_none(['k1', 'k2', 'k3'], [0, None, 'value'])
+    {'k1': 0, 'k3': 'value'}
+    >>> keep_keys_if_values_are_not_none(['a', 'b', 'c'], [None])
+    Traceback (most recent call last):
+    ...
+    AssertionError: Number of keys: 3 is not equal to the number of values: 1
+    >>> keep_keys_if_values_are_not_none(['a'], [None, 1])
+    Traceback (most recent call last):
+    ...
+    AssertionError: Number of keys: 1 is not equal to the number of values: 2
+    '''
+    assert len(keys) == len(values), f'Number of keys: {len(keys)} is not equal to the number of values: {len(values)}'
+    return {key: value for key, value in zip(keys, values) if value is not None}
+
+
+def get_api_call(cusip_list: list, 
+                 quantity_list: list, 
+                 trade_type_list: list, 
+                 username: str, 
+                 password: str, 
+                 access_token, 
+                 default_quantity: int, 
+                 default_trade_type: str, 
+                 use_for_compliance: bool, 
+                 user_price_list: list, 
+                 trade_datetime_list: list, 
+                 ignore_error_cusips: bool, 
+                 set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool, 
+                 time: str, 
+                 discard_failed_batches: bool, 
+                 server_idx: int = 0):
+    if quantity_list is not None: assert len(cusip_list) == len(quantity_list), f'Number of CUSIPs: {len(cusip_list)} is not equal to the number of quantities: {len(quantity_list)}'
+    if trade_type_list is not None: assert len(cusip_list) == len(trade_type_list), f'Number of CUSIPs: {len(cusip_list)} is not equal to the number of trade types: {len(trade_type_list)}'
+    if user_price_list is not None: assert len(cusip_list) == len(user_price_list), f'Number of CUSIPs: {len(cusip_list)} is not equal to the number of user prices: {len(user_price_list)}'
+    if trade_datetime_list is not None: assert len(cusip_list) == len(trade_datetime_list), f'Number of CUSIPs: {len(cusip_list)} is not equal to the number of trade datetimes: {len(trade_datetime_list)}'
+    url = 'compliance' if use_for_compliance else 'batchpricing'
+    url = get_servers(username)[server_idx] + '/api/' + url
+    data = {'username': username, 
+            'password': password, 
+            'access_token': access_token,    # access token is only used when calling batch pricing from the UI (otherwise, the preferable way is to use the username and password to re-generate the access token if it has become stale and lower the probability of a timeout issue)
+            'amount': default_quantity, 
+            'tradeType': default_trade_type, 
+            'cusipList': cusip_list}
+    data = data | keep_keys_if_values_are_not_none(['quantityList', 'tradeTypeList', 'userPriceList', 'tradeDatetimeList', 'ignoreErrorCusips', 'setQuantityToAmountOutstandingIfLessThanGivenQuantity', 'currentTime', 'discardFailedBatches'], 
+                                                   [quantity_list, trade_type_list, user_price_list, trade_datetime_list, ignore_error_cusips, set_quantity_to_amount_outstanding_if_less_than_given_quantity, time, discard_failed_batches])
+    return url, data
+
+
+def compute_timeout(num_items_to_price: int, use_for_compliance: bool) -> int:
+    '''Return the timeout threshold (in seconds) based on the size of the request and whether the request is for compliance. 
+    TODO: create a time per CUSIP for compliance similar to `batch_pricing_time_per_cusip`, based on experiments.'''
+    min_threshold = 15 if not use_for_compliance else 600    # have a minimum threshold based on network latency encountered for even a small request
+    batch_pricing_time_per_cusip = (5 * 60) / 2000    # 5 minute threshold for batch pricing was reasonable for 2000 items to price
+    return max(min_threshold, batch_pricing_time_per_cusip * num_items_to_price)
+
+
+async def exponential_backoff(session, url, data, timeout=300, max_retries=5, backoff_factor=2):
+    retries = 0
+    while retries < max_retries:
+        try:
+            async with async_timeout.timeout(timeout):    # timeout is in seconds
+                async with session.post(url, data=data) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        response_text = await response.text()
+                        raise aiohttp.ClientResponseError(request_info=response.request_info,
+                                                          history=response.history,
+                                                          status=response.status,
+                                                          message=response_text,
+                                                          headers=response.headers)
+        except asyncio.TimeoutError as e:
+            print(f'Request timed out with {type(e)}: {e}. Request called with data:\n{data}')
+        except Exception as e:
+            print(f'Request failed. {type(e)}: {e}. Request called with data:\n{data}')
+        retries += 1
+        wait_time = min(backoff_factor ** retries, 10)
+        print(f'Retrying after {wait_time} seconds.')
+        await asyncio.sleep(wait_time)
+    raise RuntimeError('Max retries exceeded')
+
+
+async def call_batch_pricing(session, 
+                             cusip_list: list, 
+                             quantity_list: list, 
+                             trade_type_list: list, 
+                             user_price_list: list = None, 
+                             trade_datetime_list: list = None, 
+                             username: str = None, 
+                             password: str = None, 
+                             access_token=None, 
+                             default_quantity: int = DEFAULT_QUANTITY, 
+                             default_trade_type: str = DEFAULT_TRADE_TYPE, 
+                             server_idx: int = 0, 
+                             ignore_error_cusips: bool = None,    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+                             set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool = None,    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+                             time: str = None, 
+                             use_for_compliance: bool = False, 
+                             discard_failed_batches: bool = None) -> pd.DataFrame:    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+    '''The function arguments have been rearranged so that in `price_batches(...)` calling the partial function with 
+    `*batches` correctly populates the input lists.'''
+    url, data = get_api_call(cusip_list, 
+                             quantity_list, 
+                             trade_type_list, 
+                             username, 
+                             password, 
+                             access_token, 
+                             default_quantity, 
+                             default_trade_type, 
+                             use_for_compliance, 
+                             user_price_list, 
+                             trade_datetime_list, 
+                             ignore_error_cusips, 
+                             set_quantity_to_amount_outstanding_if_less_than_given_quantity, 
+                             time, 
+                             discard_failed_batches, 
+                             server_idx)
+    response_json = await exponential_backoff(session, url, data, timeout=compute_timeout(len(cusip_list), use_for_compliance))
+
+    try:
+        priced_df = pd.read_json(response_json)
+    except Exception:
+        if 'error' in response_json and response_json['error'] == 'You have been logged out due to a period of inactivity. Refresh the page!':
+            raise aiohttp.ClientResponseError(request_info=None, history=None, status=401, message='You have been logged out due to a period of inactivity. Refresh the page!', headers=None)
+        else:
+            raise RuntimeError(f'unable to call `pd.read_json(...)` on the response even though `response.ok` is `True`. Running `response.json()` provides:\n{response_json}')    # raise error instead of printing the message to trigger the retry from the decorator: `run_multiple_times_before_failing`
+    return priced_df
+
+
+async def price_batches(cusip_list_batches: list, 
+                        quantity_list_batches: list, 
+                        trade_type_list_batches: list, 
+                        user_price_list_batches: list = None, 
+                        trade_datetime_list_batches: list = None, 
+                        username: str = None, 
+                        password: str = None, 
+                        access_token=None, 
+                        default_quantity: int = DEFAULT_QUANTITY,
+                        default_trade_type: str = DEFAULT_TRADE_TYPE,
+                        ignore_error_cusips: bool = None,    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+                        set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool = None,    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+                        time: str = None, 
+                        use_for_compliance: bool = False, 
+                        discard_failed_batches: bool = None, 
+                        long_pause_on_first_request: bool = False) -> list[pd.DataFrame]:    # intentionally setting to `None` instead of `False`, so it does not get passed into the API call (since `None` values do not get passed into form requests), and so it can perform the default logic
+    '''Ordered the arguments in this way so that calling the function is simpler for compliance.'''
+    call_batch_pricing_caller = partial(call_batch_pricing, username=username, 
+                                                            password=password, 
+                                                            access_token=access_token, 
+                                                            default_quantity=default_quantity, 
+                                                            default_trade_type=default_trade_type, 
+                                                            ignore_error_cusips=ignore_error_cusips, 
+                                                            set_quantity_to_amount_outstanding_if_less_than_given_quantity=set_quantity_to_amount_outstanding_if_less_than_given_quantity, 
+                                                            time=time, 
+                                                            use_for_compliance=use_for_compliance, 
+                                                            discard_failed_batches=discard_failed_batches)
+    num_servers = len(get_servers(username))
+    batches = [cusip_list_batches, quantity_list_batches, trade_type_list_batches]
+    if use_for_compliance: batches.extend([user_price_list_batches, trade_datetime_list_batches])
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        server_idx = random.randint(0, num_servers - 1)
+        for batch_idx, batch in enumerate(zip(*batches)):
+            sleep_time = 10 if batch_idx == 0 and long_pause_on_first_request else 0.1    # 0.1 second sleep between each call to not overwhelm the server; 10 second sleep (for the first batch) to make sure that credentials are set before making more asynchronous calls
+            await asyncio.sleep(sleep_time)
+            tasks.append(asyncio.create_task(call_batch_pricing_caller(session, *batch, server_idx=server_idx)))    # `asyncio.create_task(...)` starts the task of `call_batch_pricing_caller(...)` immediately
+            server_idx = (server_idx + 1) % num_servers
+        priced_batches = await asyncio.gather(*tasks, return_exceptions=True)    # waits until all tasks are completed
+    return priced_batches

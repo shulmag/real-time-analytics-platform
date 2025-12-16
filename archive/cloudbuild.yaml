@@ -1,0 +1,22 @@
+steps:
+- name: 'gcr.io/cloud-builders/gcloud'
+  timeout: 500s
+  args:
+  - functions
+  - deploy
+  - cusip_daily_issuer
+  - --source=./cloud_functions/cusip_issuer
+  - --trigger-http
+  - --runtime=python37
+  - --region=us-east4
+steps:
+- name: 'gcr.io/cloud-builders/gcloud'
+  timeout: 500s
+  args:
+  - functions
+  - deploy
+  - cusip_daily_issues
+  - --source=./cloud_functions/cusip_issues
+  - --trigger-http
+  - --runtime=python37
+  - --region=us-east4

@@ -1,0 +1,627 @@
+/*
+ * @Author: Gil Shulman 
+ * @Date: 2023-01-23 
+ * @Last Modified by: Developer
+ * @Last Modified time: 2025-04-11
+ */
+
+import React, { useState, useEffect } from 'react'
+import Table from 'react-bootstrap/Table'
+import Row from 'react-bootstrap/Row'
+import Col from 'react-bootstrap/Col'
+import Spinner from 'react-bootstrap/Spinner'
+import Button from 'react-bootstrap/Button'
+import Form from 'react-bootstrap/Form'
+import InputGroup from 'react-bootstrap/InputGroup'
+import ButtonGroup from 'react-bootstrap/ButtonGroup'
+import ToggleButton from 'react-bootstrap/ToggleButton'
+import { tradeTypeDict, statesDict, purposeClassDict, ratingsDict } from './relatedVarDict'
+
+import { Typeahead } from 'react-bootstrap-typeahead' 
+
+import { yearMonthDayToMonthDayYear } from '../../utils/dateUtils'
+
+
+function SimilarBonds({
+    getAuthenticationToken, 
+    relatedSearchVal, 
+    setRelatedSearchVal, 
+    similarBondsRes, 
+    setSimilarBondsRes,
+    fetchRelated, 
+    isPricing, 
+    setIsRelatedLoading, 
+    isRelatedLoading, 
+    noRelatedBondsFound, 
+    setNoRelatedBondsFound, 
+    similarBondsSearchHasRun, 
+    setSimilarBondsSearchHasRun, 
+    searchValCusip, 
+    predictedYield, 
+    predictedPrice
+}) {
+    
+    const statesList = Object.entries(statesDict).map(([key, text]) => ({ 'id': key, 'label': text }))
+    const purposeClassList = Object.entries(purposeClassDict).map(([key, text]) => ({ 'id': key, 'label': text }))
+    
+    //Ensure that there are not duplicate ratings displayed
+    const seen = new Set();
+    const ratingList = Object.entries(ratingsDict)
+      .filter(([_, label]) => {
+        if (seen.has(label)) return false;
+        seen.add(label);
+        return true;
+      })
+      .map(([key, label]) => ({ id: key, label }));
+
+    const [minMaturityDate, setMinMaturityDate] = useState('2025-01-01')
+    const [maxMaturityDate, setMaxMaturityDate] = useState('2125-12-31')
+
+    const [minCoupon, setMinCoupon] = useState(0)
+    const [maxCoupon, setMaxCoupon] = useState(10)
+
+    const defaultCusip = '64971XQM3'
+    const [searchCusip, setSearchCusip] = useState(defaultCusip)
+
+    const [radioValue, setRadioValue] = useState('previous_day')
+    const radios = [{ name: 'previous day', value: 'previous_day' },
+                    { name: 'real-time', value: 'realtime' }]
+
+    const [issuerChoiceValue, setIssuerChoiceValue] = useState('any_issuer')
+    const issuerChoices = [{ name: 'any issuer', value: 'any_issuer' },
+                            { name: 'same issuer', value: 'same_issuer' }]
+
+    const [hiddenRows, setHiddenRows] = useState([])
+
+    const [hover, setHover] = useState(false)
+
+    const [validated, setValidated] = useState(false);
+
+    // Define a simple style object for consistent form element sizes
+    const formElementStyle = {
+        fontSize: '0.9rem',
+        height: 'auto'
+    };
+
+    useEffect(() => {
+        // Set default values for maturity years if not already set
+        if (!relatedSearchVal.minMaturityDate) {
+            relatedSearchVal.minMaturityDate = minMaturityDate;
+        }
+        if (!relatedSearchVal.maxMaturityDate) {
+            relatedSearchVal.maxMaturityDate = maxMaturityDate;
+        }
+        
+        // Set default scaled values for coupons
+        if (!relatedSearchVal.minCoupon) {
+            relatedSearchVal.minCoupon = minCoupon * 100;
+        }
+        if (!relatedSearchVal.maxCoupon) {
+            relatedSearchVal.maxCoupon = maxCoupon * 100;
+        }
+    }, [minMaturityDate, maxMaturityDate, minCoupon, maxCoupon, relatedSearchVal]);
+
+    function setRadioValueAndUpdateRelatedDict(radioValue) {
+        setRadioValue(radioValue)
+        setRelatedDict({'radio': radioValue})
+    }
+
+    function setIssuerChoiceValueAndUpdateRelatedDict(issuerChoiceValue) {
+        setIssuerChoiceValue(issuerChoiceValue)
+        setRelatedDict({'issuerChoice': issuerChoiceValue})
+    }
+
+    function set(name) {
+        return function ({ target: { value } }) {
+            setRelatedSearchVal(oldSearchValues => ({ ...oldSearchValues, [name]: value }))
+        }
+    }
+
+    const setRelatedDict = (newValues) => {
+        setRelatedSearchVal({...relatedSearchVal, ...newValues})
+    }
+
+    function findOptionById(options, id) {
+        return options.reduce((foundOption, option) => {
+            if (option.id == id) {    // if the comparator is changed to `===`, we get a TypeError
+                foundOption = option
+            }
+            return foundOption
+        }, undefined)
+    }
+
+    function setSearchCusipFunction() {
+        if (typeof relatedSearchVal.cusip === 'undefined') { setSearchCusip(searchValCusip) }
+        else { setSearchCusip(relatedSearchVal.cusip) }
+    }
+    
+    const handleSubmit = (event) => {
+        event.preventDefault();
+        
+        // Check if min and max coupon values are provided
+        if (minCoupon === "" || minCoupon === null || isNaN(minCoupon) || 
+            maxCoupon === "" || maxCoupon === null || isNaN(maxCoupon)) {
+            setValidated(true);
+            return; // Stop form submission
+        }
+        
+        // Reset validation state when valid
+        setValidated(false);
+        
+        // Continue with the rest of your submission logic
+        setSimilarBondsRes([]);
+        setIsRelatedLoading(true);
+        setNoRelatedBondsFound(true);
+        setSearchCusipFunction();
+
+        if (relatedSearchVal.state === undefined) stateRef.current.clear();
+        if (relatedSearchVal.rating === undefined) ratingRef.current.clear();
+        if (relatedSearchVal.purposeClass === undefined) purposeClassRef.current.clear();
+
+        // Make sure coupon values are properly scaled for the backend
+        const scaledMinCoupon = minCoupon * 100;
+        const scaledMaxCoupon = maxCoupon * 100;
+
+        fetchRelated(
+            searchCusip,
+            predictedYield,
+            predictedPrice,
+            scaledMinCoupon,
+            scaledMaxCoupon,
+            relatedSearchVal.state,
+            relatedSearchVal.purposeClass,
+            relatedSearchVal.desc,
+            relatedSearchVal.rating,
+            minMaturityDate,
+            maxMaturityDate,
+            relatedSearchVal.amount,
+            relatedSearchVal.radio,
+            relatedSearchVal.issuerChoice,
+            true
+        );
+    }
+
+    const handleMouseEnter = (e) => {
+        e.currentTarget.style.backgroundColor = '#f8f9fa'  // lighter background color
+        setHover(true)
+    }
+    
+    const handleMouseLeave = (e) => {
+        e.currentTarget.style.backgroundColor = 'white'
+        setHover(false)
+    }
+    
+    const hoverStyle = {
+        cursor: hover ? 'pointer' : 'default',
+        transition: 'background-color 0.2s ease'  // smooth transition
+    }
+
+    function handleClick(e) {
+        setSimilarBondsSearchHasRun(true)
+        const rowId = e.currentTarget.dataset.id
+        setHiddenRows(prevHiddenRows => {
+            const newHiddenRows = [...prevHiddenRows]
+            const index = newHiddenRows.indexOf(rowId)
+            if (index === -1) {
+                newHiddenRows.push(rowId)
+            } else {
+                newHiddenRows.splice(index, 1)
+            }
+            return newHiddenRows
+        })
+    }
+
+    function dispSingleTradeDetails(grouped, cusip) {       
+        if (true) {    // need to check that similarBondsRes has data in it at some point
+            return (
+                grouped[cusip].map((result) => (
+                <tr>
+                    <td>{result.trade_datetime}</td>
+                    <td>{result.yield}</td>
+                    <td>{result.dollar_price}</td>
+                    <td>{yearMonthDayToMonthDayYear(result.calc_date)}</td>
+                    <td>{Math.floor(result.par_traded / 1000)}</td>
+                    <td>{tradeTypeDict[result.trade_type]}</td>
+                </tr>
+                ))
+            )
+        }
+    }
+
+    function dispTradesByCusip(){
+        // this gives an object with dates as keys
+        // https://stackoverflow.com/questions/55272682/reduce-function-with-bracket-key
+        function groupBy(objectArray, property) {
+            if (objectArray !== undefined) {
+                return objectArray.reduce(function(acc, obj) {
+                    var key = obj[property]
+                    if (!acc[key]) { acc[key] = [] }
+                    acc[key].push(obj)
+                    return acc
+                }, {})
+            }
+        }
+
+        function avg_yield(dailyTradeArr){
+            const total_yield = dailyTradeArr.reduce((accumulator, trade) => accumulator + trade.yield, 0)
+            return total_yield / dailyTradeArr.length
+        }
+
+        function avg_price(dailyTradeArr){
+            const total_price = dailyTradeArr.reduce((accumulator, trade) => accumulator + trade.dollar_price, 0)
+            return total_price / dailyTradeArr.length
+        }
+
+        const grouped = groupBy(similarBondsRes, 'cusip')
+        
+        var summary_by_cusip = []
+
+        for (var cusip in grouped) {
+            var summary_by_cusip_entry = {}
+            summary_by_cusip_entry['showDetails'] = false
+            var rowId = 'k' + cusip
+            
+            summary_by_cusip_entry['id'] = rowId
+            summary_by_cusip_entry['avg_yield'] = avg_yield(grouped[cusip])
+            summary_by_cusip_entry['avg_price'] = avg_price(grouped[cusip])
+            summary_by_cusip_entry['cusip'] = cusip
+            summary_by_cusip_entry['state'] = grouped[cusip][0].incorporated_state_code
+            summary_by_cusip_entry['rating'] = grouped[cusip][0].rating
+            summary_by_cusip_entry['security_description'] = grouped[cusip][0].security_description
+            summary_by_cusip_entry['coupon'] = grouped[cusip][0].coupon
+            summary_by_cusip_entry['maturity_date'] = grouped[cusip][0].maturity_date
+            
+            summary_by_cusip.push(summary_by_cusip_entry)
+        }
+
+        if (summary_by_cusip.length !== 0) {
+            setNoRelatedBondsFound(false)
+            return (summary_by_cusip.map((c) => (
+                <>
+                <tr key={c.id} data-id={c.id} onClick={handleClick} style={hoverStyle} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
+                    <td>{c.cusip}</td>
+                    <td>{statesDict[c.state]}</td>
+                    <td>{ratingsDict[c.rating]}</td>
+                    <td>{c.security_description}</td>
+                    <td>{c.avg_yield.toFixed(3)}</td>
+                    <td>{c.avg_price.toFixed(3)}</td>
+                    <td>{+parseFloat(c.coupon).toFixed(3)}</td>
+                    <td>{c.maturity_date}</td>         
+                </tr>
+                
+                {hiddenRows.includes(c.id) && (
+                <tr key={c.id + '_hidden'}>
+                    <td colspan='9'>
+                    <Table striped bordered>
+                        <thead>
+                            <tr>
+                                <th>Trade Date & Time</th>
+                                <th>Yield (%)</th>
+                                <th>Price (%)</th>
+                                <th>Yield to Worst Date</th>
+                                <th>Trade Amount (k)</th>
+                                <th>Trade Type</th>
+                            </tr>
+                        </thead>
+                        <tbody>{dispSingleTradeDetails(grouped, c.cusip)}</tbody>
+                    </Table>
+                    </td>
+                </tr>
+                )}</>
+            )))
+        } else if (isPricing || isRelatedLoading || !similarBondsSearchHasRun) {
+            return (<tr style={{border: 'none'}}></tr>)
+        } else {
+            return (<tr style={{border: 'none'}}><br></br>The current criteria is too restrictive to find any similar bonds. Consider removing the S&P rating, purpose class, and / or description.</tr>)
+        }
+    }
+
+    function drawTable(){
+        return(
+            <Table striped bordered>
+            {noRelatedBondsFound? '':
+            <thead>
+                <tr>
+                    <th>CUSIP</th>
+                    <th>State</th>
+                    <th>S&P</th>
+                    <th>Description</th>
+                    <th>Avg Yield (%)</th>
+                    <th>Avg Price (%)</th>
+                    <th>Coupon</th>
+                    <th>Maturity Date</th>
+                </tr>
+            </thead>
+            }
+            <tbody>{dispTradesByCusip()}</tbody>
+            </Table>
+        )
+    }
+
+    const stateRef = React.createRef()
+    const ratingRef = React.createRef()
+    const purposeClassRef = React.createRef()
+
+    // Check if we should show the form
+    const shouldShowForm = searchValCusip && predictedYield && predictedPrice;
+
+    if (!shouldShowForm) {
+        return null;
+    }
+
+    function handleMaturityFrom(e) {
+        const chosenDate = e.target.value // e.g. "2025-01-01"
+        // const asYear = chosenDate ? new Date(chosenDate).getFullYear() : 2025
+        setMinMaturityDate(chosenDate)
+        relatedSearchVal.minMaturityDate = chosenDate
+    }
+
+    function handleMaturityTo(e) {
+        const chosenDate = e.target.value // e.g. "2125-12-31"
+        // const asYear = chosenDate ? new Date(chosenDate).getFullYear() : 2125
+        setMaxMaturityDate(chosenDate)
+        relatedSearchVal.maxMaturityDate = chosenDate
+    }
+
+    function limitToTwoDecimals(value) {
+        if (value.includes('.')) {
+            const [intPart, decimalPart] = value.split('.');
+            if (decimalPart.length > 2) {
+                return `${intPart}.${decimalPart.slice(0, 2)}`;
+            }
+        }
+        return value;
+    }
+
+    // Helper function to process coupon input.
+    function processCouponInput(e, setCoupon, couponKey) {
+        let inputValue = e.target.value;
+
+        // Check if the input is empty
+        if (inputValue === "") {
+            setCoupon("");
+            relatedSearchVal[couponKey] = null;  // Set to null for validation
+            return;
+        }
+
+        // Restrict to at most 2 decimal places using the existing helper.
+        inputValue = limitToTwoDecimals(inputValue);
+
+        // Otherwise, proceed with normal parsing.
+        const newVal = parseFloat(inputValue);
+        if (!isNaN(newVal)) {
+            const scaledVal = newVal * 100;
+            setCoupon(newVal);
+            relatedSearchVal[couponKey] = scaledVal;
+        }
+    }
+
+    function handleCouponFrom(e) {
+        processCouponInput(e, setMinCoupon, "minCoupon");
+    }
+
+    function handleCouponTo(e) {
+        processCouponInput(e, setMaxCoupon, "maxCoupon");
+    }
+
+    // Custom CSS class for Typeahead to ensure consistent sizing with other inputs
+    const typeaheadStyle = {
+        minHeight: '31px',
+        fontSize: '0.9rem'
+    };
+
+    return (
+        <div className="mt-4">
+            <Form noValidate validated={validated} onSubmit={handleSubmit} className="bg-white shadow-sm rounded p-4 mb-4">
+                <Form.Group className="mb-4">
+                    <h5 className="mb-4 text-gray-700" style={{ fontSize: '1.1rem' }}>Search for Similar Bonds</h5>
+                    <p className="text-muted mb-3" style={{ fontSize: '0.9rem' }}>Fields marked with <span className="text-danger">*</span> are required</p>
+
+                    <Row className="mb-3">
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>State</Form.Label>
+                            <div style={{ fontSize: '0.9rem' }}>
+                                <Typeahead
+                                    id="typeaheadState"
+                                    inputProps={{ style: { fontSize: '0.9rem' } }}
+                                    ref={stateRef}
+                                    onChange={selected => {
+                                        const ids = selected.map(({ id }) => id)
+                                        if (ids.length > 0) { setRelatedDict({ 'state': ids }) }
+                                        else { setRelatedDict({ 'state': undefined }) }
+                                    }}
+                                    selected={relatedSearchVal.state !== undefined ? [findOptionById(statesList, relatedSearchVal.state)]:[]}
+                                    options={statesList}
+                                    style={typeaheadStyle}
+                                />
+                            </div>
+                        </Col>
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>S&P Rating</Form.Label>
+                            <div style={{ fontSize: '0.9rem' }}>
+                                <Typeahead
+                                    id="typeaheadRating"
+                                    inputProps={{ style: { fontSize: '0.9rem' } }}
+                                    ref={ratingRef}
+                                    onChange={selected => {
+                                        const ids = selected.map(({ id }) => id)
+                                        if (ids.length > 0){ setRelatedDict({ 'rating': ids }) }
+                                        else { setRelatedDict({ 'rating': undefined }) }
+                                    }}
+                                    selected={relatedSearchVal.rating !== undefined ? [findOptionById(ratingList, relatedSearchVal.rating)]:[]}
+                                    options={ratingList}
+                                    style={typeaheadStyle}
+                                />
+                            </div>
+                        </Col>
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>Purpose Class</Form.Label>
+                            <div style={{ fontSize: '0.9rem' }}>
+                                <Typeahead
+                                    id="typeaheadPurposeClass"
+                                    inputProps={{ style: { fontSize: '0.9rem' } }}
+                                    ref={purposeClassRef}
+                                    onChange={selected => {
+                                        const ids = selected.map(({ id }) => id)
+                                        if (ids.length > 0){ setRelatedDict({ 'purposeClass': ids }) }
+                                        else { setRelatedDict({ 'purposeClass': undefined }) }
+                                    }}
+                                    selected={relatedSearchVal.purposeClass !== undefined ? [findOptionById(purposeClassList, relatedSearchVal.purposeClass)]:[]}
+                                    options={purposeClassList}
+                                    style={typeaheadStyle}
+                                />
+                            </div>
+                        </Col>
+                    </Row>
+
+                    <Row className="mb-3">
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Maturity Date From
+                            </Form.Label>
+                            <Form.Control
+                                type="date"
+                                defaultValue="2025-01-01"
+                                onChange={handleMaturityFrom}
+                                style={formElementStyle}
+                            />
+                        </Col>
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Maturity Date To
+                            </Form.Label>
+                            <Form.Control
+                                type="date"
+                                defaultValue="2125-12-31"
+                                onChange={handleMaturityTo}
+                                style={formElementStyle}
+                            />
+                        </Col>
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Minimum Trade Amount (thousands)
+                            </Form.Label>
+                            <InputGroup>
+                                <InputGroup.Text style={{ fontSize: '0.9rem' }}>$ (k)</InputGroup.Text>
+                                <Form.Control
+                                    placeholder="Dollar Amount"
+                                    type="number"
+                                    min="0"
+                                    name="amount"
+                                    value={relatedSearchVal.amount}
+                                    onChange={set('amount')}
+                                    style={formElementStyle}
+                                />
+                            </InputGroup>
+                        </Col>
+                    </Row>
+
+                    <Row className="mb-3">
+                        <Col md={2}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Min Coupon <span className="text-danger">*</span>
+                            </Form.Label>
+                            <Form.Control
+                                type="number"
+                                value={minCoupon}
+                                onChange={handleCouponFrom}
+                                required
+                                isInvalid={validated && (minCoupon === "" || minCoupon === null || isNaN(minCoupon))}
+                                style={formElementStyle}
+                            />
+                            <Form.Control.Feedback type="invalid">
+                                Min coupon is required
+                            </Form.Control.Feedback>
+                        </Col>
+                        <Col md={2}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Max Coupon <span className="text-danger">*</span>
+                            </Form.Label>
+                            <Form.Control
+                                type="number"
+                                value={maxCoupon}
+                                onChange={handleCouponTo}
+                                required
+                                isInvalid={validated && (maxCoupon === "" || maxCoupon === null || isNaN(maxCoupon))}
+                                style={formElementStyle}
+                            />
+                            <Form.Control.Feedback type="invalid">
+                                Max coupon is required
+                            </Form.Control.Feedback>
+                        </Col>
+                        <Col md={4}>
+                            <Form.Label style={{ fontSize: '0.9rem', fontWeight: '500' }}>
+                                Description
+                            </Form.Label>
+                            <Form.Control
+                                type="text"
+                                placeholder="Description"
+                                name="desc"
+                                onChange={set('desc')}
+                                value={relatedSearchVal.desc}
+                                style={formElementStyle}
+                            />
+                        </Col>
+                        <Col md={2} className="d-flex align-items-end">
+                            <ButtonGroup style={{ fontSize: '0.9rem' }}>
+                                {radios.map((radio, idx) => (
+                                    <ToggleButton
+                                        key={idx}
+                                        id={`radio-${idx}`}
+                                        type="radio"
+                                        variant="outline-secondary"
+                                        name="radio"
+                                        value={radio.value}
+                                        checked={radioValue === radio.value}
+                                        onChange={(e) => {
+                                            setRadioValueAndUpdateRelatedDict(e.currentTarget.value)
+                                        }}
+                                        style={{ fontSize: '0.9rem' }}
+                                    >
+                                        {radio.name}
+                                    </ToggleButton>
+                                ))}
+                            </ButtonGroup>
+                        </Col>
+                        <Col md={2} className="d-flex align-items-end">
+                            <ButtonGroup style={{ fontSize: '0.9rem' }}>
+                                {issuerChoices.map((issuerChoice, idx) => (
+                                    <ToggleButton
+                                        key={idx}
+                                        id={`issuerChoice-${idx}`}
+                                        type="radio"
+                                        variant="outline-secondary"
+                                        name="issuerChoice"
+                                        value={issuerChoice.value}
+                                        checked={issuerChoiceValue === issuerChoice.value}
+                                        onChange={(e) => {
+                                            setIssuerChoiceValueAndUpdateRelatedDict(e.currentTarget.value)
+                                        }}
+                                        style={{ fontSize: '0.9rem' }}
+                                    >
+                                        {issuerChoice.name}
+                                    </ToggleButton>
+                                ))}
+                            </ButtonGroup>
+                        </Col>
+                    </Row>
+
+                    <div className="d-flex justify-content-end">
+                        {isRelatedLoading ? (
+                            <Button style={{ fontSize: '0.9rem' }} disabled>
+                                <Spinner as="span" animation="border" size="sm" role="status" aria-hidden="true"/>
+                                {' '}Fetching Similar Bonds
+                            </Button>
+                        ) : (
+                            <Button style={{ fontSize: '0.9rem' }} type="submit">
+                                Search Similar Bonds
+                            </Button>
+                        )}
+                    </div>
+                </Form.Group>
+            </Form>
+        </div>
+    )
+}
+
+export default (SimilarBonds)

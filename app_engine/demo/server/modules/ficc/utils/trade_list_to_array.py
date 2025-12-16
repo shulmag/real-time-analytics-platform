@@ -1,0 +1,134 @@
+'''
+Description: The `trade_list_to_array(...)` function uses the `trade_dict_to_list(...)` function to unpack the list of dictionaries and creates a list of historical trades.
+'''
+import numpy as np
+
+from modules.ficc.utils.trade_dict_to_list import trade_dict_to_list
+from modules.ficc.utils.auxiliary_functions import cache_output
+
+
+@cache_output    # use `cache_output` instead of `cache_output_verbose` (which was originally used for debugging) to not overload the logs
+def trade_list_to_array(cusip_and_trade_history_and_coupon_type_and_trade_datetime, 
+                        current_datetime,    # used solely for caching
+                        treasury_rate_df, 
+                        is_batch_pricing, 
+                        yield_spread_model_trade_history_length, 
+                        dollar_price_model_trade_history_length, 
+                        holidays, 
+                        num_features_from_last_trade, 
+                        verbose: bool = False):
+    '''NOTE: `current_datetime` is used solely for caching and should be the same as the `trade_datetime` column in `cusip_and_trade_history_and_coupon_type_and_trade_datetime` 
+    (in situations where the user is not intentionally trying to set the values to be different, e.g., point-in-time pricing).'''
+    # `cusip` is used for caching
+    cusip, trade_history, coupon_type, trade_datetime, reason_for_using_dollar_price_model = cusip_and_trade_history_and_coupon_type_and_trade_datetime['cusip'], \
+                                                                                             cusip_and_trade_history_and_coupon_type_and_trade_datetime['recent'], \
+                                                                                             cusip_and_trade_history_and_coupon_type_and_trade_datetime['coupon_type'], \
+                                                                                             cusip_and_trade_history_and_coupon_type_and_trade_datetime['trade_datetime'], \
+                                                                                             cusip_and_trade_history_and_coupon_type_and_trade_datetime['reason_for_using_dollar_price_model']
+    model_to_use = 'yield_spread' if reason_for_using_dollar_price_model == '' else 'dollar_price'    # if `reason_for_using_dollar_price_model` is empty, then we are using the yield spread model; otherwise, we are using the dollar price model
+    if len(trade_history) == 0: return np.array([]), [None] * num_features_from_last_trade, [], np.array([]), model_to_use, reason_for_using_dollar_price_model    # yield spread model trade history, last trade features, trade history displayed in UI, dollar price model trade history, model to use, reason for using the dollar price model
+    if verbose: print(f'Creating trade history for CUSIP: {cusip}')
+    
+    if coupon_type == 3:
+        model_to_use = 'dollar_price'
+        reason_for_using_dollar_price_model = 'adjustable_rate_coupon'    # this must be an empty string or match a key in `dollarPriceModelDisplayText` in `src/components/pricing.jsx` and match a key in `DOLLAR_PRICE_MODEL_DISPLAY_TEXT` in `finance.py`
+
+    yield_spread_model_trades_list = []
+    dollar_price_model_trades_list = []
+    last_trade_features_yield_spread_model = None
+    last_trade_features_dollar_price_model = None
+    trades_for_ui = []
+    encountered_trade_with_missing_or_negative_yield = False    # if we encounter a trade with a missing or negative yield, we no longer need to process the trade history for the yield spread in batch pricing
+    
+    for trade_idx, trade in enumerate(trade_history):
+        done_with_yield_spread_model = (yield_spread_model_trade_history_length == 0) and (model_to_use == 'yield_spread')
+        done_with_dollar_price_model = (dollar_price_model_trade_history_length == 0) and (model_to_use == 'dollar_price')
+        if is_batch_pricing and (done_with_yield_spread_model or done_with_dollar_price_model): break
+        
+        yield_spread_model_trades, \
+        dollar_price_model_trades, \
+        trade_features, \
+        currently_encountered_trade_with_missing_or_negative_yield = trade_dict_to_list(trade, 
+                                                                                        cusip,    # used for printing output in the case of error or for further analysis
+                                                                                        trade_idx,    # used for printing output in the case of error or for further analysis
+                                                                                        trade_datetime,    # represents the trade_datetime of the hypothetical trade being priced at this current time
+                                                                                        treasury_rate_df, 
+                                                                                        holidays, 
+                                                                                        (encountered_trade_with_missing_or_negative_yield or yield_spread_model_trade_history_length <= 0) and is_batch_pricing, 
+                                                                                        dollar_price_model_trade_history_length <= 0,    # do not have `is_batch_pricing` condition since information from processing trades for dollar price model trade history are not displayed in the front end
+                                                                                        verbose)
+        
+        encountered_trade_with_missing_or_negative_yield = encountered_trade_with_missing_or_negative_yield or currently_encountered_trade_with_missing_or_negative_yield
+
+        if not done_with_yield_spread_model and encountered_trade_with_missing_or_negative_yield:    # no need to switch to dollar price model if the negative or missing yield occurs after `yield_spread_model_trade_history_length` trades ago in the past
+            model_to_use = 'dollar_price'
+            reason_for_using_dollar_price_model = 'missing_or_negative_yields'    # this must be an empty string or match a key in `dollarPriceModelDisplayText` in `src/components/pricing.jsx`
+        if yield_spread_model_trades is not None and yield_spread_model_trade_history_length > 0:    # need the additional condition of `yield_spread_model_trade_history_length > 0` so that for individual pricing, we continue to process the trades to create `trades_for_ui`, but do not add these trades to the trade history for the yield spread model
+            yield_spread_model_trades_list.append(yield_spread_model_trades)
+            yield_spread_model_trade_history_length -= 1
+            if last_trade_features_yield_spread_model is None: last_trade_features_yield_spread_model = trade_features    # only perform this procedure once to get the most recent trade; note that it will include the trade with a null yield but that is okay since in this case we will use the dollar price model which does not use the last_yield_spread or other 'last' features which require the yield
+        if dollar_price_model_trades is not None and dollar_price_model_trade_history_length > 0:
+            dollar_price_model_trades_list.append(dollar_price_model_trades)
+            dollar_price_model_trade_history_length -= 1
+            if last_trade_features_dollar_price_model is None: last_trade_features_dollar_price_model = trade_features    # only perform this procedure once to get the most recent trade
+        if trade_features is not None and not is_batch_pricing: trades_for_ui.append(list(trade_features))    # no need to populate the list for `trades_for_ui` if we are doing batch pricing
+        
+    try:
+        yield_spread_model_trades_list = np.stack(yield_spread_model_trades_list) if len(yield_spread_model_trades_list) > 0 else np.array([])
+        dollar_price_model_trades_list = np.stack(dollar_price_model_trades_list) if len(dollar_price_model_trades_list) > 0 else np.array([])
+        last_trade_features = last_trade_features_dollar_price_model if model_to_use == 'dollar_price' else last_trade_features_yield_spread_model
+        if last_trade_features is None: last_trade_features = [None] * num_features_from_last_trade
+        trades_for_ui = np.stack(trades_for_ui) if len(trades_for_ui) > 0 else np.array([])
+        return yield_spread_model_trades_list, last_trade_features, trades_for_ui, dollar_price_model_trades_list, model_to_use, reason_for_using_dollar_price_model
+    except Exception as e:
+        print(f'`trade_list_to_array(...)` failed with {type(e)}: {e}')
+        print('trades list used in yield spread model')
+        for trade in yield_spread_model_trades_list: print(trade)
+        print('trades list used in dollar price model')
+        for trade in dollar_price_model_trades_list: print(trade)
+        print('trades displayed in the UI')
+        for trade in trades_for_ui: print(trade)
+        raise e
+
+
+@cache_output    # use `cache_output` instead of `cache_output_verbose` (which was originally used for debugging) to not overload the logs
+def trade_list_to_array_similar_trades(cusip_and_similar_trade_history_and_trade_datetime, 
+                                       current_datetime,    # used solely for caching
+                                       trade_history_length, 
+                                       treasury_rate_df, 
+                                       holidays, 
+                                       num_features_from_last_trade, 
+                                       verbose: bool = False):
+    '''Assumes that every trade in `similar_trade_history` has a yield.
+    NOTE: `current_datetime` should be the same as the `trade_datetime` column in `cusip_and_similar_trade_history_and_trade_datetime` 
+    (in situations where the user is not intentionally trying to set the values to be different, e.g., point-in-time pricing).'''
+    cusip, similar_trade_history, trade_datetime = cusip_and_similar_trade_history_and_trade_datetime['cusip'], cusip_and_similar_trade_history_and_trade_datetime['recent_similar'], cusip_and_similar_trade_history_and_trade_datetime['trade_datetime']
+    if len(similar_trade_history) == 0: return np.array([]), [None] * num_features_from_last_trade
+    if verbose: print(f'Creating similar trade history for CUSIP: {cusip}')
+
+    trades_list = []
+    last_trade_features = None
+    for trade_idx, trade in enumerate(similar_trade_history):
+        if trade_history_length == 0: break
+        trade_as_list, _, trade_features, _ = trade_dict_to_list(trade, 
+                                                                 cusip,    # used for printing output in the case of error or for further analysis
+                                                                 trade_idx,    # used for printing output in the case of error or for further analysis
+                                                                 trade_datetime,    # represents the trade_datetime of the hypothetical trade being priced at this current time
+                                                                 treasury_rate_df, 
+                                                                 holidays, 
+                                                                 trade_history_length <= 0, 
+                                                                 True, 
+                                                                 verbose)
+        if trade_as_list is not None:
+            trades_list.append(trade_as_list)
+            trade_history_length -= 1
+            if last_trade_features is None: last_trade_features = trade_features
+    if last_trade_features is None: last_trade_features = [None] * num_features_from_last_trade
+    try:
+        trades_list = np.stack(trades_list) if len(trades_list) > 0 else np.array([])
+        return trades_list, last_trade_features
+    except Exception as e:
+        print(f'`trade_list_to_array_similar_trades(...)` failed with {type(e)}: {e}')
+        print('trades list used for similar trade history')
+        for trade in trades_list: print(trade)
+        raise e

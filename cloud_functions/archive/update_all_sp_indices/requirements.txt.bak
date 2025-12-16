@@ -1,0 +1,37 @@
+# Function dependencies, for example:
+# package>=version
+cachetools==5.3.3
+certifi==2024.2.2
+charset-normalizer==3.3.2
+google-api-core==1.34.1
+google-auth==2.29.0
+google-cloud-bigquery==3.22.0
+google-cloud-core==2.4.1
+google-cloud-secret-manager==2.0.0
+google-cloud-storage==2.14.0
+google-crc32c==1.5.0
+google-resumable-media==2.7.0
+googleapis-common-protos==1.63.0
+grpc-google-iam-v1==0.12.7
+grpcio==1.63.0
+grpcio-status==1.48.2
+idna==3.7
+libcst==1.3.1
+numpy==1.26.4
+packaging==24.0
+pandas==2.2.2
+proto-plus==1.23.0
+protobuf==3.20.3
+pyarrow==16.0.0
+pyasn1==0.6.0
+pyasn1_modules==0.4.0
+python-dateutil==2.9.0.post0
+pytz==2024.1
+PyYAML==6.0.1
+requests==2.31.0
+rsa==4.9
+setuptools==69.5.1
+six==1.16.0
+tzdata==2024.1
+urllib3==2.2.1
+xlrd==2.0.1

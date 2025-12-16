@@ -1,0 +1,15 @@
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/libstellar_strkey-cf72c304d9ea9f2a.rmeta: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/convert.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/crc.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/ed25519.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/strkey.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/typ.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/version.rs
+
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/stellar_strkey-cf72c304d9ea9f2a.d: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/convert.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/crc.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/ed25519.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/strkey.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/typ.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/version.rs
+
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/lib.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/convert.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/crc.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/ed25519.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/error.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/strkey.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/typ.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/stellar-strkey-0.0.9/src/version.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.0.9
+# env-dep:GIT_REVISION=9b58e04ec31afd40e352c8179376729c2852a430

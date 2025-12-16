@@ -1,0 +1,151 @@
+/*
+ * @Date: 2023-01-23
+ */
+
+import React from 'react';
+import Container from 'react-bootstrap/Container';
+import Nav from 'react-bootstrap/Nav';
+import Navbar from 'react-bootstrap/Navbar';
+import { colors, typography, spacing, borderRadius } from '../styles/commonStyles';
+
+function NavBarTop({message, userEmail}) {
+    function cannotViewPrivateContent(email) {
+        const domainsThatCanViewPrivateContent = ['ficc.ai'];
+        for (let idx = 0; idx < domainsThatCanViewPrivateContent.length; idx++) {
+            const domain = domainsThatCanViewPrivateContent[idx];
+            if (email.toLowerCase().includes('@' + domain)) return false;
+        }
+        return true;
+    }
+
+    // Component-specific styles extending common styles
+    const styles = {
+        navbar: {
+            borderBottom: `1px solid ${colors.border}`,
+            padding: `${spacing.sm} ${spacing.lg}`
+        },
+        brand: {
+            fontWeight: typography.fontWeight.bold,
+            color: '#2c3e50',
+            fontSize: typography.fontSize.xxl,
+            letterSpacing: '-0.01em'
+        },
+        brandHighlight: {
+            color: colors.primary
+        },
+        navLink: {
+            marginLeft: spacing.md,
+            marginRight: spacing.md,
+            padding: `${spacing.sm} ${spacing.lg}`,
+            borderRadius: borderRadius.md,
+            transition: 'all 0.2s ease',
+            color: colors.textSecondary,
+            fontWeight: typography.fontWeight.medium
+        },
+        badge: {
+            marginRight: spacing.xl,
+            padding: `${spacing.xs} ${spacing.md}`,
+            border: `1px solid ${colors.border}`,
+            borderRadius: borderRadius.md,
+            backgroundColor: colors.backgroundAlt,
+            fontSize: '0.85rem',
+            color: colors.textMuted,
+            fontWeight: typography.fontWeight.medium
+        },
+        message: {
+            marginRight: spacing.xl,
+            color: colors.textSecondary,
+            fontSize: typography.fontSize.md,
+            backgroundColor: '#EDF2F7',
+            padding: `${spacing.xs} ${spacing.md}`,
+            borderRadius: borderRadius.md
+        },
+        userInfo: {
+            marginLeft: spacing.md,
+            padding: `${spacing.xs} ${spacing.md}`,
+            backgroundColor: colors.backgroundAlt,
+            borderRadius: borderRadius.md,
+            border: `1px solid ${colors.border}`,
+            fontSize: typography.fontSize.md,
+            color: colors.textSecondary,
+            display: 'flex',
+            alignItems: 'center'
+        },
+        userLabel: {
+            marginRight: spacing.xs
+        },
+        userLink: {
+            color: colors.primary,
+            textDecoration: 'none',
+            fontWeight: typography.fontWeight.medium
+        }
+    };
+
+    return (
+        <Navbar 
+            bg='white' 
+            expand='lg' 
+            className="shadow-sm mb-4" 
+            style={styles.navbar}
+        >
+            <Container fluid>
+                <Navbar.Brand 
+                    href='https://pricing.ficc.ai/pricing' 
+                    style={styles.brand}
+                >
+                    ficc<span style={styles.brandHighlight}>.ai</span>
+                </Navbar.Brand>
+                <Navbar.Toggle aria-controls='basic-navbar-nav' />
+                <Navbar.Collapse id='basic-navbar-nav'>
+                    <Nav className='me-auto' style={{ marginLeft: spacing.xl }}>
+                        {[
+                            ['pricing', 'Pricing Engine'],
+                            ['compliance', 'Compliance', cannotViewPrivateContent],
+                            ['ficcyieldcurve', 'Real Time Yield Curve'],
+                            ['dailyschoonover', 'Real Time Muni Market Stats'],
+                            ['contactTab', 'Contact']
+                        ].map(([path, label, condition]) => 
+                            condition && condition(userEmail) ? null : (
+                                <Nav.Link 
+                                    key={path}
+                                    href={path} 
+                                    style={styles.navLink}
+                                    className="hover-effect"
+                                    onMouseOver={(e) => e.currentTarget.style.backgroundColor = colors.backgroundAlt}
+                                    onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                                >
+                                    {label}
+                                </Nav.Link>
+                            )
+                        )}
+                    </Nav>
+                    <div className="d-flex align-items-center">
+                        <span style={styles.badge}>
+                            Powered by S&P Data
+                        </span>
+                        {message && (
+                            <Navbar.Text 
+                                className='me-3' 
+                                style={styles.message}
+                            >
+                                {message}
+                            </Navbar.Text>
+                        )}
+                        <div style={styles.userInfo}>
+                            <span style={styles.userLabel}>Signed in as:</span>
+                            <a 
+                                href='login'
+                                style={styles.userLink}
+                                className="hover-link"
+                            >
+                                {userEmail}
+                            </a>
+                        </div>
+                    </div>
+                </Navbar.Collapse>
+            </Container>
+        </Navbar>
+    );
+}
+
+export default NavBarTop;

@@ -1,0 +1,8 @@
+google-api-core==2.11.1 
+google-cloud-aiplatform==1.28.1   
+google-cloud-core==2.3.3  
+google-cloud-logging==3.6.0  
+googleapis-common-protos==1.59.1  
+grpcio==1.56.2
+kfp==2.4.0
+functions-framework==3.*

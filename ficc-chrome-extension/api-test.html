@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FICC API Test</title>
+    <style>
+        body { 
+            font-family: monospace; 
+            padding: 20px; 
+            background: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .code {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            overflow-x: auto;
+        }
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 10px 5px;
+        }
+        input, select {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        .result {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 FICC API Test - Step by Step</h1>
+        
+        <h2>Step 1: Test Basic API Call</h2>
+        <p>First, let's test a simple API call with hardcoded credentials:</p>
+        
+        <div class="code">// Basic API call code
+const testCusip = '64971XQM3'; // Sample CUSIP
+const response = await fetch('https://api.ficc.ai/api/batchpricing', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+  },
+  body: new URLSearchParams({
+    username: 'YOUR_EMAIL',
+    password: 'YOUR_PASSWORD',
+    cusipList: testCusip,
+    quantityList: '100',
+    tradeTypeList: 'S'
+  })
+});
+const data = await response.json();
+console.log(data);</div>
+
+        <h3>Enter your credentials to test:</h3>
+        <div>
+            <input type="email" id="email" placeholder="your@email.com" style="width: 200px;">
+            <input type="password" id="password" placeholder="your password" style="width: 150px;">
+        </div>
+        
+        <div>
+            <input type="text" id="cusip" value="64971XQM3" placeholder="CUSIP" style="width: 100px;">
+            <select id="tradeType">
+                <option value="S">Sale to Customer</option>
+                <option value="P">Purchase from Customer</option>
+                <option value="D">Inter-Dealer</option>
+            </select>
+            <input type="number" id="quantity" value="100" min="1" max="10000" style="width: 80px;">
+        </div>
+        
+        <button onclick="testSingleCusip()">🧪 Test Single CUSIP</button>
+        <button onclick="testMultipleCusips()">🧪 Test Multiple CUSIPs</button>
+        <button onclick="showRequestCode()">📋 Show Request Code</button>
+        <button onclick="clearResults()">🗑️ Clear Results</button>
+        
+        <div id="results"></div>
+    </div>
+    
+    <script>
+        let resultContainer = document.getElementById('results');
+        
+        function addResult(title, content) {
+            const div = document.createElement('div');
+            div.className = 'result';
+            div.innerHTML = `<strong>${title}</strong>\n${content}`;
+            resultContainer.appendChild(div);
+        }
+        
+        function clearResults() {
+            resultContainer.innerHTML = '';
+        }
+        
+        async function testSingleCusip() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const cusip = document.getElementById('cusip').value;
+            const tradeType = document.getElementById('tradeType').value;
+            const quantity = document.getElementById('quantity').value;
+            
+            if (!email || !password) {
+                addResult('❌ Error', 'Please enter email and password');
+                return;
+            }
+            
+            const startTime = Date.now();
+            addResult('🚀 Making API Request...', `CUSIP: ${cusip}\nTrade Type: ${tradeType}\nQuantity: ${quantity}\nTime: ${new Date().toLocaleTimeString()}`);
+            
+            // Log to console for debugging
+            console.log('Making API request with:', {
+                url: 'https://api.ficc.ai/api/batchpricing',
+                username: email,
+                cusip: cusip,
+                quantity: quantity,
+                tradeType: tradeType
+            });
+            
+            try {
+                const requestBody = new URLSearchParams({
+                    username: email,
+                    password: password,
+                    cusipList: cusip,
+                    quantityList: quantity,
+                    tradeTypeList: tradeType
+                });
+                
+                console.log('Request body:', requestBody.toString());
+                
+                const response = await fetch('https://api.ficc.ai/api/batchpricing', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: requestBody
+                });
+                
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+                addResult('📡 Response Status', `${response.status} ${response.statusText}\nTime taken: ${elapsed} seconds`);
+                console.log('Response received:', response.status, response.statusText);
+                
+                const responseText = await response.text();
+                console.log('Response body:', responseText);
+                
+                if (response.ok) {
+                    try {
+                        const data = JSON.parse(responseText);
+                        addResult('✅ Success - API Response', JSON.stringify(data, null, 2));
+                    } catch (e) {
+                        addResult('⚠️ Response (not JSON)', responseText);
+                    }
+                } else {
+                    addResult('❌ API Error', `Status: ${response.status}\n${responseText}`);
+                }
+                
+            } catch (error) {
+                console.error('Network error:', error);
+                addResult('❌ Network Error', `${error.message}\n\nThis might be a CORS issue. Check the browser console for details.`);
+            }
+        }
+        
+        async function testMultipleCusips() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            if (!email || !password) {
+                addResult('❌ Error', 'Please enter email and password');
+                return;
+            }
+            
+            // Test with multiple CUSIPs from the Schwab page you showed
+            const testCusips = ['735389XD5', '54659LBH6', '438670W80'];
+            const quantities = ['100', '100', '100'];
+            const tradeTypes = ['S', 'S', 'S'];
+            
+            addResult('🚀 Testing Multiple CUSIPs...', `CUSIPs: ${testCusips.join(', ')}\nQuantities: ${quantities.join(', ')}\nTrade Types: ${tradeTypes.join(', ')}`);
+            
+            // Build form data - each CUSIP needs its own entry
+            const formData = new URLSearchParams();
+            formData.append('username', email);
+            formData.append('password', password);
+            
+            // Add each CUSIP separately
+            testCusips.forEach((cusip, i) => {
+                formData.append('cusipList', cusip);
+                formData.append('quantityList', quantities[i]);
+                formData.append('tradeTypeList', tradeTypes[i]);
+            });
+            
+            console.log('Batch request body:', formData.toString());
+            
+            try {
+                const response = await fetch('https://api.ficc.ai/api/batchpricing', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: formData
+                });
+                
+                const responseText = await response.text();
+                console.log('Batch response:', responseText);
+                
+                if (response.ok) {
+                    try {
+                        const data = JSON.parse(responseText);
+                        // Format the response nicely
+                        let formattedResponse = 'Results for each CUSIP:\n\n';
+                        
+                        // Check if it's the expected format
+                        if (data.cusip && typeof data.cusip === 'object') {
+                            const cusipCount = Object.keys(data.cusip).length;
+                            for (let i = 0; i < cusipCount; i++) {
+                                formattedResponse += `CUSIP ${i+1}: ${data.cusip[i]}\n`;
+                                formattedResponse += `  Price: ${data.price[i]}\n`;
+                                formattedResponse += `  YTW: ${data.ytw[i]}\n`;
+                                formattedResponse += `  Description: ${data.security_description[i]}\n`;
+                                if (data.error_message[i]) {
+                                    formattedResponse += `  ⚠️ Error: ${data.error_message[i]}\n`;
+                                }
+                                formattedResponse += '\n';
+                            }
+                        }
+                        
+                        addResult('✅ Batch Success', formattedResponse + '\nRaw Response:\n' + JSON.stringify(data, null, 2));
+                    } catch (e) {
+                        addResult('⚠️ Batch Response (not JSON)', responseText);
+                    }
+                } else {
+                    addResult('❌ Batch Error', `Status: ${response.status}\n${responseText}`);
+                }
+                
+            } catch (error) {
+                console.error('Batch error:', error);
+                addResult('❌ Network Error', error.message);
+            }
+        }
+        
+        function showRequestCode() {
+            const email = document.getElementById('email').value || 'YOUR_EMAIL';
+            const password = document.getElementById('password').value || 'YOUR_PASSWORD';
+            const cusip = document.getElementById('cusip').value;
+            
+            const code = `// JavaScript code to call FICC API
+const response = await fetch('https://api.ficc.ai/api/batchpricing', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+  },
+  body: new URLSearchParams({
+    username: '${email}',
+    password: '${password}',
+    cusipList: '${cusip}',
+    quantityList: '100',
+    tradeTypeList: 'S'
+  })
+});
+
+const data = await response.json();
+console.log(data);`;
+            
+            addResult('📋 JavaScript Code', code);
+        }
+    </script>
+</body>
+</html>

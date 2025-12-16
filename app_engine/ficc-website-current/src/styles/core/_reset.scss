@@ -1,0 +1,66 @@
+body,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+ol,
+ul,
+dl,
+menu,
+dd,
+hr,
+pre,
+button,
+input,
+select,
+textarea,
+fieldset,
+legend,
+figure,
+blockquote,
+iframe,
+dialog,
+table,
+th,
+td,
+tbody,
+tr,
+tfoot,
+thead,
+colgroup {
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+input,
+select,
+progress,
+meter {
+  -moz-appearance: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+ol,
+ul {
+  list-style: none;
+}
+
+li::before {
+  position: absolute;
+  content: '\200C';
+}
+
+a,
+abbr {
+  text-decoration: none;
+}
+
+dfn,
+address {
+  font-style: normal;
+}

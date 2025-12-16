@@ -1,0 +1,51 @@
+'''
+Author: Developer Ray
+Date: 2024-12-16
+Last Editor: Developer Ray
+Last Edit Date: 2024-12-16
+Description: Initialize a new redis with all of the data from an old redis. Then, add a reference data 
+             snapshot on top of this.
+             Use `python -u initialize_with_old_redis_and_add_new_snapshots.py >> output.txt` to print output into a file.
+             Use `nohup python -u initialize_with_old_redis_and_add_new_snapshots.py >> output.txt 2>&1 &` to run the above procedure in the background (can close the connection to the VM).
+'''
+import os
+import sys
+
+from datetime import datetime
+from pytz import timezone
+
+import pandas as pd
+
+from transfer_old_reference_data_to_new_redis import transfer_old_reference_data_to_new_redis
+
+
+reference_data_redis_update_v2_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))    # get the directory containing the 'cloud_functions/reference_data_redis_v2' package
+sys.path.append(reference_data_redis_update_v2_dir)    # add the directory to sys.path
+
+
+from rebuild_redis import get_all_reference_data
+from main import update_reference_data_redis
+
+
+EASTERN = timezone('US/Eastern')
+
+
+def set_valid_from_date_to_current_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    '''Set the `valid_from_date` in `df` to the current datetime. This is done so downstream 
+    updates to the reference data redis keep the snapshot with this `valid_from_date` as the 
+    most recent snapshot for the corresponding CUSIPs.'''
+    current_datetime = datetime.now(EASTERN)
+    current_datetime = pd.Timestamp(current_datetime).tz_localize(None).tz_localize('UTC')    # convert to timestamp, remove the timezone, and then set timezone to UTC to match convention derived from BigQuery (which sets everything to UTC by default)
+    df['ref_valid_from_date'] = current_datetime
+    return df
+
+
+def main():
+    transfer_old_reference_data_to_new_redis(convert_to_numpy_array=False)    # old reference data redis already has the value as a numpy array
+    all_new_reference_data = get_all_reference_data()
+    all_new_reference_data = set_valid_from_date_to_current_datetime(all_new_reference_data)
+    update_reference_data_redis(all_new_reference_data, verbose=True)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,63 @@
+'''
+Description: Makes asynchronous calls for large batch pricing.
+'''
+import aiohttp
+import asyncio
+import async_timeout
+
+import pandas as pd
+
+from auxiliary_variables import COLUMNS_TO_KEEP, PRINT_RETRY_MESSAGES, NUM_SERVERS
+from auxiliary_functions import get_api_call
+
+
+async def exponential_backoff(session, url, data, max_retries=5, backoff_factor=2):
+    retries = 0
+    while retries < max_retries:
+        try:
+            async with async_timeout.timeout(300):    # timeout set to 5 minutes
+                async with session.post(url, data=data) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        response_text = await response.text()
+                        raise aiohttp.ClientResponseError(request_info=response.request_info, 
+                                                          history=response.history, 
+                                                          status=response.status, 
+                                                          message=response_text, 
+                                                          headers=response.headers)
+        except asyncio.TimeoutError as e:
+            if PRINT_RETRY_MESSAGES: print(f'WARNING: Request at {url} timed out with {type(e)}: {e}. Request called with data:\n{data}')
+        except Exception as e:
+            if PRINT_RETRY_MESSAGES: print(f'WARNING: Request failed. {type(e)}: {e}. Request called with data:\n{data}')
+        retries += 1
+        wait_time = min(backoff_factor ** retries, 10)
+        if PRINT_RETRY_MESSAGES: print(f'WARNING: Retrying after {wait_time} seconds.')
+        await asyncio.sleep(wait_time)
+    raise RuntimeError('Max retries exceeded')
+
+
+async def call_batch_pricing(session, cusip_list, quantity_list, trade_type_list, username, password, server_idx: int = 0, time: str = None):
+    url, data = get_api_call(cusip_list, quantity_list, trade_type_list, username, password, time=time, server_idx=server_idx)
+    response_json = await exponential_backoff(session, url, data)
+
+    try:
+        priced_df = pd.read_json(response_json)[COLUMNS_TO_KEEP]
+    except Exception:
+        if 'error' in response_json and response_json['error'] == 'You have been logged out due to a period of inactivity. Refresh the page!':
+            raise aiohttp.ClientResponseError(request_info=None, history=None, status=401, message='You have been logged out due to a period of inactivity. Refresh the page!', headers=None)
+        else:
+            raise RuntimeError(f'unable to call `pd.read_json(...)` on the response even though `response.ok` is `True`. Running `response.json()` provides:\n{response_json}')    # raise error instead of printing the message to trigger the retry from the decorator: `run_multiple_times_before_failing`
+    return priced_df
+
+
+async def price_batches(cusip_list_batches, quantity_list_batches, trade_type_list_batches, username, password, time: str = None):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        server_idx = 0
+        for batch in zip(cusip_list_batches, quantity_list_batches, trade_type_list_batches):
+            await asyncio.sleep(0.1)    # 0.1 second sleep between each call to not overwhelm the server
+            tasks.append(asyncio.create_task(call_batch_pricing(session, *batch, username, password, server_idx=server_idx, time=time)))    # task automatically starts running when called with `asyncio.create_task(...)`
+            server_idx = (server_idx + 1) % NUM_SERVERS
+        priced_batches = await asyncio.gather(*tasks, return_exceptions=True)
+    return priced_batches

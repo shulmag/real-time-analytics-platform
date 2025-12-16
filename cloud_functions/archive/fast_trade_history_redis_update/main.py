@@ -1,0 +1,1406 @@
+'''
+Description: Take trades from MSRB and upload the trades to the trade history redis and similar trade history redis. 
+The trade history redis maps a CUSIP to its trade history. The similar trade history redis maps a trade history group 
+identifier to a history of all the trades in that group. The trades are in descending order of trade datetime and 
+other tiebreakers (the most recent trade is index 0).
+'''
+import functions_framework
+
+import os
+import logging as python_logging    # to not confuse with google.cloud.logging
+from functools import wraps
+import time
+from datetime import timedelta, datetime
+from dateutil.relativedelta import relativedelta
+
+import urllib3
+import requests
+
+from pytz import timezone
+import multiprocess as mp    # using `multiprocess` instead of `multiprocessing` because function to be called in `map` is in the same file as the function which is calling it: https://stackoverflow.com/questions/41385708/multiprocessing-example-giving-attributeerror
+
+import numpy as np
+import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype as is_datetime
+import pickle
+
+import redis
+from google.cloud import bigquery, storage, logging
+
+
+pd.options.mode.chained_assignment = None    # default='warn'; suppresses `SettingWithCopyWarning` in Pandas
+
+MULTIPROCESSING = False
+FILENAME_ADDENDUM = '_from_fast_redis_update'
+
+# # TODO: comment the below line out when not running the function locally
+# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/home/user/ficc/mitas_creds.json'
+
+# set up logging client; https://cloud.google.com/logging/docs/setup/python
+logging_client = logging.Client()
+logging_client.setup_logging()
+
+bqclient = bigquery.Client()
+reference_data_redis_host = os.environ.get('REDISHOST', '10.2.196.133')
+reference_data_redis_port = int(os.environ.get('REDISPORT', 6379))
+reference_data_redis_client = redis.Redis(host=reference_data_redis_host, port=reference_data_redis_port, db=0)
+trade_history_redis_host = os.environ.get('REDISHOST', '10.84.7.180')
+trade_history_redis_port = int(os.environ.get('REDISPORT', 6379))
+trade_history_redis_client = redis.Redis(host=trade_history_redis_host, port=trade_history_redis_port, db=0)
+similar_trade_history_redis_host = os.environ.get('REDISHOST', '10.166.249.101')
+similar_trade_history_redis_port = int(os.environ.get('REDISPORT', 6379))
+similar_trade_history_redis_client = redis.Redis(host=similar_trade_history_redis_host, port=similar_trade_history_redis_port, db=0)
+
+EASTERN = timezone('US/Eastern')
+
+YEAR_MONTH_DAY = '%Y-%m-%d'
+HOUR_MIN_SEC = '%H:%M:%S'
+
+DATETIME_FAR_INTO_FUTURE = datetime(2100, 1, 1, 0, 0, 0, 0)
+
+MAX_NUM_TRADES_IN_HISTORY = 32
+FEATURES_FOR_EACH_TRADE_IN_HISTORY = {'msrb_valid_from_date': 'DATETIME', 
+                                      'msrb_valid_to_date': 'DATETIME', 
+                                      'rtrs_control_number': 'INTEGER', 
+                                      'trade_datetime': 'DATETIME', 
+                                      'publish_datetime': 'DATETIME', 
+                                      'yield': 'FLOAT', 
+                                      'dollar_price': 'FLOAT', 
+                                      'par_traded': 'NUMERIC', 
+                                      'trade_type': 'STRING', 
+                                      'is_non_transaction_based_compensation': 'BOOLEAN', 
+                                      'is_lop_or_takedown': 'BOOLEAN', 
+                                      'brokers_broker': 'STRING', 
+                                      'is_alternative_trading_system': 'BOOLEAN', 
+                                      'is_weighted_average_price': 'BOOLEAN', 
+                                      'settlement_date': 'DATE', 
+                                      'calc_date': 'DATE', 
+                                      'calc_day_cat': 'INTEGER', 
+                                      'maturity_date': 'DATE', 
+                                      'next_call_date': 'DATE', 
+                                      'par_call_date': 'DATE', 
+                                      'refund_date': 'DATE', 
+                                      'transaction_type': 'STRING', 
+                                      'sequence_number': 'INTEGER'}
+
+MAX_NUM_TRADES_IN_SIMILAR_TRADE_HISTORY = 64    # wanted a value larger than 32 in case the last many trades were from the same CUSIP and so chose the next power of 2
+
+MAX_NUM_DAYS_FOR_TRADES_IN_HISTORY = 390    # number of days for which if there are more than `MAX_NUM_TRADES_IN_HISTORY` for a particular CUSIP, then we keep only those that are within `MAX_NUM_DAYS_FOR_TRADES_IN_HISTORY` from the current datetime for the trade history redis; similar logic for the similar trade history redis; this value should be the same as `MAX_NUM_DAYS_FOR_REFERENCE_DATA_POINT_IN_TIME` in `cloud_functions/reference_data_redis_update/main.py`
+MAX_TRADES_USED_IN_MODEL = 5    # yield spread with similar trades model uses 5 trades in the history, dollar price model uses 2 trades in the history, and so this value is max(2, 5) = 5
+
+NUM_OF_MONTHS_IN_YEAR = 12
+NUM_OF_WEEKS_IN_YEAR = 52
+NUM_OF_DAYS_IN_YEAR = 360
+
+COUPON_FREQUENCY_DICT = {0: 'Unknown',
+                         1: 'Semiannually',
+                         2: 'Monthly',
+                         3: 'Annually',
+                         4: 'Weekly',
+                         5: 'Quarterly',
+                         6: 'Every 2 years',
+                         7: 'Every 3 years',
+                         8: 'Every 4 years',
+                         9: 'Every 5 years',
+                         10: 'Every 7 years',
+                         11: 'Every 8 years',
+                         12: 'Biweekly',
+                         13: 'Changeable',
+                         14: 'Daily',
+                         15: 'Term mode',
+                         16: 'Interest at maturity',
+                         17: 'Bimonthly',
+                         18: 'Every 13 weeks',
+                         19: 'Irregular',
+                         20: 'Every 28 days',
+                         21: 'Every 35 days',
+                         22: 'Every 26 weeks',
+                         23: 'Not Applicable',
+                         24: 'Tied to prime',
+                         25: 'One time',
+                         26: 'Every 10 years',
+                         27: 'Frequency to be determined',
+                         28: 'Mandatory put',
+                         29: 'Every 52 weeks',
+                         30: 'When interest adjusts-commercial paper',
+                         31: 'Zero coupon',
+                         32: 'Certain years only',
+                         33: 'Under certain circumstances',
+                         34: 'Every 15 years',
+                         35: 'Custom',
+                         36: 'Single Interest Payment'}
+
+LARGE_NUMBER = 1e6
+
+COUPON_FREQUENCY_TYPE = {'Unknown': LARGE_NUMBER,
+                         'Semiannually': 2,
+                         'Monthly': 12,
+                         'Annually': 1,
+                         'Weekly': 52,
+                         'Quarterly': 4,
+                         'Every 2 years': 0.5,
+                         'Every 3 years': 1/3,
+                         'Every 4 years': 0.25,
+                         'Every 5 years': 0.2,
+                         'Every 7 years': 1/7,
+                         'Every 8 years': 1/8,
+                         'Biweekly':  26,
+                         'Changeable': 44,
+                         'Daily': 360,
+                         'Interest at maturity': 0,
+                         'Not Applicable': LARGE_NUMBER}
+
+# identical to `app_engine/demo/server/modules/auxiliary_functions.py::REFERENCE_DATA_FEATURES`
+REFERENCE_DATA_FEATURES = ['coupon',
+                           'cusip',
+                           'ref_valid_from_date',
+                           'ref_valid_to_date',
+                           'incorporated_state_code',
+                           'organization_primary_name',
+                           'instrument_primary_name',
+                           'issue_key',
+                           'issue_text',
+                           'conduit_obligor_name',
+                           'is_called',
+                           'is_callable',
+                           'is_escrowed_or_pre_refunded',
+                           'first_call_date',
+                           'call_date_notice',
+                           'callable_at_cav',
+                           'par_price',
+                           'call_defeased',
+                           'call_timing',
+                           'call_timing_in_part',
+                           'extraordinary_make_whole_call',
+                           'extraordinary_redemption',
+                           'make_whole_call',
+                           'next_call_date',
+                           'next_call_price',
+                           'call_redemption_id',
+                           'first_optional_redemption_code',
+                           'second_optional_redemption_code',
+                           'third_optional_redemption_code',
+                           'first_mandatory_redemption_code',
+                           'second_mandatory_redemption_code',
+                           'third_mandatory_redemption_code',
+                           'par_call_date',
+                           'par_call_price',
+                           'maximum_call_notice_period',
+                           'called_redemption_type',
+                           'muni_issue_type',
+                           'refund_date',
+                           'refund_price',
+                           'redemption_cav_flag',
+                           'max_notification_days',
+                           'min_notification_days',
+                           'next_put_date',
+                           'put_end_date',
+                           'put_feature_price',
+                           'put_frequency',
+                           'put_start_date',
+                           'put_type',
+                           'maturity_date',
+                           'sp_long',
+                           'sp_stand_alone',
+                           'sp_icr_school',
+                           'sp_prelim_long',
+                           'sp_outlook_long',
+                           'sp_watch_long',
+                           'sp_Short_Rating',
+                           'sp_Credit_Watch_Short_Rating',
+                           'sp_Recovery_Long_Rating',
+                           'moodys_long',
+                           'moodys_short',
+                           'moodys_Issue_Long_Rating',
+                           'moodys_Issue_Short_Rating',
+                           'moodys_Credit_Watch_Long_Rating',
+                           'moodys_Credit_Watch_Short_Rating',
+                           'moodys_Enhanced_Long_Rating',
+                           'moodys_Enhanced_Short_Rating',
+                           'moodys_Credit_Watch_Long_Outlook_Rating',
+                           'has_sink_schedule',
+                           'next_sink_date',
+                           'sink_indicator',
+                           'sink_amount_type_text',
+                           'sink_amount_type_type',
+                           'sink_frequency',
+                           'sink_defeased',
+                           'additional_next_sink_date',
+                           'sink_amount_type',
+                           'additional_sink_frequency',
+                           'min_amount_outstanding',
+                           'max_amount_outstanding',
+                           'default_exists',
+                           'has_unexpired_lines_of_credit',
+                           'years_to_loc_expiration',
+                           'escrow_exists',
+                           'escrow_obligation_percent',
+                           'escrow_obligation_agent',
+                           'escrow_obligation_type',
+                           'child_linkage_exists',
+                           'put_exists',
+                           'floating_rate_exists',
+                           'bond_insurance_exists',
+                           'is_general_obligation',
+                           'has_zero_coupons',
+                           'delivery_date',
+                           'issue_price',
+                           'primary_market_settlement_date',
+                           'issue_date',
+                           'outstanding_indicator',
+                           'federal_tax_status',
+                           'maturity_amount',
+                           'available_denom',
+                           'denom_increment_amount',
+                           'min_denom_amount',
+                           'accrual_date',
+                           'bond_insurance',
+                           'coupon_type',
+                           'current_coupon_rate',
+                           'daycount_basis_type',
+                           'debt_type',
+                           'default_indicator',
+                           'first_coupon_date',
+                           'interest_payment_frequency',
+                           'issue_amount',
+                           'last_period_accrues_from_date',
+                           'next_coupon_payment_date',
+                           'odd_first_coupon_date',
+                           'orig_principal_amount',
+                           'original_yield',
+                           'outstanding_amount',
+                           'previous_coupon_payment_date',
+                           'sale_type',
+                           'settlement_type',
+                           'additional_project_txt',
+                           'asset_claim_code',
+                           'additional_state_code',
+                           'backed_underlying_security_id',
+                           'bank_qualified',
+                           'capital_type',
+                           'conditional_call_date',
+                           'conditional_call_price',
+                           'designated_termination_date',
+                           'DTCC_status',
+                           'first_execution_date',
+                           'formal_award_date',
+                           'maturity_description_code',
+                           'muni_security_type',
+                           'mtg_insurance',
+                           'orig_cusip_status',
+                           'orig_instrument_enhancement_type',
+                           'other_enhancement_type',
+                           'other_enhancement_company',
+                           'pac_bond_indicator',
+                           'project_name',
+                           'purpose_class',
+                           'purpose_sub_class',
+                           'refunding_issue_key',
+                           'refunding_dated_date',
+                           'sale_date',
+                           'sec_regulation',
+                           'secured',
+                           'series_name',
+                           'sink_fund_redemption_method',
+                           'state_tax_status',
+                           'tax_credit_frequency',
+                           'tax_credit_percent',
+                           'use_of_proceeds',
+                           'use_of_proceeds_supplementary',
+                           # 'material_event_history',    # this feature doubles the query cost and is not used in the product
+                           # 'default_event_history',    # removed by Developer 2023-05-25
+                           # 'most_recent_event',
+                           # 'event_exists',
+                           'series_id',
+                           'security_description',
+                           # 'recent',    # removed by Developer 2024-08-30 since we use a separate redis for the trade history data
+                           ]
+
+PROJECT_ID = 'eng-reactor-287421'
+LOCATION = 'US'
+
+ALL_TRADE_MESSAGES_FILENAME = 'all_trade_messages'
+MSRB_INTRADAY_FILES_BUCKET_NAME = 'msrb_intraday_real_time_trade_files'
+
+LOGGING_PRECISION = 3    # choosing to log 3 digits after the decimal point since price values are only 3 digits after the decimal point
+
+
+def function_timer(function_to_time):
+    '''This function is to be used as a decorator. It will print out the execution time of `function_to_time`.'''
+    @wraps(function_to_time)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        print(f'BEGIN {function_to_time.__name__}')
+        start_time = time.time()
+        result = function_to_time(*args, **kwargs)
+        end_time = time.time()
+        print(f'END {function_to_time.__name__}. Execution time: {timedelta(seconds=end_time - start_time)}')
+        return result
+    return wrapper
+
+
+def run_multiple_times_before_raising_error(errors, max_runs):    # using the same formatting from https://stackoverflow.com/questions/10176226/how-do-i-pass-extra-arguments-to-a-python-decorator
+    '''This function customizes the returned decorator for a custom list of `errors` and a number of `max_runs`.'''
+    def run_multiple_times_before_failing(function):
+        '''This function is to be used as a decorator. It will run `function` over and over again until it does not 
+        raise an Exception for a maximum of `max_runs` (specified below) times. `max_runs = 1` is the same functionality 
+        as not having this decorator. It solves the following problems: (1) GCP limits how quickly files can be 
+        downloaded from buckets and raises an `SSLError` or a `KeyError` when the buckets are accessed too quickly in 
+        succession, (2) redis infrequently fails due to connectionError which succeeds upon running the function again.'''
+        @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+        def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+            nonlocal max_runs    # `max_runs` belongs to the outer scope
+            while max_runs > 0:
+                try:
+                    return function(*args, **kwargs)
+                except tuple(errors) as e:
+                    max_runs -= 1
+                    if max_runs == 0: raise e
+                    python_logging.warning(f'{function.__name__} raise error: {e}, but we will re-attempt it {max_runs} more times before failing')    # raise warning of error instead of error itself
+                    time.sleep(1)    # have a one second delay to prevent overloading the number of calls
+        return wrapper
+    return run_multiple_times_before_failing
+
+
+def run_five_times_before_raising_redis_connector_error(function):
+    return run_multiple_times_before_raising_error((redis.exceptions.ConnectionError,), 5)(function)    # need to make the first argument a collection to avoid `TypeError: 'type' object is not iterable`
+
+
+def convert_to_date(date):
+    '''Converts an object, either of type pd.Timestamp or datetime.datetime to a 
+    datetime.date object.'''
+    if isinstance(date, pd.Timestamp): date = date.to_pydatetime()
+    if isinstance(date, datetime): date = date.date()
+    return date    # assumes the type is datetime.date
+
+
+def compare_dates(date1, date2):
+    '''This function compares two date objects whether they are in Timestamp or datetime.date. 
+    The different types are causing a future warning. If date1 occurs after date2, return 1. 
+    If date1 equals date2, return 0. Otherwise, return -1.'''
+    return (convert_to_date(date1) - convert_to_date(date2)).total_seconds()
+
+
+def dates_are_equal(date1, date2):
+    '''This function directly calls `compare_dates` to check if two dates are equal.'''
+    return compare_dates(date1, date2) == 0
+
+
+def _diff_in_days_two_dates_360_30(end_date, start_date):
+    '''This function calculates the difference in days using the 360/30 
+    convention specified in MSRB Rule Book G-33, rule (e).'''
+    Y2 = end_date.year
+    Y1 = start_date.year
+    M2 = end_date.month
+    M1 = start_date.month
+    D2 = end_date.day
+    D1 = start_date.day
+    D1 = min(D1, 30)
+    if D1 == 30: 
+        D2 = min(D2, 30)
+    return (Y2 - Y1) * 360 + (M2 - M1) * 30 + (D2 - D1)
+
+
+def _diff_in_days_two_dates_exact(end_date, start_date):
+    diff = end_date - start_date
+    if isinstance(diff, pd.Series): return diff.dt.days    # https://stackoverflow.com/questions/60879982/attributeerror-timedelta-object-has-no-attribute-dt
+    else: return diff.days
+
+
+ACCEPTED_CONVENTIONS = {'360/30': _diff_in_days_two_dates_360_30, 
+                        'exact': _diff_in_days_two_dates_exact}
+
+
+def diff_in_days_two_dates(end_date, start_date, convention='360/30'):
+    if convention not in ACCEPTED_CONVENTIONS:
+        print('unknown convention', convention)
+        return None
+    return ACCEPTED_CONVENTIONS[convention](end_date, start_date)
+
+
+def trunc(x, decimal_places):
+    '''
+    This file truncations an input to a specified number of decimal places.
+
+    >>> trunc(3.33333, 3)
+    3.333
+    >>> trunc(3.99499, 3)
+    3.994
+    >>> trunc(30.99499, 3)
+    30.994
+    '''
+    ten_places = 10 ** decimal_places
+    return ((x * ten_places) // 1) / ten_places
+
+
+def trunc_and_round_price(price):
+    '''This function rounds the final price according to MSRB Rule Book G-33, rule (d).'''
+    return trunc(price, 3)
+
+
+def end_date_for_called_bond(trade):
+    '''This function provides the end date for a called bond.'''
+    if not pd.isnull(trade.refund_date): return trade.refund_date
+    raise ValueError(f'Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) is called, but no refund date.')
+
+
+def refund_price_for_called_bond(trade):
+    '''This function provides the par value for a called bond.'''
+    if not pd.isnull(trade.refund_price): return trade.refund_price
+    raise ValueError(f'Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) is called, but no refund price.')
+
+
+def get_frequency(identifier):
+    '''This function returns the frequency of coupon payments based on 
+    the interest payment frequency identifier in the bond reference data.'''
+    if type(identifier) == str: return COUPON_FREQUENCY_TYPE[identifier]    # check whether the frequency dict has already been applied to the identifier
+    return COUPON_FREQUENCY_TYPE[COUPON_FREQUENCY_DICT[identifier]]
+
+
+def get_time_delta_from_interest_frequency(interest_payment_frequency):
+    error_string = lambda num: f'The interest payment frequency of {interest_payment_frequency} is invalid, since it must divide {num}'
+
+    time_delta = 0
+    if interest_payment_frequency != 0:
+        if interest_payment_frequency <= 1:
+            delta = 1 / interest_payment_frequency
+            time_delta = relativedelta(years=delta)
+        elif interest_payment_frequency > 1 and interest_payment_frequency <= NUM_OF_MONTHS_IN_YEAR:
+            if NUM_OF_MONTHS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_MONTHS_IN_YEAR))
+            delta = NUM_OF_MONTHS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(months=delta)
+        elif interest_payment_frequency > NUM_OF_MONTHS_IN_YEAR and interest_payment_frequency <= NUM_OF_WEEKS_IN_YEAR:
+            if NUM_OF_WEEKS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_WEEKS_IN_YEAR))
+            delta = NUM_OF_WEEKS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(weeks=delta)
+        elif interest_payment_frequency > NUM_OF_WEEKS_IN_YEAR and interest_payment_frequency <= NUM_OF_DAYS_IN_YEAR:
+            if NUM_OF_DAYS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_DAYS_IN_YEAR))
+            delta = NUM_OF_DAYS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(days=delta)
+    return time_delta
+
+
+@function_timer
+def typecast_reference_data(df):
+    '''This function takes the dataframe from the bigquery and updates certain 
+    fields to be the right type. Note that this function mutates the fields 
+    passed in dataframe, so the function itself has no return value.'''
+    df['coupon'] = df['coupon'].astype(float)
+    df['next_call_price'] = df['next_call_price'].astype(float)
+    return df
+
+
+def typecast_yield(df):
+    df['yield'] = df['yield'].astype(float)
+    # df['deferred'] = (df.interest_payment_frequency == 0) | df.coupon == 0
+    return df
+
+
+def get_next_coupon_date(first_coupon_date, start_date, time_delta):
+    '''This function computes the next time a coupon is paid. Note that this function could return 
+    a `next_coupon_date` that is after the end_date. This does not create a problem since we 
+    deal with the final coupon separately in `price_of_bond_with_multiple_periodic_interest_payments`. 
+    Note that it may be that this function is not necessary because the field `next_coupon_date` 
+    is never null when there is a 'next coupon date.' In the future, we should confirm whether this 
+    is the case.'''
+    date = first_coupon_date
+    while compare_dates(date, start_date) < 0:
+        date = date + time_delta
+    return date
+#     cannot use the below code since division is not valid between datetime.timedelta and relativedelta, and converting between types introduces potential for errors
+#     num_of_time_periods = int(np.ceil((start_date - first_coupon_date) / time_delta))    # `int` wraps the `ceil` function because the `ceil` function returns a float
+#     return first_coupon_date + time_delta * num_of_time_periods
+
+
+def get_previous_coupon_date(first_coupon_date, start_date, accrual_date, time_delta, next_coupon_date=None):
+    '''This function computes the previous time a coupon was paid for this bond 
+    by relating it to the next coupon date.
+    Note that it may be that this function is not necessary because the field 
+    `previous_coupon_date` is never null when `next_coupon_date` exists. In the 
+    future, we should confirm whether this is the case.'''
+    if next_coupon_date == None: next_coupon_date = get_next_coupon_date(first_coupon_date, start_date, time_delta)
+
+    if dates_are_equal(next_coupon_date, first_coupon_date): return accrual_date
+    return next_coupon_date - time_delta
+
+
+def get_prev_coupon_date_and_next_coupon_date(trade, frequency, time_delta):
+    '''This function is valid for bonds that don't pay coupons, whereas the previous 
+    two functions assume the bond pays coupons.
+    Note: the field of `next_coupon_payment_date` corresponds to our variable of 
+    `next_coupon_date` (removing the word `payment`) for more concise and readable 
+    code, and similarly with `previous_coupon_date`.'''
+    if frequency == 0:
+        next_coupon_date = trade.maturity_date
+        prev_coupon_date = trade.accrual_date
+    else:
+        if pd.isnull(trade.next_coupon_payment_date):
+            next_coupon_date = get_next_coupon_date(trade.first_coupon_date, trade.settlement_date, time_delta)
+        else:
+            next_coupon_date = pd.to_datetime(trade.next_coupon_payment_date)
+
+        if pd.isnull(trade.previous_coupon_payment_date):
+            prev_coupon_date = get_previous_coupon_date(trade.first_coupon_date, trade.settlement_date, trade.accrual_date, time_delta, next_coupon_date)
+        else:
+            prev_coupon_date = pd.to_datetime(trade.previous_coupon_payment_date)
+
+    return prev_coupon_date, next_coupon_date
+
+
+def get_num_of_interest_payments_and_final_coupon_date(next_coupon_date, end_date, time_delta):
+    '''This function returns the number of interest payments and the final coupon 
+    date based on the next coupon date, the end date, and the gap between coupon 
+    payments. This function returns both together because one is always a 
+    byproduct of computing the other.
+    Note that the special case of an odd final coupon is handled below in 
+    `price_of_bond_with_multiple_periodic_interest_payments`.'''
+    if compare_dates(next_coupon_date, end_date) > 0: return 0, next_coupon_date    # return 1, end_date (would be valid in isolation)
+    
+    num_of_interest_payments = 1
+    final_coupon_date = next_coupon_date
+    while compare_dates(final_coupon_date + time_delta, end_date) <= 0:
+        num_of_interest_payments += 1
+        final_coupon_date += time_delta
+    return num_of_interest_payments, final_coupon_date
+
+
+def price_of_bond_with_interest_at_maturity(cusip,    # can be used for debugging purposes
+                                            settlement_date, 
+                                            accrual_date, 
+                                            end_date, 
+                                            yield_rate, 
+                                            coupon, 
+                                            RV):
+    '''This function is called when the interest is only paid at maturity (which is represented 
+    in the transformed dataframe as interest payment frequency equaling 0). There are two 
+    cases when interest is paid at maturity. The first case is for short term bonds where 
+    there is a single coupon payment at maturity, and this logic will reduce to the logic 
+    in MSRB Rule Book G-33, rule (b)(i)(A). The second case is when when there is a compounding 
+    accreted value (i.e., capital appreciation bonds) which accrues semianually. Then, to get 
+    the price of this bond, we need to account for the accrued interest. This can be thought 
+    of as a bond that pays a coupon semiannually through the duration of the bond, but all the 
+    coupon payments are made as a single payment at the time the bond is called / maturity. 
+    For more info and an example, see the link: https://www.investopedia.com/terms/c/cav.asp#:~:text=Compound%20accreted%20value%20(CAV)%20is,useful%20metric%20for%20bond%20investors.'''
+    NOMINAL_FREQUENCY = 2    # semiannual interest payment frequency
+    accrual_date_to_settlement_date = diff_in_days_two_dates(settlement_date, accrual_date)
+    settlement_date_to_end_date = diff_in_days_two_dates(end_date, settlement_date)
+    accrued = coupon * accrual_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR
+    num_of_periods_from_settlement_date_to_end_date = settlement_date_to_end_date / (NUM_OF_DAYS_IN_YEAR / NOMINAL_FREQUENCY)
+    denom = (1 + yield_rate / NOMINAL_FREQUENCY) ** num_of_periods_from_settlement_date_to_end_date
+    accrual_date_to_end_date = diff_in_days_two_dates(end_date, accrual_date)
+    base = (RV + coupon * accrual_date_to_end_date / NUM_OF_DAYS_IN_YEAR) / denom
+    return base - accrued
+
+
+def price_of_bond_with_multiple_periodic_interest_payments(cusip,    # can be used for debugging purposes
+                                                           settlement_date, 
+                                                           accrual_date,
+                                                           first_coupon_date, 
+                                                           prev_coupon_date, 
+                                                           next_coupon_date,    
+                                                           final_coupon_date, 
+                                                           end_date, 
+                                                           frequency,
+                                                           num_of_interest_payments, 
+                                                           yield_rate,
+                                                           coupon, 
+                                                           RV, 
+                                                           time_delta, 
+                                                           last_period_accrues_from_date):
+    '''This function computes the price of a bond with multiple periodic interest 
+    payments using MSRB Rule Book G-33, rule (b)(i)(B)(2). Comments with capital 
+    letter symbols represent those same symbols seen in formula in MSRB rule book.'''
+    num_of_days_in_period = NUM_OF_DAYS_IN_YEAR / frequency
+    discount_rate = 1 + yield_rate / frequency    # 1 + Y / M
+    final_coupon_date_to_end_date = diff_in_days_two_dates(end_date, final_coupon_date)
+    prev_coupon_date_to_settlement_date = diff_in_days_two_dates(settlement_date, prev_coupon_date)    # A
+    interest_due_at_end_date = coupon * final_coupon_date_to_end_date / NUM_OF_DAYS_IN_YEAR
+    
+    RV_and_interest_due_at_end_date = RV + interest_due_at_end_date
+    settlement_date_to_next_coupon_date = diff_in_days_two_dates(next_coupon_date, settlement_date)    # E - A
+    settlement_date_to_next_coupon_date_frac = settlement_date_to_next_coupon_date / num_of_days_in_period    # (E - A) / E
+    final_coupon_date_to_end_date_frac = final_coupon_date_to_end_date / num_of_days_in_period
+    num_of_periods_from_settlement_date_to_end_date = num_of_interest_payments - 1 + settlement_date_to_next_coupon_date_frac + final_coupon_date_to_end_date_frac
+    
+    RV_and_interest_due_at_end_date_discounted = RV_and_interest_due_at_end_date / (discount_rate ** num_of_periods_from_settlement_date_to_end_date)
+    
+    # The following logic statements are necessary to address odd first and final coupons
+    if dates_are_equal(next_coupon_date, first_coupon_date):
+        num_of_days_in_current_interest_payment_period = diff_in_days_two_dates(first_coupon_date, accrual_date)
+    elif not pd.isna(last_period_accrues_from_date) and compare_dates(settlement_date, last_period_accrues_from_date + time_delta) > 0:    # this logic has not been tested
+        num_of_days_in_current_interest_payment_period = 0
+    else:
+        num_of_days_in_current_interest_payment_period = num_of_days_in_period
+
+    coupon_payments_discounted_total = (coupon * num_of_days_in_current_interest_payment_period / NUM_OF_DAYS_IN_YEAR) / \
+                                       (discount_rate ** settlement_date_to_next_coupon_date_frac)
+    coupon_payment = coupon / frequency
+    for k in range(1, num_of_interest_payments):
+        coupon_payment_discounted = coupon_payment / (discount_rate ** (settlement_date_to_next_coupon_date_frac + k))
+        coupon_payments_discounted_total += coupon_payment_discounted
+        
+    accrued = coupon * prev_coupon_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR    # R * A / B
+    return RV_and_interest_due_at_end_date_discounted + coupon_payments_discounted_total - accrued
+
+
+def get_price(cusip, 
+              prev_coupon_date, 
+              first_coupon_date, 
+              next_coupon_date, 
+              end_date, 
+              settlement_date, 
+              accrual_date, 
+              frequency, 
+              yield_rate, 
+              coupon, 
+              RV, 
+              time_delta, 
+              last_period_accrues_from_date):
+    '''This function is a helper function for `compute_price`. This function calculates the price of a trade, where `yield_rate` 
+    is a specific yield and `end_date` is a fixed repayment date. All dates must be valid relative to the settlement 
+    date, as opposed to the trade date. Note that 'yield' is a reserved word in Python and should not be used as the name 
+    of a variable or column.
+    Formulas are from https://www.msrb.org/pdf.aspx?url=https%3A%2F%2Fwww.msrb.org%2FRules-and-Interpretations%2FMSRB-Rules%2FGeneral%2FRule-G-33.aspx.
+    For all bonds, `base` is the present value of future cashflows to the buyer. 
+    The clean price is this price minus the accumulated amount of simple interest that the buyer must pay to the seller, which is called `accrued`.
+    Zero-coupon bonds are handled first. For these, the yield is assumed to be compounded semi-annually, i.e., once every six months.
+    For bonds with non-zero coupon, the first and last interest payment periods may have a non-standard length,
+    so they must be handled separately.
+    When referring to the formulas in the MSRB handbook (link above), the below variables map to the code.
+    A: prev_coupon_date_to_settlement_date
+    B: NUM_OF_DAYS_IN_YEAR
+    Y: yield_rate
+    N: num_of_interest_payments
+    E: num_of_days_in_period
+    F: settlement_date_to_next_coupon_date
+    P: price
+    D: settlement_date_to_end_date
+    H: prev_coupon_date_to_end_date
+    R: coupon'''
+    yield_rate = yield_rate / 100
+    
+    # Right now we do not disambiguate zero coupon from interest at maturity. More specfically, 
+    # we should add logic that separates the cases of MSRB Rule Book G-33, rule (b) and rule (c)
+    if frequency == 0:
+        # See description for `price_of_bond_with_interest_at_maturity`
+        price = price_of_bond_with_interest_at_maturity(cusip, 
+                                                        settlement_date, 
+                                                        accrual_date, 
+                                                        end_date, 
+                                                        yield_rate, 
+                                                        coupon, 
+                                                        RV)
+    else:
+        num_of_interest_payments, final_coupon_date = get_num_of_interest_payments_and_final_coupon_date(next_coupon_date, 
+                                                                                                         end_date, 
+                                                                                                         time_delta)
+        prev_coupon_date_to_settlement_date = diff_in_days_two_dates(settlement_date, prev_coupon_date)
+            
+        num_of_days_in_period = NUM_OF_DAYS_IN_YEAR / frequency    # number of days in interest payment period 
+        assert num_of_days_in_period == round(num_of_days_in_period)
+         
+        if compare_dates(end_date, next_coupon_date) <= 0:
+            # MSRB Rule Book G-33, rule (b)(i)(B)(1)
+            settlement_date_to_end_date = diff_in_days_two_dates(end_date, settlement_date)
+            final_coupon_date_to_end_date = diff_in_days_two_dates(end_date, final_coupon_date)
+            interest_due_at_end_date = coupon * final_coupon_date_to_end_date / NUM_OF_DAYS_IN_YEAR
+            base = (RV + coupon / frequency + interest_due_at_end_date) / \
+                   (1 + (yield_rate / frequency) * settlement_date_to_end_date / num_of_days_in_period)
+            accrued = coupon * prev_coupon_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR
+            price = base - accrued
+        else:
+            # MSRB Rule Book G-33, rule (b)(i)(B)(2)
+            price = price_of_bond_with_multiple_periodic_interest_payments(cusip, 
+                                                                           settlement_date, 
+                                                                           accrual_date, 
+                                                                           first_coupon_date, 
+                                                                           prev_coupon_date, 
+                                                                           next_coupon_date, 
+                                                                           final_coupon_date, 
+                                                                           end_date,  
+                                                                           frequency,
+                                                                           num_of_interest_payments, 
+                                                                           yield_rate,
+                                                                           coupon, 
+                                                                           RV, 
+                                                                           time_delta, 
+                                                                           last_period_accrues_from_date)              
+    return trunc_and_round_price(price)
+
+
+def compute_price(trade, yield_rate=None):
+    '''This function computes the price of a trade. For bonds that have not been called, the price is the lowest of
+    three present values: to the next call date (which may be above par), to the next par call date, and to maturity.'''
+    old_date = pd.to_datetime('2000-01-01').date()     # NOTE: change this error value because the yield to worst below will always be to this date
+    return_values_if_missing_data = -100, old_date, -100, -100, -100, -1
+    
+    # below code is commented out in `server/modules/ficc/pricing/price.py` because this situation is handled in `get_data_from_redis(...)` in `server/modules/finance.py`
+    if trade.interest_payment_frequency != 0 and pd.isnull(trade.first_coupon_date):    # checks if data is faulty
+        print(f'Trade (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has a coupon but no first coupon date.')    # printing instead of raising an error to not disrupt processing large quantities of trades
+        return return_values_if_missing_data
+    
+    if yield_rate == None:
+        yield_rate = trade['yield']
+    elif type(yield_rate) == str:
+        raise ValueError('Yield rate argument cannot be a string. It must be a numerical value.')
+    
+    if pd.isna(yield_rate):
+        print(f'Trade (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has a yield value of {yield_rate}.')    # printing instead of raising an error to not disrupt processing large quantities of trades
+        return return_values_if_missing_data
+
+    frequency = trade.interest_payment_frequency
+    time_delta = get_time_delta_from_interest_frequency(frequency)
+    my_prev_coupon_date, my_next_coupon_date = get_prev_coupon_date_and_next_coupon_date(trade, frequency, time_delta)
+
+    get_price_caller = lambda end_date, redemption_value: get_price(trade.cusip, 
+                                                                    my_prev_coupon_date, 
+                                                                    trade.first_coupon_date, 
+                                                                    my_next_coupon_date, 
+                                                                    end_date, 
+                                                                    trade.settlement_date, 
+                                                                    trade.accrual_date, 
+                                                                    frequency, 
+                                                                    yield_rate, 
+                                                                    trade.coupon, 
+                                                                    redemption_value, 
+                                                                    time_delta, 
+                                                                    trade.last_period_accrues_from_date)
+
+    redemption_value_at_maturity = 100
+    if (not trade.is_called) and (not trade.is_callable):
+        yield_to_maturity = get_price_caller(trade.maturity_date, redemption_value_at_maturity)
+        return yield_to_maturity, trade.maturity_date, 0, 0, 0, 2
+    elif trade.is_called:
+        end_date = end_date_for_called_bond(trade)
+
+        if compare_dates(end_date, trade.settlement_date) < 0:
+            print(f'Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has an end date ({end_date}) which is after the settlement date ({trade.settlement_date}).')    # printing instead of raising an error to not disrupt processing large quantities of trades
+            # raise ValueError(f'Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has an end date ({end_date}) which is after the settlement date ({trade.settlement_date}).')
+        
+        redemption_value_at_refund = refund_price_for_called_bond(trade)
+        return get_price_caller(end_date, redemption_value_at_refund), end_date, 0, 0, 0, 3
+    else:
+        next_price, to_par_price, maturity_price = float('inf'), float('inf'), float('inf')
+
+        if not pd.isnull(trade.par_call_date):
+            to_par_price = get_price_caller(trade.par_call_date, trade.par_call_price)
+        if not pd.isnull(trade.next_call_date):
+            next_price = get_price_caller(trade.next_call_date, trade.next_call_price)
+        maturity_price = get_price_caller(trade.maturity_date, redemption_value_at_maturity)
+
+        prices_and_dates = [(next_price, trade.next_call_date), 
+                            (to_par_price, trade.par_call_date), 
+                            (maturity_price, trade.maturity_date)]
+        calc_price, calc_date = min(prices_and_dates, key=lambda pair: pair[0]) # this function is stable and will choose the pair which appears first in the case of ties for the lowest price
+    
+    if calc_date == trade.next_call_date: calc_day_cat = 0
+    elif calc_date == trade.par_call_date: calc_day_cat = 1
+    elif calc_date == trade.maturity_date: calc_day_cat = 2
+    elif calc_date == trade.refund_date: calc_day_cat = 3
+    else: calc_day_cat = 4
+    return calc_price, calc_date, next_price, to_par_price, maturity_price, calc_day_cat
+
+
+def get_latest_sequence_number_filename_with_folder(timestamp):
+    timestamp_wo_hour_min_sec = timestamp[:10]
+    latest_sequence_number_filename = 'latest_sequence_number' + FILENAME_ADDENDUM
+    return f'{timestamp_wo_hour_min_sec}/{latest_sequence_number_filename}.pkl'
+
+
+@function_timer
+def get_latest_sequence_number(timestamp):
+    '''Get the latest sequence number from a pickle file that contains it. Each day has a new file.'''
+    latest_sequence_number_filename_with_folder = get_latest_sequence_number_filename_with_folder(timestamp)
+    latest_sequence_number = download_pickle_file(MSRB_INTRADAY_FILES_BUCKET_NAME, latest_sequence_number_filename_with_folder)
+    latest_sequence_number = -1 if latest_sequence_number is None else latest_sequence_number
+    print(f'Latest sequence number: {latest_sequence_number}')
+    return latest_sequence_number
+
+
+@function_timer
+def update_latest_sequence_number(timestamp, sequence_number):
+    '''Update the latest sequence number in the pickle file that contains it. Each day has a new file.'''
+    latest_sequence_number_filename_with_folder = get_latest_sequence_number_filename_with_folder(timestamp)
+    upload_to_storage(latest_sequence_number_filename_with_folder, pickle.dumps(sequence_number))
+    print(f'Updated the latest sequence number to {sequence_number} in {latest_sequence_number_filename_with_folder} in Google Cloud Storage bucket: {MSRB_INTRADAY_FILES_BUCKET_NAME}')
+    return sequence_number
+
+
+def update_latest_sequence_number_and_return_success(timestamp, sequence_number):
+    '''Used to terminate the `hello_http(...)` function.'''
+    update_latest_sequence_number(timestamp, sequence_number)
+    return 'SUCCESS'
+
+
+def concatenate_date_and_time_objects_into_datetime_object(df):
+    '''Concatenate a date object with a time object to create a datetime object. We assume that the date 
+    field is a date object (converted from string to date in `convert_date_object_to_date_type`) and the 
+    time field is a string.
+    NOTE: `msrb_valid_to_date` is assigned to `publish_datetime` and `msrb_valid_from_date` is a dummy field 
+    assigned to a far away datetime. Even for point in time, the most recent data should be used for `calc_date`.'''
+    date_and_time_objects = {('trade_date', 'time_of_trade'): 'trade_datetime', 
+                             ('publish_date', 'publish_time'): 'publish_datetime'}
+    for (date_field, time_field), datetime_field in date_and_time_objects.items():
+        df[datetime_field] = df.apply(lambda row: datetime.combine(row[date_field], datetime.strptime(row[time_field], HOUR_MIN_SEC).time()), axis=1)
+    df['msrb_valid_from_date'] = df['publish_datetime']
+    df['msrb_valid_to_date'] = DATETIME_FAR_INTO_FUTURE
+    return df
+
+
+def typecast_for_bigquery(df, column_to_dtype):
+    '''Typecast each column in `column_to_dtype` for `df` to its corresponding dtype. Sometimes the numerical data 
+    that is supposed to be an integer comes in as a float causing an error when attempting to upload to bigquery.
+    TODO: figure out why certain columns come in as float when they otherwise mostly come in as integer (e.g. `issue_key`).'''
+    for column, dtype in column_to_dtype.items():
+        if column in df.columns: df[column] = df[column].astype(dtype)
+    return df
+
+
+def df_to_json_dict(df):
+    '''Convert a dataframe into a json serializable dict. Avoids `TypeError: Object of type ___ is not JSON serializable`.'''
+    df = typecast_for_bigquery(df, {'rtrs_control_number': int, 
+                                    'par_traded': int, 
+                                    'sequence_number': 'Int64', 
+                                    'calc_day_cat': 'Int64'})    # sometimes the numerical data that is supposed to be an integer comes in as a float causing an error when attempting to upload to BigQuery; use `Int64` instead of `int` to allow conversion when there are `None` values: https://stackoverflow.com/questions/26614465/python-pandas-apply-function-if-a-column-value-is-not-null
+    for column_name in df.columns:
+        column = df[column_name]
+        if is_datetime(column):
+            df[column_name] = column.dt.strftime(YEAR_MONTH_DAY + 'T' + HOUR_MIN_SEC)
+        elif column_name.endswith('_date'):
+            df[column_name] = column.astype('string')
+    df = df.mask(df == float('inf'), pd.NA)    # replaces `inf`, which may appear for certain prices as a result of `compute_price`; the reason that we do not use `df.replace(float('inf'), pd.NA)` is because of it sometimes raises `TypeError: boolean value of NA is ambiguous` which occurs because Pandas is trying to interpret the pd.NA value as a boolean in the process of replacing the float('inf') values in the DataFrame
+    df = df.astype(object).where(pd.notnull(df), None)    # need to replace all NaN values with `None` in order to properly upload to BigQuery: https://stackoverflow.com/questions/14162723/replacing-pandas-or-numpy-nan-with-a-none-to-use-with-mysqldb
+    return df.to_dict('records')
+
+
+def upload_to_bigquery(table_name, schema, df_or_dict, function_name=None):
+    '''Uploads `df_or_dict` (after converting the object to a dictionary if it is passed in as a pandas DataFrame) to 
+    `table_name` (with `schema`) using the function `load_table_from_json(...)`. If `function_name` is not `None`, then 
+    we wait until the job is completed and print the job status (success or failure).'''
+    if isinstance(df_or_dict, pd.DataFrame): df_or_dict = df_to_json_dict(df_or_dict)
+    client = bigquery.Client(project=PROJECT_ID, location=LOCATION)
+    job_config = bigquery.LoadJobConfig(schema=schema, write_disposition='WRITE_APPEND')
+    table_name = f'{PROJECT_ID}.{table_name}'    # NOTE: table will be automatically created the first time that this function is run
+    job = client.load_table_from_json(df_or_dict, table_name, job_config=job_config)
+    if function_name is not None:
+        try:    # removing this try...catch would make `client.load_table_from_dataframe(...)` asynchronous since `job.result()` would be removed
+            job.result()    # waits for job to complete
+            print(f'Upload Successful in `{function_name}`')
+        except Exception as e:
+            print(f'Upload Failed in `{function_name}`')
+            print('Dataframe')
+            num_rows_to_print_at_once = 50    # if the dataframe is too large, then it gets truncated in the logs, so we print chunks of it so that it can all be viewed; 50 is chosen since the last time this happened, we were able to see 84 rows in the logs before truncation
+            for start_idx in range(0, len(df_or_dict), num_rows_to_print_at_once):
+                end_idx = min(start_idx + num_rows_to_print_at_once, len(df_or_dict))
+                print(f'Rows {start_idx} to {end_idx - 1}')
+                print(df_or_dict[start_idx : end_idx])
+            print('Schema')
+            print(schema)
+            python_logging.warning(f'{function_name} was not able to upload to {table_name} due to {type(e)}: {e}')    # raise warning of error instead of error itself
+
+
+@function_timer
+def upload_calculation_date_and_price_to_bigquery(df, current_timestamp):
+    df = df.rename(columns={'calc_day_cat': 'calc_date_selection',    # `auxiliary_views.calculation_date_and_price` BigQuery table has the name `calc_date_selection` for `calc_day_cat`
+                            'conduit_obligor_name': 'obligor_id'})
+    column_to_dtype = {'rtrs_control_number': 'INTEGER', 
+                       'trade_datetime': 'DATETIME', 
+                       'cusip': 'STRING', 
+                       'calc_price': 'FLOAT', 
+                       'price_to_next_call': 'FLOAT', 
+                       'price_to_par_call': 'FLOAT', 
+                       'price_to_maturity': 'FLOAT', 
+                       'calc_date': 'DATE', 
+                       'next_call_date': 'DATE', 
+                       'par_call_date': 'DATE', 
+                       'maturity_date': 'DATE', 
+                       'refund_date': 'DATE', 
+                       'price_delta': 'FLOAT', 
+                       'publish_datetime': 'DATETIME', 
+                       'when_issued': 'BOOLEAN', 
+                       'calc_date_selection': 'INTEGER',    # 'calc_day_cat' was the column name used in the BigQuery table `auxiliary_views.calculation_date_and_price_from_fast_redis_update`
+                       'issue_key': 'INTEGER', 
+                       'sequence_number': 'INTEGER', 
+                       'par_traded': 'INTEGER', 
+                       'series_name': 'STRING', 
+                       'series_id': 'STRING', 
+                       'msrb_valid_to_date': 'DATETIME', 
+                       'msrb_valid_from_date': 'DATETIME', 
+                       'obligor_id': 'STRING', 
+                       'upload_datetime': 'DATETIME'}    # 'brokers_broker': 'STRING', 'assumed_settlement_date': 'DATE', 'unable_to_verify_dollar_price': 'BOOLEAN'; these columns were used in the table auxiliary_views.calculation_date_and_price_from_fast_redis_update but are not used in auxiliary_views.calculation_date_and_price
+    df['upload_datetime'] = current_timestamp    # when there are duplicate RTRS control numbers with the same `publish_datetime` and `sequence_number` (but some miscellaneous feature is different such as `obligor_id` due to weirdness with the reference data files) we use the row that corresponds to the most recent `upload_datetime`
+    df = df[list(column_to_dtype.keys())]    # keep only the columns in `columns_to_dtype`
+    schema = [bigquery.SchemaField(column, dtype) for column, dtype in column_to_dtype.items()]
+    upload_to_bigquery('auxiliary_views.calculation_date_and_price', schema, df, 'upload_calculation_date_and_price_to_bigquery')    # TODO: remove final argument for procedure to be asynchronous
+
+
+def upload_to_storage(file_name, file_text, bucket_name=MSRB_INTRADAY_FILES_BUCKET_NAME):
+    client = storage.Client()
+    bucket = client.get_bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    blob.upload_from_string(file_text)
+    print(f'File {file_name} uploaded to in {bucket_name}')
+
+
+def _get_file_from_storage_bucket(storage_client, bucket_name, file_name):
+    '''Return blob object of the file with name `file_name` from the GCP storage bucket 
+    with name `bucket_name`.'''
+    bucket = storage_client.bucket(bucket_name)    # use `.bucket(...)` since we know that the bucket exists: https://stackoverflow.com/questions/65310422/difference-between-bucket-and-get-bucket-on-google-storage
+    blob = bucket.blob(file_name)
+    if blob.exists():
+        print(f'File {file_name} found in {bucket_name}/{file_name}')
+        return blob
+    else:
+        print(f'{file_name} not found in {bucket_name}')
+
+
+@run_multiple_times_before_raising_error((KeyError, urllib3.exceptions.SSLError, requests.exceptions.SSLError), 50)    # catches KeyError: 'email', KeyError: 'expires_in', urllib3.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad, requests.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac 
+def download_pickle_file(bucket_name, file_name):
+    '''Download a pickle file `file_name` from the GCP storage bucket with name `bucket_name`.'''
+    client = storage.Client()
+    blob = _get_file_from_storage_bucket(client, bucket_name, file_name)
+    if blob is None: return None
+    pickle_in = blob.download_as_string()
+    data = pickle.loads(pickle_in)
+    print(f'Pickle file {file_name} downloaded from {bucket_name}/{file_name}')
+    return data
+
+
+def delete_file(bucket_name, file_name):
+    '''Delete `file_name` from the GCP storage bucket with name `bucket_name`.'''
+    client = storage.Client()
+    blob = _get_file_from_storage_bucket(client, bucket_name, file_name)
+    if blob is not None: blob.delete()
+
+
+DATA_TYPE_DICT = {'upload_date': 'date', 
+                  'message_type': 'string', 
+                  'sequence_number': 'integer', 
+                  'rtrs_control_number': 'integer', 
+                  'trade_type': 'string', 
+                  'transaction_type': 'string', 
+                  'cusip': 'string', 
+                  'security_description': 'string', 
+                  'dated_date': 'date', 
+                  'coupon': 'numeric', 
+                  'maturity_date': 'date', 
+                  'when_issued': 'boolean', 
+                  'assumed_settlement_date': 'date', 
+                  'trade_date': 'date', 
+                  'time_of_trade': 'time', 
+                  'settlement_date': 'date', 
+                  'par_traded': 'numeric', 
+                  'dollar_price': 'float', 
+                  'yield': 'float', 
+                  'brokers_broker': 'string', 
+                  'is_weighted_average_price': 'boolean', 
+                  'is_lop_or_takedown': 'boolean', 
+                  'publish_date': 'date', 
+                  'publish_time': 'time', 
+                  'version': 'numeric', 
+                  'unable_to_verify_dollar_price': 'boolean', 
+                  'is_alternative_trading_system': 'boolean', 
+                  'is_non_transaction_based_compensation': 'boolean', 
+                  'is_trade_with_a_par_amount_over_5MM': 'boolean'}
+
+
+@function_timer
+def get_all_trade_messages(timestamp):
+    '''Each day has its own dataframe pickle file with all trades, so we retrieve it for the 
+    day from the specified timestamp.'''
+    timestamp_wo_hour_min_sec = timestamp[:10]    # assumes that the first 10 characters of `timestamp` contain the year, month, and day (e.g., 2024-01-01 is 10 characters)
+    filename_with_directory = f'{timestamp_wo_hour_min_sec}/{ALL_TRADE_MESSAGES_FILENAME}.pkl'
+    return download_pickle_file(MSRB_INTRADAY_FILES_BUCKET_NAME, filename_with_directory), filename_with_directory
+
+
+@function_timer
+def get_msrb_trade_messages(beginning_sequence_number, timestamp):
+    '''MSRB API is no longer called in this function. See the cloud function `get_msrb_trade_messages` for more details.'''
+    trade_messages, filename = get_all_trade_messages(timestamp)
+    if trade_messages is None:
+        print(f'{filename} not found in Google Cloud Storage bucket: {MSRB_INTRADAY_FILES_BUCKET_NAME}, meaning that are no trade messages yet for today. If this is in error, refer to cloud function `get_msrb_trade_messages`.')
+        return pd.DataFrame(), beginning_sequence_number - 1
+    trade_messages_after_beginning_sequence_number = trade_messages[trade_messages.index >= beginning_sequence_number]
+    if len(trade_messages_after_beginning_sequence_number) == 0:
+        print(f'No new trade messages since sequence number: {beginning_sequence_number}')
+        return pd.DataFrame(), beginning_sequence_number - 1
+    print(f'{len(trade_messages_after_beginning_sequence_number)} trade messages since sequence number: {beginning_sequence_number}')
+    trade_messages_after_beginning_sequence_number = trade_messages_after_beginning_sequence_number.reset_index(drop=True)    # `.reset_index(drop=True)` ensures that `sequence_number` is not the index, as it is when getting trades from `get_all_trade_messages(...)`, since this causes problems downstream since the index is called `sequence_number` and there is a column `sequence_number` (e.g., `.sort_values(by='sequence_number')` throws an error because of ambiguity)
+    latest_sequence_number = trade_messages_after_beginning_sequence_number['sequence_number'].max()
+    print('Latest sequence number:', latest_sequence_number)
+    return trade_messages_after_beginning_sequence_number, latest_sequence_number
+
+
+@function_timer
+def remove_open_and_close_messages(trade_messages):
+    return trade_messages if len(trade_messages) == 0 else trade_messages.dropna(subset=['transaction_type'])    # drop the opening and closing messages for the day
+
+
+@function_timer
+def process_msrb_data(msrb_data):
+    '''Make the following modifications (that were previously done in SQL) to `par_traded` and `settlement_date`:
+    CASE
+        WHEN a.par_traded IS NULL AND is_trade_with_a_par_amount_over_5MM IS TRUE THEN 5000000
+    ELSE
+        a.par_traded
+    END AS par_traded, 
+    CASE
+        WHEN a.settlement_date IS NULL AND a.assumed_settlement_date IS NOT NULL THEN a.assumed_settlement_date
+    ELSE
+        a.settlement_date
+    END AS settlement_date
+
+    Additionally, check for multiple trade messages with the same RTRS control number. If those exist, order by publish_datetime, sequence_number 
+    descending and take the most recent (the reason why we have to use sequence number is because sometimes publish datetime is not unique). It is 
+    possibly the case that you only need sequence number because `msrb_data` only contains rows that are in the same day.'''
+    if len(msrb_data) == 0: return msrb_data
+    msrb_data = msrb_data.sort_values(by='sequence_number', ascending=False)
+    par_traded_is_null_and_par_amount_over_5MM = msrb_data['par_traded'].isnull() & msrb_data['is_trade_with_a_par_amount_over_5MM']
+    msrb_data.loc[par_traded_is_null_and_par_amount_over_5MM, 'par_traded'] = 5000000
+    msrb_data = msrb_data[msrb_data['par_traded'] >= 10000]    # remove all trades with `par_traded` less than 10000
+    msrb_data['settlement_date'].fillna(msrb_data['assumed_settlement_date'], inplace=True)    # pandas replace NaN in one column with value from corresponding row of second column: https://stackoverflow.com/questions/29177498/python-pandas-replace-nan-in-one-column-with-value-from-corresponding-row-of-sec
+    return msrb_data
+
+
+future_processing_file_name = 'trades_for_future_processing.pkl'
+future_processing_file_bucket_name = 'fast_trade_history_redis_update_files'
+
+
+@function_timer
+def get_trades_for_future_processing():
+    '''Only keep trades that are 7 days old or newer. From a team member: "If you keep trades for a month, you get 99% of the 
+    trades that eventually have reference data. If you keep trades for 2 days you get 70%. If you keep trades for 7 
+    days you get 97.5%. In almost all these cases where reference data is not available within a day, the issue is 
+    the same as when the reference data never shows up: these are short maturity securities (like coml paper) that 
+    have different reporting requirements."'''
+    trades = download_pickle_file(future_processing_file_bucket_name, future_processing_file_name)
+    if trades is None or len(trades) == 0: return pd.DataFrame()
+    trades = pd.DataFrame(trades, columns=DATA_TYPE_DICT.keys())
+    at_most_7_days_old = trades['upload_date'].apply(lambda date_string: diff_in_days_two_dates(datetime.now(), pd.to_datetime(date_string), convention='exact')) <= 7    # mark trades if it has been at most 7 days since we first saw it
+    return trades[at_most_7_days_old]    # TODO: make this faster by filtering only once a day
+
+
+@function_timer
+def store_trades_for_future_processing_and_return_trades_with_cusips_found_in_reference_data(trades, cusips_not_found):
+    '''Upload `trades` where the CUSIP for each trade is in `cusips_not_found` to the bucket if it is not empty. 
+    NOTE: If you upload a file with the same name as an existing object in your Cloud Storage bucket, the existing 
+    object is overwritten (https://cloud.google.com/storage/docs/uploads-downloads). This is the desired behavior.'''
+    if len(cusips_not_found) == 0:
+        delete_file(future_processing_file_bucket_name, future_processing_file_name)
+        return trades
+
+    print(f'CUSIPs not found in reference data redis: {cusips_not_found}')
+    cusips_not_found_condition = trades['cusip'].isin(cusips_not_found)
+    trades_with_cusips_not_found = trades[cusips_not_found_condition]
+    print(f'{len(trades_with_cusips_not_found)} trades have CUSIPs that were not found in reference data redis')
+    upload_to_storage(future_processing_file_name, pickle.dumps(trades_with_cusips_not_found), bucket_name=future_processing_file_bucket_name)
+    return trades[~cusips_not_found_condition]
+
+
+@run_five_times_before_raising_redis_connector_error
+def get_pickled_cusips_data(cusips):
+    return reference_data_redis_client.mget(cusips)
+
+
+@function_timer
+def get_reference_data_from_reference_data_redis(cusips):
+    '''Get reference data for each CUSIP in `cusips` from reference_data_redis. Return the result as a dataframe.'''
+    pickled_cusips_data = get_pickled_cusips_data(cusips)
+    reference_data = []
+    cusips_not_found = []
+    for cusip_idx, pickled_cusip_data in enumerate(pickled_cusips_data):    # takes less than 0.5 seconds, so no need to parallelize this with `multiprocess`
+        if pickled_cusip_data is None:
+            cusip = cusips[cusip_idx]
+            cusips_not_found.append(cusip)
+        else:
+            reference_data.append(pd.Series(pickle.loads(pickled_cusip_data)[0], index=REFERENCE_DATA_FEATURES))    # index 0 indicates the most recent snapshot of the reference data
+    return (pd.concat(reference_data, axis=1).T, cusips_not_found) if reference_data != [] else (pd.DataFrame(), cusips_not_found)    # list of series to dataframe: https://stackoverflow.com/questions/55478191/list-of-series-to-dataframe
+
+
+@function_timer
+def left_join_on_cusip(table1, table2):
+    '''Perform a left join of `table1` to `table2` on `cusip`. Assume that `table1` is MSRB data and 
+    `table2` is reference data, so that we keep the features from the reference data with handling of 
+    `suffixes` when calling `merge(...)`.'''
+    duplicate_column_suffix = '_remove_after_merge_to_keep_the_column_from_reference_data'
+    merged = table1.merge(table2, on='cusip', how='left', suffixes=(duplicate_column_suffix, None))    # `suffixes` argument specifies which suffix to put at the end of the column name for each table if the column name is the same; if a feature is in MSRB data and the reference data, then we want to keep the one from the reference data
+
+    # keep the coupon value from the reference data, which is called `current_coupon_rate`, and remove the one from MSRB, which is called `coupon`, and alias the reference data field to `coupon`
+    merged['coupon'] = merged['current_coupon_rate']
+    merged = merged.drop(columns=['current_coupon_rate'])
+
+    return merged.drop(columns=[column for column in merged.columns if column.endswith(duplicate_column_suffix)])    # keep the column name from the first table
+
+
+@function_timer
+def add_restrictions_on_interest_payment_frequency(df):
+    '''Make sure that `df` has `interest_payment_frequency` values that are one of 1, 2, 3, 5, 16.'''
+    return df[df['interest_payment_frequency'].isin([1, 2, 3, 5, 16])]
+
+
+@function_timer
+def add_calc_date(df):
+    '''Add the calc date field for each row to the dataframe `df`.'''
+    df['calc_price'], df['calc_date'], df['price_to_next_call'], df['price_to_par_call'], df['price_to_maturity'], df['calc_day_cat'] = zip(*df.apply(lambda row: compute_price(row), axis=1))    # no need to parallelize this since although it is the bottleneck in this procedure, the entire procedure takes less than 0.5 seconds
+    df['price_delta'] = np.abs(df.calc_price - df.dollar_price)
+    df['price_delta'] = df['price_delta'].astype(float)    # manually convert to type `float` to avoid the following error in the next line: `TypeError: loop of ufunc does not support argument 0 of type float which has no callable rint method`
+    df['price_delta'] = np.round(df['price_delta'], LOGGING_PRECISION)    # need to be rounded to LOGGING_PRECISION (can perhaps do more but not too many more digits) decimal places otherwise will be detected as an invalid numerical value
+    return df
+
+
+@function_timer
+def upload_trade_history_to_trade_history_bigquery(cusip_trade_history_pairs):
+    '''Upload the trade history to a bigquery table for easy monitoring.'''
+    def create_trade_history_record(trade_history_array):
+        '''`trade_history_array` is a numpy array for a single trade.'''
+        columns = list(FEATURES_FOR_EACH_TRADE_IN_HISTORY.keys())
+        trade_history_df = pd.DataFrame(trade_history_array, columns=columns)
+        return df_to_json_dict(trade_history_df)
+    
+    schema = [bigquery.SchemaField('cusip', 'STRING'), 
+              bigquery.SchemaField('upload_datetime', 'DATETIME'), 
+              bigquery.SchemaField('recent', 'RECORD', mode='REPEATED', fields=[bigquery.SchemaField(feature, schema_type) for feature, schema_type in FEATURES_FOR_EACH_TRADE_IN_HISTORY.items()])]    # `recent` corresponds to trade history
+    now = datetime.now(EASTERN).strftime(YEAR_MONTH_DAY + 'T' + HOUR_MIN_SEC)
+    cusip_trade_history_dict = [{'cusip': cusip, 'upload_datetime': now, 'recent': create_trade_history_record(trade_history)} for cusip, trade_history in cusip_trade_history_pairs]    # no need to parallelize this since this procedure is not a bottleneck
+    upload_to_bigquery('demo_monitoring.trade_history_only' + FILENAME_ADDENDUM, schema, cusip_trade_history_dict, 'upload_trade_history_to_trade_history_bigquery')    # TODO: remove final argument for procedure to be asynchronous
+
+
+@run_five_times_before_raising_redis_connector_error
+def cusip_exists_in_redis(redis_client, cusip):
+    '''Created this one line function solely to use the decorator: `run_five_times_before_raising_redis_connector_error`.'''
+    return redis_client.exists(cusip)
+
+
+@run_five_times_before_raising_redis_connector_error
+def get_value_for_cusip_in_redis(redis_client, cusip):
+    '''Created this one line function solely to use the decorator: `run_five_times_before_raising_redis_connector_error`.'''
+    return redis_client.get(cusip)
+
+
+@run_five_times_before_raising_redis_connector_error
+def set_value_for_cusip_in_redis(redis_client, cusip, value):
+    '''Created this one line function solely to use the decorator: `run_five_times_before_raising_redis_connector_error`.'''
+    return redis_client.set(cusip, value)
+
+
+def create_trade_history_numpy_array(trade_history_df, max_num_trades):
+    trade_history_df = trade_history_df.drop_duplicates(subset='rtrs_control_number', keep='first')    # keep the most recently published `rtrs_control_number` which we can assume is in descending order of 'publish_datetime' and 'sequence_number' due to the `.sort_values(...)` statement above
+    trade_history_df = trade_history_df[trade_history_df['transaction_type'] != 'C']    # drop all cancelled trades
+    trade_history_df = trade_history_df.sort_values(by=['trade_datetime', 'publish_datetime', 'sequence_number'], ascending=False)
+
+    current_date_as_datetime = datetime.now(EASTERN).replace(hour=23, minute=59, second=59, microsecond=999999).replace(tzinfo=None)    # set every field not pertaining to the day to be the end of day; set `tzinfo=None` so that we can compute the difference with `trade_datetime` otherwise the following error occurs: `TypeError: Cannot subtract tz-naive and tz-aware datetime-like objects.`
+    older_than_max_num_days = diff_in_days_two_dates(current_date_as_datetime, trade_history_df['trade_datetime'], convention='exact') > MAX_NUM_DAYS_FOR_TRADES_IN_HISTORY + 1    # add 1 since the current_date_as_datetime sets all of the values to be the end of the day for the current date
+    idx_of_most_recent_trade_older_than_max_num_days = np.argmax(older_than_max_num_days.values) if older_than_max_num_days.any() else len(trade_history_df)    # `np.argmax(series.values)` returns the position of the first `True` value: https://stackoverflow.com/questions/16243955/numpy-first-occurrence-of-value-greater-than-existing-value
+    return trade_history_df.head(max(idx_of_most_recent_trade_older_than_max_num_days + MAX_TRADES_USED_IN_MODEL, max_num_trades)).to_numpy()    # keep a trade if the trade is before `MAX_NUM_DAYS_FOR_TRADES_IN_HISTORY` or if the trade is one of the `max_num_trades` most recent trades; also ensures that for a trade that is within `MAX_NUM_DAYS_FOR_TRADES_IN_HISTORY`, we have the `MAX_TRADES_USED_IN_MODEL` most recent trades from that point to be used in the model if we were to do point in time pricing from that point
+
+
+def upload_trade_history_to_redis(key, trade_history, redis_client):
+    '''Add `trade_history` to `redis_client` for a corresponding `key`. If we are in 
+    testing mode, then we should wipe the redis before using it for production.
+    TODO: wipe redis before using for production.
+    NOTE: If the only new trade_message is a cancellation message and there is only one trade in the history 
+    (for example), we will upload a trade_history with nothing in it. This is good and desirable, because this 
+    will overwrite/replace a key/CUSIP with a trade_message that has subsequently been cancelled.'''
+    trade_history = pickle.dumps(trade_history)
+    redis_client.set(key, trade_history)
+
+
+def get_key_trade_history_pair(key, trade_history, redis_client, max_num_trades, key_transform_func=None, verbose=False, keep_cusip_in_trade_history=False):
+    '''`key_transform_func` is helpful in turning a tuple into a primitive type (e.g. string) that can be 
+    used as a key for Redis. Redis does not allow tuples to be used as keys.'''
+    if key_transform_func is not None: key = key_transform_func(key)
+    if verbose: print(f'Calling get_key_trade_history_pair(...) with key={key} and trade_history:\n{trade_history.to_markdown()}')
+    features_for_each_trade_in_history = list(FEATURES_FOR_EACH_TRADE_IN_HISTORY.keys())
+    if keep_cusip_in_trade_history: features_for_each_trade_in_history.append('cusip')
+    trade_history = trade_history[features_for_each_trade_in_history]    # this procedure cannot be done outside of this function since it removes the `cusip` field
+    if redis_client.exists(key):
+        old_trade_history = redis_client.get(key)
+        try:
+            old_trade_history = pd.DataFrame(pickle.loads(old_trade_history), columns=features_for_each_trade_in_history)
+        except Exception as e:
+            print('key:', key)
+            print('old_trade_history:\n', pd.DataFrame(pickle.loads(old_trade_history)))
+            raise e
+        trade_history = pd.concat([trade_history, old_trade_history], ignore_index=True)
+    return key, create_trade_history_numpy_array(trade_history, max_num_trades)
+
+
+def upload_to_redis_from_upload_function(pairs, upload_function):
+    '''Upload each pair from `pairs` to the redis using the `upload_function`.'''
+    if MULTIPROCESSING:
+        with mp.Pool() as pool_object:    # using template from https://docs.python.org/3/library/multiprocessing.html
+            pool_object.starmap(upload_function, pairs)    # need to use starmap since `upload_function` has multiple arguments: https://stackoverflow.com/questions/5442910/how-to-use-multiprocessing-pool-map-with-multiple-arguments
+    else:
+        [upload_function(key, trade_history) for key, trade_history in pairs]
+    return pairs    # unused return value
+
+
+@function_timer
+def upload_to_redis_using_mset(pairs: list, redis_client, redis_name: str = 'redis'):
+    '''Add each item in `pairs` to `redis_client`, by first converting it to a dictionary and then using `.mset(...)` 
+    Using `.mset(...)` instead of `.set(...)` uploads all the values at once and does not require multiple round trips 
+    to the redis server. If we are in testing mode, then we should wipe the redis before using it for production. 
+    `redis_name` is used only for printing.
+    TODO: wipe redis before using for production.
+    NOTE: If the only new trade_message is a cancellation message and there is only one trade in the history 
+    (for example), we will upload a trade_history with nothing in it. This is good and desirable, because this 
+    will overwrite/replace a key/CUSIP with a trade_message that has subsequently been cancelled.'''
+    pairs_to_upload_to_redis = {key: pickle.dumps(unpickled_value) for key, unpickled_value in pairs}
+    redis_client.mset(pairs_to_upload_to_redis)
+    print(f'Uploaded {len(pairs_to_upload_to_redis)} keys to {redis_name}')
+    return pairs_to_upload_to_redis    # unused return value
+
+
+@function_timer
+def update_trade_history_redis(new_trades, verbose=False):
+    '''Update the redis corresponding to the trade history with the rows from `new_trades`. If the CUSIP does not exist 
+    in the redis, then create the trade history starting from this trade(s). If the CUSIP does exist, then check if 
+    there are new messages for old RTRS control numbers and substitute those new messages for the old ones. If the 
+    `transaction_type` is 'C', remove the trade, otherwise, replace the old message with the newest message. Add 
+    new trades to the dataframe in descending order of `trade_datetime`.
+    NOTE: 'I' is an instruction or the first trade message. 'C' is to cancel the trade. We see here the trade messages 
+    have the same information. 'M' and 'R' both indicate modification. 'R' is an MSRB modification (e.g., to fill in 
+    par_traded when that value is initially null because of the `par_traded` over $5M rule).
+    NOTE: for a particular RTRS control number, there is a specific `trade_datetime`. A more recent message for that  
+    RTRS control number, such as a modify or a cancellation, would correspond to a more recent `publish_datetime`.'''
+    get_cusip_trade_history_pair_caller = lambda cusip, df: get_key_trade_history_pair(cusip, df, trade_history_redis_client, MAX_NUM_TRADES_IN_HISTORY, verbose=verbose)
+    # if MULTIPROCESSING:    # this procedure takes less than 1 second during testing, so no need to parallelize this with `multiprocess`
+    #     with mp.Pool() as pool_object:    # using template from https://docs.python.org/3/library/multiprocessing.html
+    #         cusip_trade_history_pairs = pool_object.starmap(get_cusip_trade_history_pair_caller, new_trades.groupby('cusip'))    # need to use starmap since `get_cusip_trade_history_pair_caller` has multiple arguments: https://stackoverflow.com/questions/5442910/how-to-use-multiprocessing-pool-map-with-multiple-arguments
+    # else:
+    cusip_trade_history_pairs = [get_cusip_trade_history_pair_caller(cusip, df_for_cusip) for cusip, df_for_cusip in new_trades.groupby('cusip')]
+
+    # upload_trade_history_to_trade_history_redis = lambda cusip, trade_history: upload_trade_history_to_redis(cusip, trade_history, trade_history_redis_client)
+    # upload_to_redis_from_upload_function(cusip_trade_history_pairs, upload_trade_history_to_trade_history_redis)
+    upload_to_redis_using_mset(cusip_trade_history_pairs, trade_history_redis_client, 'trade history redis')
+    return cusip_trade_history_pairs
+
+
+def remove_negative_and_missing_yields(trades_df: pd.DataFrame) -> pd.DataFrame:
+    num_trades_before_removal = len(trades_df)
+    trades_df = trades_df[~pd.isna(trades_df['yield'])]    # remove trades that have missing yields
+    trades_df = trades_df[trades_df['yield'] >= 0]    # remove trades that have negative yields
+    num_trades_after_removal = len(trades_df)
+    if num_trades_before_removal != num_trades_after_removal: print(f'Removed {num_trades_before_removal - num_trades_after_removal} trades for having negative or missing yields, leaving {num_trades_after_removal} trades')
+    return trades_df
+
+
+def add_features_for_definition_of_similar(trades_df: pd.DataFrame) -> pd.DataFrame:
+    '''Add the following features which are needed to define similarity: `years_to_maturity_date_by_5`, `coupon_by_1`. The 
+    definition of similar is one that matches on `issue_key`, `maturity_year_by_5`, and `coupon_by_1`, where `maturity_year_by_5` 
+    takes the `maturity_year` and floor divides it by 5 and `coupon_by_1` takes the coupon and floor divides it by 1.'''
+    trades_df['years_to_maturity_date_by_5'] = ((trades_df['maturity_date'] - trades_df['trade_date']).dt.days // NUM_OF_DAYS_IN_YEAR) // 5
+    trades_df['coupon_by_1'] = np.nan    # initialize the column
+    is_zero_coupon = trades_df['coupon'] == 0
+    trades_df.loc[is_zero_coupon, 'coupon_by_1'] = -1    # zero coupon has its own bucket
+    trades_df.loc[~is_zero_coupon, 'coupon_by_1'] = trades_df.loc[~is_zero_coupon, 'coupon'] // 1
+    trades_df = trades_df.astype({'issue_key': int, 'years_to_maturity_date_by_5': int, 'coupon_by_1': int})
+    return trades_df
+
+
+@function_timer
+def update_similar_trade_history_redis(new_trades, verbose=False):
+    '''Update the redis corresponding to the similar trade history with the rows from `new_trades`. If the feature set 
+    defining the related trade does not exist in the redis, then create the similar trade history starting from this 
+    trade(s). If the feature set does exist, then check if there are new messages for old RTRS control numbers 
+    and substitute those new messages for the old ones. If the `transaction_type` is 'C', remove the trade, 
+    otherwise, replace the old message with the newest message. Add new trades to the dataframe in descending 
+    order of `trade_datetime`. The definition of similar is one that matches on `issue_key`, `maturity_year_by_5`, 
+    and `coupon_by_1`, where `maturity_year_by_5` takes the maturity_year and floor divides it by 5 and `coupon_by_1` 
+    takes the coupon and floor divides it by 1.
+    NOTE: 'I' is an instruction or the first trade message. 'C' is to cancel the trade. We see here the trade messages 
+    have the same information. 'M' and 'R' both indicate modification. 'R' is an MSRB modification (e.g., to fill in 
+    par_traded when that value is initially null because of the `par_traded` over $5M rule).
+    NOTE: for a particular RTRS control number, there is a specific `trade_datetime`. A more recent message for that  
+    RTRS control number, such as a modify or a cancellation, would correspond to a more recent `publish_datetime`.
+    NOTE: Setting `verbose` to `True` provides detailed print output and is helpful for testing.'''
+    new_trades = remove_negative_and_missing_yields(new_trades)    # only keep trades with nonnegative yields
+    new_trades = new_trades.dropna(subset=['issue_key', 'maturity_date', 'trade_date', 'coupon'])    # remove trades that have null values for features that we need to determine similarity
+    if len(new_trades) == 0:
+        print('No trades to add to the similar trade history redis after removing trades with negative yields, and trades with null values for yield, issue_key, maturity_date, trade_date, or coupon.')
+        return None
+    new_trades = add_features_for_definition_of_similar(new_trades)
+    if verbose: print(f'new_trades:\n{new_trades.drop(columns=["recent"]).to_markdown()}')    # drop `recent` column because it has a lot of data that makes it difficult to read the output
+
+    features_to_string = lambda features: '_'.join([str(feature) for feature in features])    # `features` should be a tuple or list; NOTE: this lambda function is identical to `similar_group_to_similar_key(...)` in `app_engine/demo/server/modules/finance.py`
+    get_features_similar_trade_history_pair_caller = lambda features, df: get_key_trade_history_pair(features, df, similar_trade_history_redis_client, MAX_NUM_TRADES_IN_SIMILAR_TRADE_HISTORY, features_to_string, verbose=verbose, keep_cusip_in_trade_history=True)
+    features_trade_history_pairs = [get_features_similar_trade_history_pair_caller(features, df_for_features) for features, df_for_features in new_trades.groupby(['issue_key', 'years_to_maturity_date_by_5', 'coupon_by_1'])]
+
+    # upload_similar_trade_history_to_similar_trade_history_redis = lambda features, trade_history: upload_trade_history_to_redis(features, trade_history, similar_trade_history_redis_client)
+    # upload_to_redis_from_upload_function(features_trade_history_pairs, upload_similar_trade_history_to_similar_trade_history_redis)
+    upload_to_redis_using_mset(features_trade_history_pairs, similar_trade_history_redis_client, 'similar trade history redis')
+    return features_trade_history_pairs    # return value is unused, but perhaps can be used later to store these values into bigquery for testing
+
+
+@functions_framework.http
+def hello_http(request):
+    '''HTTP Cloud Function.
+    Args:
+        request (flask.Request): The request object.
+        <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
+    Returns:
+        The response text, or any set of values that can be turned into a
+        Response object using `make_response`
+        <https://flask.palletsprojects.com/en/1.1.x/api/#flask.make_response>.
+    
+    request_json = request.get_json(silent=True)
+    request_args = request.args
+
+    if request_json and 'name' in request_json:
+        name = request_json['name']
+    elif request_args and 'name' in request_args:
+        name = request_args['name']
+    else:
+        name = 'World'
+    return 'Hello {}!'.format(name)
+    
+    Step 1: Get MSRB data. Step 2: Process MSRB data. Step 3: Get reference data from reference_data_redis. 
+    Step 4: Update trade history in trade_history_redis. Step 5: Update similar trade history in 
+    similar_trade_history_redis.
+    NOTE: updating the reference data redis is done in this cloud function: `update-new-pipeline-ice-data`'''
+    current_timestamp = datetime.now(EASTERN).replace(microsecond=0)    # remove microseconds to reduce distraction
+    current_timestamp_string = current_timestamp.strftime(f'{YEAR_MONTH_DAY}_{HOUR_MIN_SEC}')
+    latest_sequence_number = get_latest_sequence_number(current_timestamp_string)
+    # TODO: this could be a place where we could try to find trades that happened when we don't expect them to
+    # if we run this cloud function once at the end of the day of every day, then we will always get all 
+    # of the trades that day. hard case: trade occurs on sunday
+    # if TESTING: latest_sequence_number = 0    # TODO: remove after testing; testing API from https://rtrsbetasubscription.msrb.org does not provide any values when `latest_sequence_number` is large
+    msrb_data, latest_sequence_number = get_msrb_trade_messages(latest_sequence_number + 1, current_timestamp_string)
+    msrb_data = remove_open_and_close_messages(msrb_data)
+    if len(msrb_data) == 0: print('No trade messages that are not the opening and closing messages')
+
+    msrb_data = process_msrb_data(msrb_data)
+    trades_for_future_processing = get_trades_for_future_processing()
+    if len(trades_for_future_processing) > 0:
+        msrb_data = pd.concat([msrb_data, trades_for_future_processing], ignore_index=True) if len(msrb_data) > 0 else trades_for_future_processing
+        msrb_data = msrb_data.drop_duplicates(keep='first', ignore_index=True)    # prevents duplicate trades being stored for future processing, if there are duplicate trades coming in due to re-running the function after upstream failures; the `keep` argument can be either `first` or `last`, but leaving it empty will result in all duplicates to be dropped; `ignore_index=True` will re-label the index as 0, 1, ..., n-1
+
+    if len(msrb_data) == 0: return update_latest_sequence_number_and_return_success(current_timestamp_string, latest_sequence_number)
+    cusip_list_from_msrb_data = msrb_data['cusip'].unique().tolist()    # .unique() prevents same CUSIP being queried in Redis when there are multiple trades with the same CUSIP
+    reference_data, cusips_not_found = get_reference_data_from_reference_data_redis(cusip_list_from_msrb_data)
+    msrb_data = store_trades_for_future_processing_and_return_trades_with_cusips_found_in_reference_data(msrb_data, cusips_not_found)
+    if len(reference_data) == 0: return update_latest_sequence_number_and_return_success(current_timestamp_string, latest_sequence_number)    # do not perform any processing if no reference data is found
+
+    reference_data = typecast_reference_data(reference_data)
+    all_data = left_join_on_cusip(msrb_data, reference_data)
+    all_data_after_restrictions = add_restrictions_on_interest_payment_frequency(all_data)
+
+    if len(all_data_after_restrictions) == 0:    # do not perform any processing if there are no trades after applying restrictions
+        print(f'No trades left after applying restrictions. Before restrictions:')
+        print(all_data.to_markdown())
+        return update_latest_sequence_number_and_return_success(current_timestamp_string, latest_sequence_number)
+    
+    all_data = all_data_after_restrictions
+    all_data['interest_payment_frequency'] = all_data['interest_payment_frequency'].apply(get_frequency)
+    all_data = typecast_yield(all_data)
+    all_data = add_calc_date(all_data)
+    all_data = concatenate_date_and_time_objects_into_datetime_object(all_data)
+    all_data = typecast_for_bigquery(all_data, {'issue_key': 'Int64'})    # sometimes the numerical data that is supposed to be an integer comes in as a float causing an error when attempting to upload to BigQuery; use `Int64` instead of `int` to allow conversion when there are `None` values: https://stackoverflow.com/questions/26614465/python-pandas-apply-function-if-a-column-value-is-not-null
+    upload_calculation_date_and_price_to_bigquery(all_data, current_timestamp)
+    all_data = all_data.sort_values(by=['publish_datetime', 'sequence_number'], ascending=False)    # `publish_datetime` and `sequence_number` are ONLY for getting the most recent trade message for a given trade (RTRS control number)
+    cusip_trade_history_pairs = update_trade_history_redis(all_data)
+    update_similar_trade_history_redis(all_data)
+    upload_trade_history_to_trade_history_bigquery(cusip_trade_history_pairs)
+    return update_latest_sequence_number_and_return_success(current_timestamp_string, latest_sequence_number)

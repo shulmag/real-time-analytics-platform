@@ -1,0 +1,161 @@
+@use "../../styles/lib" as *;
+
+
+.root {
+  display: flex;
+  position: fixed;
+  inline-size: 100vw;
+  block-size: spacing(6);
+  top: 0;
+  inset-block-start: 0;
+  background: color('surface.primary.2');
+  z-index: 9;
+
+  a {
+    
+    &:active {
+      color: color('accent')
+    }
+  }
+
+  @include screen {
+    contain: strict;
+    block-size: spacing(7);
+    align-items: center;
+  
+    a {
+      
+      &:hover,
+      &:focus {
+        color: color('accent');
+      }
+    }
+  }
+}
+
+.scroll {
+  box-shadow: shadow();
+}
+
+
+.wrapper {
+  display: flex;
+  align-items: center;
+}
+
+
+.menu {
+  contain: strict;
+  position: fixed;
+  display: flex;
+  inline-size: 100vw;
+  block-size: 100vh;
+  left: 0;
+  top: 0;
+  inset-inline-start: 0;
+  inset-block-start: 0;
+  flex-flow: column wrap;
+  background: color('surface.primary.1');
+  opacity: 0;
+  transform: translateX(-100%);
+  transition: opacity .3s, transform 0s .3s;
+  text-align: center;
+
+  p {
+    inline-size: 100%;
+    position: absolute;
+    bottom: 18px;
+    inset-block-end: 18px;
+    color: color('grey');
+    font-family: Canela;
+    font-size: 1.5rem;
+  }
+
+  a {
+    color: color('text.secondary');
+    text-transform: lowercase;
+    padding: spacing(4);
+    font-size: 1.4rem;
+
+    &:first-child {
+      margin-block-start: 15vh;
+    }
+  }
+
+  @include screen {
+    contain: layout;
+    position: static;
+    inline-size: auto;
+    block-size: auto;
+    flex-flow: row;
+    background: none;
+    transform: none;
+    transition: none;
+    opacity: 1;
+
+    p {
+      display: none;
+    }
+
+    a {
+      margin-inline-start: 2.5ch;
+      font-size: .9rem;
+      padding: 0;
+
+      &:first-child {
+        margin-block-start: 0;
+      }
+    }
+  }
+}
+
+
+.open {
+  transform: translateX(0);
+  transition: opacity .3s, transform 0s 0s;
+  opacity: 1;
+}
+
+
+.logo {
+  font: 36px / 1 #{font('serif')};
+  margin-inline-end: auto;
+
+  span {
+    color: color('accent')
+  }
+
+  @include screen {
+    font: 40px / 1 #{font('serif')};
+    margin-block-end: 3px;
+  }
+}
+
+
+.icon {
+  inline-size: spacing('ui');
+  block-size: spacing('ui');
+  background: none;
+
+  &:active {
+    transform: scale(.8)
+  }
+
+  svg {
+    block-size: 100%;
+    stroke: white;
+    stroke-linecap: round;
+    stroke-width: 2;
+  }
+
+  @include screen {
+    display: none;
+  }
+}
+
+
+.close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}

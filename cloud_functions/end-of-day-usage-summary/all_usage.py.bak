@@ -1,0 +1,105 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2024-06-13
+'''
+import pandas as pd
+
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+from auxiliary_functions import MAX_NUMBER_OF_RESULTS, SENDER_EMAIL, SENDER_PASSWORD, SMTP_SERVER, PORT, EMAIL_RECIPIENTS, function_timer, sqltodf, remove_trailing_zeros
+
+
+USAGE_TABLE_NAME = '`eng-reactor-287421.api_calls_tracker.usage_data`'
+FEATURES_FROM_USAGE_AS_STRING = 'user, cusip, quantity * 1000 AS quantity, direction, time, ficc_price, ficc_ytw'
+EXCLUDE_FICC_AI_AND_RESTRICT_TO_TODAY_AS_STRING = "user NOT LIKE '%ficc.ai%' AND EXTRACT(DATE FROM time) >= CURRENT_DATE('America/New_York')"
+
+
+ALL_USAGE_DATA_QUERY_ORDER_BY_TIME = f'''SELECT user, cusip, quantity * 1000 AS quantity, direction, time, ficc_price, ficc_ytw 
+                                         FROM {USAGE_TABLE_NAME} 
+                                         WHERE {EXCLUDE_FICC_AI_AND_RESTRICT_TO_TODAY_AS_STRING} 
+                                         ORDER BY time DESC'''
+
+ALL_USAGE_DATA_QUERY_RANDOM_SAMPLE = f'''SELECT user, cusip, quantity * 1000 AS quantity, direction, time, ficc_price, ficc_ytw 
+                                         FROM {USAGE_TABLE_NAME} 
+                                         WHERE {EXCLUDE_FICC_AI_AND_RESTRICT_TO_TODAY_AS_STRING} 
+                                         LIMIT {MAX_NUMBER_OF_RESULTS}'''
+
+ALL_USAGE_DATA_QUERY_COUNT = f'''SELECT COUNT(*)
+                                 FROM {USAGE_TABLE_NAME} 
+                                 WHERE {EXCLUDE_FICC_AI_AND_RESTRICT_TO_TODAY_AS_STRING}'''
+
+
+def send_email(subject, trades):
+    message = MIMEMultipart()
+    message['Subject'] = subject
+    message['From'] = SENDER_EMAIL
+    message['To'] = ', '.join(EMAIL_RECIPIENTS)
+    html = f'''\
+    <html>
+      <head></head>
+      <body>
+        {trades.to_html(index=False)}
+      </body>
+    </html>'''
+
+    part1 = MIMEText(html, 'html')
+    message.attach(part1)
+
+    with smtplib.SMTP(SMTP_SERVER, PORT) as server:
+        try:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, EMAIL_RECIPIENTS, message.as_string())
+        except Exception as e:
+            print(e)
+        finally:
+            server.quit()
+
+
+def remove_timestamp(df:pd.DataFrame, column_names:list):
+    '''Remove the timestamp for each column in `column_names` from `df`.'''
+    def remove_timestamp_from_series(series):
+        has_timestamp = series.str.find('+') != -1    # .find('+') searches for the '+' in the string form of the column, and if it exists, then the position will not be -1
+        if len(has_timestamp) > 0:
+            series[has_timestamp] = series[has_timestamp].str.split('+').str[0]    # keep only the first part of the split (before the '+' appears); https://stackoverflow.com/questions/29947574/splitting-at-underscore-in-python-and-storing-the-first-value
+        return series
+    for column in column_names:
+        df[column] = df[column].astype('string')
+        df[column] = remove_timestamp_from_series(df[column])
+    return df
+
+
+@function_timer
+def get_all_usage():
+    return sqltodf(ALL_USAGE_DATA_QUERY_ORDER_BY_TIME)
+
+
+@function_timer
+def get_random_sample_of_all_usage():
+    return sqltodf(ALL_USAGE_DATA_QUERY_RANDOM_SAMPLE)
+
+
+@function_timer
+def get_usage_count():
+    return sqltodf(ALL_USAGE_DATA_QUERY_COUNT).iloc[0, 0]    # query returns a table with a single item
+
+
+def send_all_usage_email(date_today):
+    '''Sends an email to `EMAIL_RECIPIENTS` with all of the usage for today.'''
+    usage_count = get_usage_count()
+    print(f'Total usage for today: {usage_count}')
+    if usage_count > MAX_NUMBER_OF_RESULTS:
+        email_subject = f'Random {MAX_NUMBER_OF_RESULTS} log entries from product usage for {date_today} (total: {usage_count})'
+        usage_df = get_random_sample_of_all_usage()
+    else:
+        email_subject = f'Product usage for {date_today} (total: {usage_count})'
+        usage_df = get_all_usage()
+    usage_df = remove_timestamp(usage_df, ['time'])
+    usage_df = remove_trailing_zeros(usage_df, ['ficc_price', 'ficc_ytw'])
+    if len(usage_df) > 0:    # entering this `if` statement indicates that there was usage today
+        send_email(email_subject, usage_df)
+        print(f'Email sent to {EMAIL_RECIPIENTS}')
+    else:
+        print('No usage today. No email was sent since there was no usage today.')

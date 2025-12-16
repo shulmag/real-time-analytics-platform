@@ -1,0 +1,79 @@
+@use "sass:map";
+@use "sass:string";
+
+
+$_color: (
+  'white': var(--white),
+  'black': var(--black),
+  'primary': var(--primary),
+  'secondary': var(--secondary),
+  'accent': var(--accent),
+  'warning': var(--warning),
+  'info': var(--info),
+  'error': var(--error),
+  'success': var(--success),
+  'text': var(--text-primary),
+  'text.primary': var(--text-primary),
+  'text.secondary': var(--text-secondary),
+  'text.contrast': var(--text-contrast),
+  'surface.primary.1': var(--surface-primary-1),
+  'surface.primary.2': var(--surface-primary-2),
+  'surface.secondary.1': var(--surface-secondary-1),
+  'surface.secondary.2': var(--surface-secondary-2),
+  'surface.accent.1': var(--surface-accent-1),
+  'grey': var(--grey-5),
+  'grey.1': var(--grey-1),
+  'grey.2': var(--grey-2),
+  'grey.3': var(--grey-3),
+  'grey.4': var(--grey-4),
+  'grey.5': var(--grey-5),
+  'grey.6': var(--grey-6),
+  'grey.7': var(--grey-7),
+  'grey.8': var(--grey-8),
+  'grey.9': var(--grey-9),
+  'gradient.start': var(--gradient-start),
+  'gradient.end': var(--gradient-end),
+);
+
+$_spacing: (
+  1: 9px,
+  2: 12px,
+  3: 18px,
+  4: 24px,
+  5: 30px,
+  6: 60px,
+  7: 90px,
+  8: 120px,
+  9: 240px,
+  'ui': 46px,
+);
+
+$_shadow: (
+  1: var(--shadow-1),
+  2: var(--shadow-2),
+  3: var(--shadow-3),
+  4: var(--shadow-4),
+);
+
+$_font: (
+  'sans': "International, Arial, sans-serif",
+  'serif': "Canela, 'Times New Roman', serif",
+  'mono': "Menlo, monospace",
+);
+
+
+@function color($arg: 'primary') {
+  @return map.get($_color, $arg);
+}
+
+@function spacing($arg: 5) {
+  @return map.get($_spacing, $arg);
+}
+
+@function shadow($arg: 1) {
+  @return map.get($_shadow, $arg);
+}
+
+@function font($arg: 'sans') {
+  @return string.unquote(map.get($_font, $arg));
+}

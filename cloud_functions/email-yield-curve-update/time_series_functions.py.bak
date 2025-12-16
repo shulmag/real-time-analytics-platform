@@ -1,0 +1,88 @@
+'''
+Author: Developer Watson
+Date: 2024-01-03
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-07
+'''
+import numpy as np
+import pandas as pd
+
+from auxiliary_functions import KEY_MATURITIES, date_format
+
+
+### INTRA-DAY FUNCTIONS
+def exponential_mean(data, weights):
+    return np.average(data, weights=weights[:len(data)])
+
+
+def intraday_groupby(df): 
+    df['date'] = pd.to_datetime(df.index.date)
+    df.sort_index(ascending=True, inplace=True)
+    return df.groupby('date')
+
+
+def _apply_intraday_func(df, func):
+    df['date'] = df.index.date
+    summary = pd.DataFrame(index = df['date'].unique())
+    for maturity in KEY_MATURITIES:
+        summary = summary.join(intraday_groupby(df)[maturity].apply(func))
+    summary.index = pd.to_datetime(summary.index)
+    return summary
+
+
+def intraday_largest_move(df):
+    # lambda function will be applied after groupby 'date'; finds the largest absolute difference between first entry
+    # (market open) and any other datapoint within the same day 
+    func = lambda x: max([x.max() - x.iloc[0], x.min() - x.iloc[0]], key=abs)
+    return _apply_intraday_func(df, func)
+
+
+def intraday_open_close(df):
+     # lambda function will be applied after groupby 'date'; finds the difference between the first (market_ pen)
+     # and last (market close) entry 
+    func = lambda x: x.iloc[-1] - x.iloc[0]
+    return _apply_intraday_func(df, func)
+
+
+def intraday_mean(df):
+    return _apply_intraday_func(df, np.mean)
+
+
+def intraday_SD(df):
+    return _apply_intraday_func(df, np.std)
+
+
+### INTER-DAY FUNCTIONS
+
+def get_close_open(group, one_business_day_before_today, today, offset: int = 0):
+    """Optional argument `offset` is used to get the value in the morning `offset` minutes after the market opens."""
+    date_str = group.name.strftime(date_format)
+    if date_str == one_business_day_before_today:
+        return group.iloc[[-1]]  # Close value for the previous business day
+    elif date_str == today:
+        return group.iloc[[0 + offset]]  # Open value for today with an offset in terms of how many minutes after 9:30am ET
+    else:
+        return None
+
+def get_overnight_change(yield_curve_df, one_business_day_before_today, today, offset: int = 0):
+    df = yield_curve_df.copy()
+    df['date'] = yield_curve_df.index.date
+    df.sort_index(ascending=True, inplace=True)
+
+    # Take market open for today and close for the previous business day
+    df = (
+        df.reset_index()
+        .groupby('date')
+        .apply(lambda group: get_close_open(group, one_business_day_before_today, today, offset))
+        .dropna() # This is necessary because if we have extraneous dates (for example if we run train_minute_yc on a holiday) there will be None/Null values from get_close_open. 
+        .reset_index(drop=True)
+        .set_index('index', drop=True)
+        .drop('date', axis=1)
+        .rename_axis(None, axis=0)
+    ) 
+    
+    # Calculate overnight deltas
+    overnight_deltas = df[KEY_MATURITIES].copy()
+    overnight_deltas.loc['Overnight Delta', :] = df[KEY_MATURITIES].diff().iloc[-1]
+    
+    return df, overnight_deltas

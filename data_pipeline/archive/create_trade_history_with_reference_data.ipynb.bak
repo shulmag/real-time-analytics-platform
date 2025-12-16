@@ -1,0 +1,1003 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Creating trade history joined with point-in-time reference data\n",
+    "Last updated by Developer.  12 Dec 2024. \n",
+    "\n",
+    "This notebook creates a sereies of views which join trade information with reference data.  Data restrictions are calculated empirically at the end of this notebook.\n",
+    "\n",
+    "Further documentation for this notebook may be found here: https://www.notion.so/Data-Wiki-d1716c1ed9444d2c99e992b6104a8593\n",
+    "\n",
+    "First we set up access to BigQuery."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "from google.cloud import bigquery\n",
+    "\n",
+    "\n",
+    "os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/user/base/ficc/creds.json'\n",
+    "bq_client = bigquery.Client()\n",
+    "\n",
+    "project = 'eng-reactor-287421'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Next we define a function that creates views. Conceptually, a view is a table that is defined by a query.\n",
+    "When the view is created, the query is not evaluated.\n",
+    "Instead, the query is evaluated whenever the table is used in a later query.\n",
+    "The database system combines the query that defines the table with the later query,\n",
+    "and optimizes them jointly.  \n",
+    "\n",
+    "The final view (_trade_history_with_reference_data_) is stored in a dataset called _primary_views_. This is the view that should be used by our models.  Views that are made to create this view are stored in a dataset called _auxiliary_views_ to reduce clutter.  These should not be used except to create _primary_views_."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def mkview(dataset, name, sql):\n",
+    "    db = f'{project}.{dataset}.'\n",
+    "    name = db + name\n",
+    "    bq_client.delete_table(name, not_found_ok=True) \n",
+    "    view = bigquery.Table(name)\n",
+    "    view.view_query = sql\n",
+    "    view = bq_client.create_table(view)\n",
+    "    return name"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "We will use the following function to test views. If the _limit_ argument is missing, then the whole table is returned."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def sqltodf(sql, limit=''):\n",
+    "    if limit != '': \n",
+    "        limit = f' ORDER BY RAND() LIMIT {limit}'\n",
+    "    bqr = bq_client.query(sql + limit).result()\n",
+    "    return bqr.to_dataframe()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Our first set of views convert trade messages into trades\n",
+    "The following table combines two sources of trade messages, historical data prior to 14 October 2020, and real time trade messages subsequent to that. \n",
+    "\n",
+    "Note that the biggest table combined, named _msrb__trades__2019__2020_, contains over 17 million messages.\n",
+    "Using all of it is perfectly feasible for BigQuery,\n",
+    "but generates a dataframe that is too big for the memory of a standard laptop computer.\n",
+    "\n",
+    "We have three sources of MSRB data:\n",
+    "\n",
+    "- The table _msrb__trades__2019__2020_ was last modified at time of writing on March 9, 2021, and contains 17,153,838 rows.\n",
+    "- The table _msrb__daily__replay__files_ was last modified at time of writing on May 7, 2021, and contains 4,417,348 rows.\n",
+    "- The table _msrb__trade__messages_ was last modified at time of writing on May 7, 2021 at 10:43:57pm, and contains 4,633,079 rows.\n",
+    "\n",
+    "The second and third tables contain roughly the same information. For precise point-in-time querying, we should use the third table.\n",
+    "\n",
+    "- Note on _msrb_trades__2019__2020_: This table contains exactly one message per trade and does not contain modification or cancellation messages. We assume a historical message represents the latest information for that trade, and that cancelled trades do not appear in the data. Some fields such as _transaction_type_ and _message_type_ are always null in the historical data, so we should be careful to distinguish between historical data and _msrb_trade_messages_ when filtering on these fields. Upload date for historical data is always 2021-03-09. \n",
+    "\n",
+    "- Note on time zones: Some fields in the ICE and S&P data such as publish_datetime are in TIMESTAMP (i.e. UTC); MSRB is in DATE and TIME format (i.e. no time zone), but should be understood as ET following page 10 of https://www.msrb.org/msrb1/RTRS/Specifications-Document-for-RTRS-Subscription-Service.pdf. When we join ICE and S&P reference data to MSRB trade data, we convert ICE and S&P to ET and convert to DATETIME in the join conditions, using the tz database “America/New York” definition. This is a light solution because it only requires two conversions. When we add other asset classes, we may want to make convert all date and time fields to UTC/TIMESTAMP format."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "unioned = mkview('auxiliary_views', 'msrb_unioned',\n",
+    "f'''\n",
+    "    SELECT *\n",
+    "    FROM eng-reactor-287421.MSRB.msrb_trades_2019_2020_partitioned\n",
+    "    WHERE publish_date BETWEEN '2019-01-01' and '2020-10-14'\n",
+    "    UNION DISTINCT\n",
+    "    SELECT *\n",
+    "    FROM eng-reactor-287421.MSRB.msrb_trade_messages\n",
+    "    WHERE publish_date > '2020-10-14'\n",
+    "''')\n",
+    "\n",
+    "print(unioned)\n",
+    "%time df = sqltodf(f'SELECT * FROM {unioned}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The unique identifier of each trade is _rtrs__control__number_.\n",
+    "The following view has columns for the publication timestamp and trade execution timestamp.\n",
+    "The combination of _rtrs__control__number_ and _publish__datetime_ and _sequence_number_should uniquely identify trade messages.\n",
+    "\n",
+    "Possible improvement: Before doing anything further, take a snapshot of all trade messages published before a certain date.\n",
+    "Then, since later views are defined on top of this, leakage from after the given date cannot occur."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "msrb_all =  mkview('auxiliary_views', 'msrb_all',\n",
+    "f'''\n",
+    "    SELECT \n",
+    "        Datetime(trade_date, time_of_trade) AS trade_datetime,\n",
+    "        Datetime(publish_date, publish_time) AS publish_datetime, \n",
+    "        *\n",
+    "    FROM {unioned}\n",
+    "''')\n",
+    "\n",
+    "print(msrb_all)\n",
+    "%time df = sqltodf(f'SELECT * FROM {msrb_all}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The next view creates \"valid from\" and \"valid to\" datetimes for messages.\n",
+    "The publication timestamp is the same as the \"valid from\" timestamp.\n",
+    "The \"valid until\" timestamp of a message is one second before the publication timestamp of the next message with the same _rtrs__control__number_,\n",
+    "if such a message exists.  Subtracting one second is necessary because the operator \"BETWEEN\" in BigQuery SQL is inclusive.  \n",
+    "Publish_datetime is the time at which a message is published.  Sequence_number is the sequence of MSRB messages on a given day (sequence_number is reset each day).  \n",
+    "The reason that we must concatenate publish_datetime and sequence_number is that two messages for the same rtrs_control_number are sometimes published at the same time.  We cannot use sequence_number alone, because sequence number is reset each day, so if messages for a given trade (rtrs_control_number) are published on different days the sequence implied by sequence_number will be arbitrary. Hence the correct way to create a sequence of messages for a given trade (rtrs_control_number) is to concatenate publish_datetime and sequence_number. \n",
+    "\n",
+    "For trades with the flag is_trade_with_a_par_amount_over_5MM, the field par_traded is null so we fill a notional amount of $5M.  These messages are amended later with the true par_traded amount. \n",
+    "\n",
+    "In some cases, the MSRB does not report a settlement_date, but does report an assumed_settlement_date and leaves the field settlement_date null.  Because the settlement_date is required our yield and price calculations, as a simplification we replace the null value for settlement_date with the value of the field assumed_settlement_date. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "final =  mkview('auxiliary_views', 'msrb_final',\n",
+    "f'''\n",
+    "    WITH\n",
+    "      first_published_sq AS (\n",
+    "      SELECT\n",
+    "        rtrs_control_number,\n",
+    "        MIN(publish_datetime) AS first_published_datetime\n",
+    "      FROM\n",
+    "        `auxiliary_views.msrb_all`\n",
+    "      GROUP BY\n",
+    "        rtrs_control_number )\n",
+    "    SELECT\n",
+    "      first_published_datetime,\n",
+    "      ROW_NUMBER() OVER (PARTITION BY a.rtrs_control_number ORDER BY CONCAT(a.publish_datetime, a.sequence_number)) AS MSRB_INST_ORDR_ASC,\n",
+    "      ROW_NUMBER() OVER (PARTITION BY a.rtrs_control_number ORDER BY concat (a.publish_datetime, a.sequence_number) DESC) MSRB_INST_ORDR_DESC,\n",
+    "      publish_datetime AS MSRB_valid_from_date,\n",
+    "      CASE\n",
+    "        WHEN ROW_NUMBER() OVER (PARTITION BY a.rtrs_control_number ORDER BY a.publish_datetime DESC) = 1 THEN '2100-01-01'\n",
+    "      ELSE\n",
+    "      DATETIME_SUB (LEAD(publish_datetime) OVER (PARTITION BY a.rtrs_control_number ORDER BY concat (a.publish_datetime, a.sequence_number)), INTERVAL 1 second)\n",
+    "    END\n",
+    "      MSRB_valid_to_date,\n",
+    "      CASE\n",
+    "        WHEN settlement_date IS NULL AND assumed_settlement_date IS NOT NULL THEN assumed_settlement_date\n",
+    "      ELSE\n",
+    "      settlement_date\n",
+    "    END\n",
+    "      settlement_date,\n",
+    "      CASE\n",
+    "        WHEN par_traded IS NULL AND is_trade_with_a_par_amount_over_5MM IS TRUE THEN 5000000\n",
+    "      ELSE\n",
+    "      par_traded\n",
+    "    END\n",
+    "      AS par_traded,\n",
+    "      a.* EXCEPT(settlement_date,\n",
+    "        par_traded)\n",
+    "    FROM\n",
+    "      `auxiliary_views.msrb_all` a\n",
+    "    LEFT JOIN\n",
+    "      first_published_sq fp\n",
+    "    ON\n",
+    "      a.rtrs_control_number = fp.rtrs_control_number ''')\n",
+    "\n",
+    "print(final)\n",
+    "%time df = sqltodf(f'SELECT * FROM {final}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view eliminates messages that lack the minimum information needed to be usable. \n",
+    "\n",
+    "- Each trade message has \"_valid from_\" and \"_valid until_\" times. During this interval, this message is the point-in-time knowledge about this trade.\n",
+    "\n",
+    "- Explanation of _multiple messages_: MSRB sends modification or cancellation messages for approximately 3% of trades, a small number but not zero.  Modifications typically are to a) update missing data or b) change important pricing data.  Cancellations simply cancel the trade.  \n",
+    "\n",
+    "- Explanation of _transaction_type_:  \"I\" is an instruction or \"the first trade message\".  \"C\" is to cancel the trade.  We see here the trade messages have the same information.  \"M\" and \"R\" both indicate \"modification\".  \"R\" is an MSRB modification, for example to fill in par_traded when that value is intially null because of the par_traded over $5M rule.\n",
+    "\n",
+    "- Explanation of logic for _num_previous_messages_: For historical MSRB data we only have the last message sent, so no indicator of number of messages.  If _transaction_type_ is null, this indicates a historical record; all other records include a _transaction_type_. As an approximation we assume that if the publish datetime is more than an hour after the trade datetime then this message is a \"second message\" rather than the initial instruction, and so we assume there is one previous message for these rows.\n",
+    "\n",
+    "- Below we also eliminate trades where the yield reported by MSRB seems anomalous to us because it is negative.  Explanation of reasons for negative reported yield https://msrb.org/sites/default/files/2023-03/MSRB-Negative-Yield-Bonds-Factsheet.pdf  This is not a restriction in production.\n",
+    "\n",
+    "\n",
+    "NB: Counterintuitively, _transaction_type_ is the correct field for trade message type; _message_type_ is unrelated to trades.  (See here: https://www.msrb.org/msrb1/RTRS/Specifications-Document-for-RTRS-Subscription-Service.pdf esp. pages 21 and 33.  _message_type_ can be \"O\" or \"C\" for \"open\" or \"close\"(once daily) or \"T\" for \"trade.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "only_usable = mkview('auxiliary_views', 'msrb_only_usable',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "     IF(transaction_type IS NULL AND DATETIME_DIFF(publish_datetime,trade_datetime, MINUTE)>60,\n",
+    "            1, MSRB_INST_ORDR_ASC-1) as num_prev_messages,\n",
+    "       -- cast(concat(COALESCE(rtrs_control_number,0),COALESCE(sequence_number,0))as numeric) as sequence_number,\n",
+    "        * EXCEPT (MSRB_INST_ORDR_ASC, message_type)\n",
+    "    FROM\n",
+    "      {final}\n",
+    "    WHERE trade_type IS NOT NULL \n",
+    "\n",
+    "''')\n",
+    "\n",
+    "print(only_usable)\n",
+    "%time df = sqltodf(f'SELECT * FROM {only_usable}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view combines trades with reference data for the purpose of calculating prices. The cloud function which does this is here https://console.cloud.google.com/functions/details/us-central1/calculated_price_and_date?env=gen1&project=eng-reactor-287421\n",
+    "\n",
+    "Conceptually, there are mulitple possible choices for chosing the temporality of reference data.  One could select the latest reference data as of the time of query, or one could select the reference data as of the publish_datetime of the trade.  In the case of the ICE reference data, there are two reasons that ICE updates the data for a particular CUSIP: 1) a correction and 2) temporality.  An example of the first type of update might be if the issue_amount of a CUSIP was unknown initially but became known when the CUSIP was offered in the primary market.  An example of the second type of update would be the changing value for the field next_call_date as time passes.  Given that we cannot disambiguate the two types of update, we must take the reference data as of the time of a trade."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "iceflat = 'eng-reactor-287421.primary_views.ice_flat'\n",
+    "\n",
+    "trades_with_ref_data_pd = mkview('auxiliary_views', 'trades_with_ref_data_pd',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      msrb.maturity_date AS MSRB_maturity_date,\n",
+    "      msrb.cusip AS msrb_cusip,\n",
+    "      msrb.* EXCEPT (cusip,\n",
+    "        maturity_date),\n",
+    "      ice.*\n",
+    "    FROM\n",
+    "      {final} msrb\n",
+    "    LEFT JOIN\n",
+    "      {iceflat} ice\n",
+    "    ON\n",
+    "      msrb.cusip = ice.cusip\n",
+    "      AND timestamp (msrb.trade_datetime) BETWEEN ice.ref_valid_from_date \n",
+    "      AND ice.ref_valid_to_date\n",
+    "    WHERE\n",
+    "      ice.cusip IS NOT NULL\n",
+    "      and  (ice.interest_payment_frequency = 1 or ice.interest_payment_frequency = 16 OR ice.interest_payment_frequency = 2 OR ice.interest_payment_frequency = 3 OR ice.interest_payment_frequency = 5)\n",
+    "      AND (msrb.transaction_type <> 'C' or msrb.transaction_type is null)\n",
+    "''')\n",
+    "\n",
+    "print(trades_with_ref_data_pd)\n",
+    "%time df = sqltodf(f'SELECT * FROM {trades_with_ref_data_pd}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view supplies the categories calc_date and calc_day_cat from our yield-price conversion cloud function: https://console.cloud.google.com/functions/details/us-central1/calculated_price_and_date?env=gen1&project=eng-reactor-287421.\n",
+    "\n",
+    "We also have a value for \"price_delta\" which when not zero signifies a discrepency between our yield-price conversion and MSRB's.  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "clean_calc = '(select distinct * from auxiliary_views.clean_calc)'\n",
+    "# clean_calc = '(select distinct * from eng-reactor-287421.auxiliary_views.calculation_date_and_price_v2)'\n",
+    "## NOTE 4-23-2024 JESSE CREATED A NEW TABLE 'clean_calc' which arbitrarily takes a row with the latest publish_datetime\n",
+    "## for a trade.  The reason this is necessary is that ref_data can change between runs of calculation_date_and_price_v2.\n",
+    "## in future we will use a datetime stamp for the run of calculation_date_and_price_v2 (fast_trade_history_redis_update_v2)\n",
+    "## to select the most correct message for a trade. \n",
+    "\n",
+    "only = mkview('auxiliary_views', 'only',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      clean_calc.* except (rtrs_control_number, trade_datetime, cusip, publish_datetime, when_issued, calc_date_selection, sequence_number, par_traded, series_name, msrb_valid_from_date, msrb_valid_to_date,  upload_datetime),\n",
+    "      clean_calc.calc_date_selection as calc_day_cat,\n",
+    "      only_usable.* except(maturity_date)\n",
+    "    FROM\n",
+    "      {only_usable} only_usable\n",
+    "    INNER JOIN\n",
+    "      {clean_calc} clean_calc\n",
+    "    ON\n",
+    "    only_usable.rtrs_control_number = clean_calc.rtrs_control_number\n",
+    "    AND only_usable.trade_datetime = clean_calc.trade_datetime\n",
+    "    and clean_calc.publish_datetime = only_usable.publish_datetime\n",
+    "    AND only_usable.msrb_valid_to_date = clean_calc.msrb_valid_to_date\n",
+    "    WHERE clean_calc.calc_date_selection <> -1\n",
+    "''')\n",
+    "\n",
+    "print(only)\n",
+    "%time df = sqltodf(f'SELECT * FROM {only}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view creates a _valid_date_ for the daily S&P index. To do this, we check the next date available in the S&P data up to six days in the future, in order to account for various holidays.  For the latest date available in S&P, the _valid_date_ is _current_date_.  We join on _valid_date_ because the S&P index is published at the end of a given day, and thus as of a given point in time, the current S&P yield index will be that published on the previous business day.\n",
+    "\n",
+    "Note: We select distinct values here because our cloud function will create multiple identical records for one date when a holiday occurs(e.g. 2021-05-28). \n",
+    "\n",
+    "A possible improvement to the following view would be to calculate a valid_from and valid_to date in order to compute a yield spread for bonds that trade on bond market holidays and weekends.\n",
+    "\n",
+    "#TODO ADD NOTE TO EXPLAIN THIS IS NO LONGER USED. \n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spindex = \"(SELECT date FROM eng-reactor-287421.spBondIndex.sp_muni_index_yield WHERE date BETWEEN '2010-01-01' AND '2024-05-15' UNION DISTINCT SELECT date FROM eng-reactor-287421.spBondIndex.sp_high_quality_short_intermediate_municipal_bond_index_yield WHERE date > '2024-05-15' ORDER BY date DESC)\"\n",
+    "sp_index = mkview('auxiliary_views', 'sp_index', \n",
+    "f'''\n",
+    "    SELECT\n",
+    "      DISTINCT *,\n",
+    "      EXTRACT(DAYOFWEEK\n",
+    "      FROM\n",
+    "        date) AS weekdaynumber,\n",
+    "      DATE_ADD(date, INTERVAL 1 Day) as valid_from_date,\n",
+    "      CASE\n",
+    "            WHEN DATE_ADD(date, INTERVAL 1 Day) IN ( SELECT date FROM {spindex}) \n",
+    "            THEN DATE_ADD(date, INTERVAL 1 Day)\n",
+    "            WHEN DATE_ADD(date, INTERVAL 2 Day) IN (\n",
+    "          SELECT\n",
+    "            date\n",
+    "          FROM\n",
+    "           {spindex}) THEN DATE_ADD(date, INTERVAL 2 Day)\n",
+    "            WHEN DATE_ADD(date, INTERVAL 3 Day) IN ( SELECT date FROM {spindex}) \n",
+    "            THEN DATE_ADD(date, INTERVAL 3 Day)\n",
+    "            WHEN DATE_ADD(date, INTERVAL 4 Day) IN (\n",
+    "          SELECT\n",
+    "            date\n",
+    "          FROM\n",
+    "            {spindex}) THEN DATE_ADD(date, INTERVAL 4 Day)\n",
+    "            WHEN DATE_ADD(date, INTERVAL 5 Day) IN ( SELECT date FROM {spindex}) \n",
+    "            THEN DATE_ADD(date, INTERVAL 5 Day)\n",
+    "            WHEN DATE_ADD(date, INTERVAL 6 Day) IN (\n",
+    "          SELECT\n",
+    "            date\n",
+    "          FROM\n",
+    "            {spindex}) THEN DATE_ADD(date, INTERVAL 6 Day)\n",
+    "          WHEN ROW_NUMBER() OVER (PARTITION BY date ORDER BY date DESC) = 1 \n",
+    "          THEN current_date ('America/New_York')\n",
+    "    END\n",
+    "      AS valid_to_date\n",
+    "    FROM\n",
+    "    {spindex}\n",
+    "''')\n",
+    "\n",
+    "print(sp_index)\n",
+    "%time df = sqltodf(f'SELECT * FROM {sp_index}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The field _cusip_with_large_conversion_deltas_ is a flag for the case in which a trade from the last month would have been excluded from the trade history due to a discrepency between our yield-to-price conversion and the MSRB's.  This is true less than 10% of the time as of Nov, 2022."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trans = mkview('auxiliary_views', 'msrb_trans',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "        only_usable.*,IF\n",
+    "  (( cusip IN (\n",
+    "      SELECT\n",
+    "        DISTINCT(cusip)\n",
+    "      FROM\n",
+    "        `auxiliary_views.calculation_date_and_price_v2`\n",
+    "      WHERE\n",
+    "        price_delta > .005 and\n",
+    "        date_diff(current_date('America/New_York') , date(trade_datetime), day) < 30)), TRUE, FALSE) AS cusip_with_large_conversion_deltas\n",
+    "    FROM {only} AS only_usable\n",
+    "    JOIN {sp_index} as sp_index\n",
+    "    ON only_usable.trade_date = sp_index.valid_to_date\n",
+    "    WHERE sp_index.date IS NOT NULL AND par_traded IS NOT NULL AND dollar_price IS NOT NULL \n",
+    "    AND yield IS NOT NULL AND yield >= 0 and par_traded >= 10000 \n",
+    "''')\n",
+    "\n",
+    "print(trans)\n",
+    "%time df = sqltodf(f'SELECT * FROM {trans}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view extends each trade message with the most recent previous messages for the same cusip. This extension is point-in-time correct because of the condition \n",
+    "\n",
+    "    latest.trade_datetime BETWEEN past.msrb_valid_from_date AND past.msrb_valid_to_date\n",
+    "\n",
+    "The number of recent trades should be limited to a constant (here 32) in order to avoid quadratic explosion.\n",
+    "\n",
+    "The following conditions ensure that the trade history consist of trades prior to the current or latest trade:\n",
+    "\n",
+    "    latest.trade_datetime > past.trade_datetime\n",
+    "        \n",
+    "\n",
+    "Because a trade (rtrs_control_number) may have many trade messages, we group by publish_datetime and sequence_number to arrive at a unique id for a trade_message.\n",
+    "\n",
+    "Queries that only require the latest trade and do not require a sequence of recent trades need not include _recent_. \n",
+    "\n",
+    "Because some trades are reported as occuring simultaneously, we order by trade_datetime and MSRB's \"sequence_number\" field.  The trade sequence should thus match MSRB's trade sequence. \n",
+    "\n",
+    "Because of limitations in SQL, we choose to pad trade history in Python when a CUSIP has not yet traded.  \n",
+    "\n",
+    "A result of the self join is CUSIPs that have only traded once are eliminated, or about 9% of the CUSIPs in the MSRB data.\n",
+    "\n",
+    "A preliminary approach to overcoming this technical problem and some of the latency created by the self join in this view is described here: \n",
+    "https://docs.google.com/document/d/10hcbJRg1DZ5RYgRX47AH1Q7uwTDCUdd8Xf_u8m7l42s/edit#heading=h.bxamsg99mpxg\n",
+    "\n",
+    "Q: We might require latest.trade_datetime > past.trade_datetime and also latest.trade_datetime > past.publish_datetime. Seconds ago should be based on the most recent of past.trade_datetime and past.publish_datetime, hence always be positive.\n",
+    "\n",
+    "A: We tried this before, but we forgot to anticipate the following case, which caused problems: say the current trade occurs at 1pm time and is revised at 2pm and two trades which occurred at 12:30 were published at 1:30pm.  The latest.trade_datetime > past.publish_datetime condition would erroneously exclude the 12:30 trades from the trade history.    In practice this is not uncommon (though the time scale is much shorter), especially when the CUSIP trades frequently.   We (or perhaps I) therefore concluded that the sole condition latest.trade_datetime > past.trade_datetime was more correct."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_all = mkview('auxiliary_views', 'trade_history_all',\n",
+    "f'''\n",
+    " SELECT\n",
+    "        latest.rtrs_control_number,\n",
+    "        latest.publish_datetime,\n",
+    "        latest.sequence_number as seq_num,\n",
+    "        ARRAY_AGG(STRUCT (past.msrb_valid_from_date, past.msrb_valid_to_date,past.rtrs_control_number, past.trade_datetime, past.publish_datetime,\n",
+    "                         past.yield, past.dollar_price, past.par_traded, past.trade_type,\n",
+    "                   datetime_diff(latest.trade_datetime,past.trade_datetime, second) as seconds_ago, past.is_non_transaction_based_compensation,\n",
+    "                        past.is_lop_or_takedown, past.brokers_broker, past.is_alternative_trading_system, past.is_weighted_average_price, past.settlement_date,\n",
+    "                        past.calc_date,past.calc_day_cat, past.maturity_date, past.next_call_date, past.par_call_date,past.refund_date, latest.rtrs_control_number as current_rtrs_control_number, latest.par_traded - past.par_traded as par_traded_diff,\n",
+    "      concat(past.trade_type,latest.trade_type) as trade_type_past_latest)\n",
+    "                ORDER BY past.trade_datetime DESC, past.sequence_number DESC  LIMIT 32\n",
+    "              ) AS recent\n",
+    "    FROM eng-reactor-287421.auxiliary_views.msrb_trans latest\n",
+    "    LEFT JOIN eng-reactor-287421.auxiliary_views.msrb_trans past\n",
+    "        ON\n",
+    "          latest.cusip = past.cusip\n",
+    "        and \n",
+    "        --(latest.first_published_datetime > past.publish_datetime or past.publish_datetime is null) and \n",
+    "        --(latest.publish_datetime BETWEEN past.msrb_valid_from_date AND past.msrb_valid_to_date)\n",
+    "        past.msrb_valid_to_date > current_datetime('America/New_York') \n",
+    "        AND (past.transaction_type <> 'C' or past.transaction_type is null) \n",
+    "        AND latest.trade_datetime > past.trade_datetime\n",
+    "        --AND latest.sequence_number <> past.sequence_number (this condition will eliminate trades before 2020 when the sequence number is null)\n",
+    "    GROUP BY latest.rtrs_control_number, latest.publish_datetime, latest.sequence_number\n",
+    "\n",
+    "''')\n",
+    "\n",
+    "print(trade_history_all)\n",
+    "%time df = sqltodf(f'SELECT * FROM {trade_history_all}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Now we move on to combine reference data with trade data\n",
+    "The following view joins the following three tables: \n",
+    "\n",
+    "- Reference data from ICE\n",
+    "- Historical S&P data\n",
+    "- Latest trades\n",
+    "\n",
+    "The explanation of historical S&P data is here: https://www.notion.so/S-P-Historical-Data-b60175cf1d844ef7abaf46985ba30f76\n",
+    "\n",
+    "The notebook for creating _ice__flat_ is here: https://github.com/Ficcai/ficc/blob/dev/SQL_examples/Create_ICE_flat.ipynb\n",
+    "\n",
+    "This view also creates a de_minimis_threshold flag.  See this document for a definition and example of the de minimis threshold: https://msrb.org/-/media/Files/Resources/Tax-and-Liquidity-Considerations-for-Buying-Discount-Bonds.ashx?\n",
+    "\n",
+    "Note: We remove all interest payment frequencies other than semiannual and interest at maturity.  This is done in this view, as interest payment frequency is a field from ICE.   Note that the code for semiannual interest payment is \"1\" and for interest at maturity \"16."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "iceflat = 'eng-reactor-287421.primary_views.ice_flat'\n",
+    "sp = 'eng-reactor-287421.auxiliary_views.sp_history_processed'\n",
+    "mh = 'eng-reactor-287421.reference_data.moodys_historical'\n",
+    "\n",
+    "latest_trades_with_ratings_and_reference_data = mkview('auxiliary_views', 'latest_trades_with_ratings_and_reference_data',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      latest.maturity_date AS MSRB_maturity_date,\n",
+    "      latest.coupon as MSRB_coupon_rate,\n",
+    "      latest.cusip AS msrb_cusip,\n",
+    "      latest.* EXCEPT (cusip,coupon,next_call_date,refund_date,par_call_date,maturity_date),\n",
+    "      ice.current_coupon_rate as coupon,\n",
+    "      ice.* EXCEPT (moodys_long, issue_key,sp_long,\n",
+    "      sp_stand_alone,\n",
+    "      sp_icr_school,\n",
+    "      sp_prelim_long,\n",
+    "      sp_outlook_long,\n",
+    "      sp_watch_long, obligor_id),\n",
+    "      --ice.default_event_history[safe_OFFSET(0)] as most_recent_default_event,\n",
+    "      ice.material_event_history[safe_OFFSET(0)] as most_recent_event,\n",
+    "    IF\n",
+    "        (latest.trade_datetime<'2022-05-26T20:00:04'\n",
+    "          AND mh.rating_type = 'Long-Term Debt Rating',\n",
+    "          mh.rating,\n",
+    "          ice.moodys_long) AS moodys_long,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_long,\n",
+    "        ice.sp_long) AS sp_long,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_stand_alone,\n",
+    "        ice.sp_stand_alone) AS sp_stand_alone,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_icr_school,\n",
+    "        ice.sp_icr_school) AS sp_icr_school,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_prelim_long,\n",
+    "        ice.sp_prelim_long) AS sp_prelim_long,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_outlook_long,\n",
+    "        ice.sp_outlook_long) AS sp_outlook_long,\n",
+    "    IF\n",
+    "      (latest.trade_datetime<'2021-02-19T17:45:05',\n",
+    "        sp.sp_watch_long,\n",
+    "        ice.sp_watch_long) AS sp_watch_long,\n",
+    "      date_diff(date(latest.trade_datetime), date(ice.material_event_history[safe_OFFSET(0)].date), day) as most_recent_event_1_days_ago,\n",
+    "      date_diff(date(latest.trade_datetime), date(ice.default_event_history[safe_OFFSET(0)].default_date), day) as most_recent_default_event,\n",
+    "      date_diff(date(latest.trade_datetime), date(ice.material_event_history[safe_OFFSET(0)].date), day) as days_since_most_recent_event,\n",
+    "      date_diff(date(latest.trade_datetime), date(ice.default_event_history[safe_OFFSET(0)].default_date), day) as days_since_most_recent_default_event,\n",
+    "      100 - (0.25 *DATE_DIFF(ice.maturity_date,latest.trade_date,isoyear))     AS de_minimis_threshold,\n",
+    "      IF\n",
+    "  (( ice.callable_at_cav IS FALSE\n",
+    "      AND latest.yield > 10\n",
+    "      AND latest.dollar_price < 10),\n",
+    "    TRUE,\n",
+    "    FALSE) AS price_yield_reporting_error\n",
+    "  FROM\n",
+    "      {trans} latest\n",
+    "    LEFT JOIN\n",
+    "      {sp} sp\n",
+    "    ON\n",
+    "      latest.cusip = sp.cusip\n",
+    "      AND timestamp (latest.trade_datetime,\n",
+    "        'America/New_York') BETWEEN sp.sp_valid_from_date\n",
+    "      AND sp.sp_valid_to_date\n",
+    "  LEFT JOIN\n",
+    "   {mh} mh\n",
+    "  ON\n",
+    "    latest.cusip = mh.cusip\n",
+    "    AND latest.publish_datetime BETWEEN mh.rating_valid_From_date\n",
+    "    AND mh.rating_valid_to_date\n",
+    "    LEFT JOIN\n",
+    "      {iceflat} ice\n",
+    "    ON\n",
+    "      latest.cusip = ice.cusip\n",
+    "      AND timestamp (latest.trade_datetime) BETWEEN ice.ref_valid_from_date\n",
+    "      AND ice.ref_valid_to_date\n",
+    "    WHERE\n",
+    "      ice.cusip IS NOT NULL\n",
+    "      AND (latest.transaction_type <> 'C' or latest.transaction_type is null)\n",
+    "      and  (ice.interest_payment_frequency = 1 or ice.interest_payment_frequency = 16 OR ice.interest_payment_frequency = 2 OR ice.interest_payment_frequency = 3 OR ice.interest_payment_frequency = 5)\n",
+    "''')\n",
+    "\n",
+    "print(latest_trades_with_ratings_and_reference_data)\n",
+    "%time df = sqltodf(f'SELECT * FROM {latest_trades_with_ratings_and_reference_data}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following view joins trade history and issue history to our latest trades with reference data. We exclude trades where a reporting error has occured and the price has been reported as the yield.  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_with_reference_data = mkview('primary_views', 'trade_history_with_reference_data',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      latest.*,\n",
+    "      th.* EXCEPT (publish_datetime,\n",
+    "        rtrs_control_number)\n",
+    "    FROM\n",
+    "      {trade_history_all} th\n",
+    "    INNER JOIN\n",
+    "      {latest_trades_with_ratings_and_reference_data} latest\n",
+    "    ON\n",
+    "      th.rtrs_control_number = latest.rtrs_control_number\n",
+    "      AND th.publish_datetime = latest.publish_datetime\n",
+    "      --AND th.seq_num = latest.sequence_number\n",
+    "    where latest.price_yield_reporting_error is false\n",
+    "''')\n",
+    "\n",
+    "print(trade_history_with_reference_data)\n",
+    "%time df = sqltodf(f'SELECT * FROM {trade_history_with_reference_data}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Following the preliminary plan to over come the latency described here https://docs.google.com/document/d/10hcbJRg1DZ5RYgRX47AH1Q7uwTDCUdd8Xf_u8m7l42s/edit#heading=h.bxamsg99mpxg, the following view creates a view with only today's trades. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_today = mkview('auxiliary_views', 'trade_history_today',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      *\n",
+    "    FROM\n",
+    "      eng-reactor-287421.auxiliary_views.trade_history_all\n",
+    "    WHERE\n",
+    "      DATE (publish_datetime) = CURRENT_DATE('America/New_York')\n",
+    "''')\n",
+    "\n",
+    "print(trade_history_today)\n",
+    "%time df = sqltodf(f'SELECT * FROM {trade_history_today}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Below we create trade history with reference data only for today.  The following view duplicates some of the logic to create _trade_history_with_reference_data_ above, and hence is not DRY.  A DRY solution is not trivial, however, and as we will no longer use this view when we create the key-value store described here https://docs.google.com/document/d/1LrUtwI9lzPAXLwX48RV5Cn0zDzn9InOLVpXgnnoZrzs/edit#heading=h.1193k3go281\n",
+    "making this view DRY is not a priority. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_with_ref_today = mkview('auxiliary_views', 'trade_history_with_ref_today',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "      latest.*except(material_event_history,default_event_history),\n",
+    "      th.* EXCEPT (publish_datetime,\n",
+    "        rtrs_control_number)\n",
+    "    FROM\n",
+    "      {trade_history_today} th\n",
+    "    INNER JOIN\n",
+    "      {latest_trades_with_ratings_and_reference_data} latest\n",
+    "    ON\n",
+    "      th.rtrs_control_number = latest.rtrs_control_number\n",
+    "      AND th.publish_datetime = latest.publish_datetime\n",
+    "      AND th.seq_num = latest.sequence_number --this condition ok for later trades\n",
+    "    where latest.price_yield_reporting_error is false\n",
+    "   \n",
+    "''')\n",
+    "\n",
+    "print(trade_history_with_ref_today)\n",
+    "print(len(trade_history_with_ref_today))\n",
+    "%time df = sqltodf(f'SELECT * FROM {trade_history_with_ref_today}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Below we join the trade history with reference data for today with a table containing the materialized trade history for all trades before today.  This view is significantly faster than using a view for all trades, but is still relatively slow.  Eventually we will implement a mechanism to improve latency such as that described here:  https://docs.google.com/document/d/1LrUtwI9lzPAXLwX48RV5Cn0zDzn9InOLVpXgnnoZrzs/edit#\n",
+    "\n",
+    "The materialized trade history is made by a scheduled query here: https://console.cloud.google.com/bigquery/scheduled-queries/locations/us/configs/61fe7c6f-0000-2f58-bbb3-883d24fad8a8/runs?project=eng-reactor-287421"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "materialized = 'eng-reactor-287421.auxiliary_views.materialized_trade_history'\n",
+    "speedy_trade_history = mkview('primary_views', 'speedy_trade_history',\n",
+    "f'''\n",
+    "    SELECT\n",
+    "     * \n",
+    "    FROM\n",
+    "      {materialized}\n",
+    "    UNION ALL\n",
+    "    SELECT\n",
+    "     *\n",
+    "    FROM\n",
+    "      {trade_history_with_ref_today} \n",
+    "''')\n",
+    "\n",
+    "print(speedy_trade_history)\n",
+    "%time df = sqltodf(f'SELECT * FROM {speedy_trade_history}', 3)\n",
+    "df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The following two functions are used to create insights into the accuracy of our price estimates when compared to those supplied by the MSRB"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_price_delta_cnts(tol):\n",
+    "    query = f'''\n",
+    "    SELECT CONCAT(CAST(EXTRACT(YEAR from publish_datetime) as string), LPAD(CAST(EXTRACT(MONTH from publish_datetime) as string),2,'0') ) as month, count(price_delta) AS delta_cnt\n",
+    "    FROM eng-reactor-287421.auxiliary_views.calculation_date_and_price_v2\n",
+    "    WHERE price_delta > {tol}\n",
+    "      AND publish_datetime > \"2018-12-01\"\n",
+    "      AND msrb_valid_to_date > current_datetime(\"America/New_York\") \n",
+    "    GROUP BY month\n",
+    "    ORDER BY month asc\n",
+    "    '''\n",
+    "    query_job = bq_client.query(query).result().to_dataframe()\n",
+    "    return query_job\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_price_deltas(tol):\n",
+    "    number = tol\n",
+    "    print(\"Tolerance is \" + str (number))\n",
+    "    price_deltas = get_price_delta_cnts(number)\n",
+    "    price_deltas.plot.bar(x=\"month\", y=\"delta_cnt\", title = \"Total Price Deltas Above Tolerance of \"+ str (number) + \" by Month\")\n",
+    "    price_deltas2 = get_price_delta_cnts(0)\n",
+    "    price_deltas[\"percent_above_tol\"] = 100*price_deltas[\"delta_cnt\"].div(price_deltas2[\"delta_cnt\"])\n",
+    "    price_deltas.plot.bar(x=\"month\", y=\"percent_above_tol\", title= \"Price Deltas Above Tolerance of \"+ str (number) + \" as a Percentage of Total Deltas by Month\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Below we plot the price deltas above a tolerance of .05. We may perceive a clear pattern: the number of price_deltas over .05 drops off after December of 2020 when we start receiving ICE data, and the percentage of inaccurate deltas as a percentage of the total falls to about 1%.  The inaccuracy is highest in March of 2020, possibily due to volatility related to the pandemic."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plot_price_deltas(.05)\n",
+    "#jan and feb above .6"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Below we plot the price deltas above a tolerance of .005.  The same pattern is still perceivable here, though it is less pronounced. The percentage of inaccurate deltas after December 2020 is about 6-7% at this tolerance. For training, we will use the more than 90% of trades for which our price estimates are accurate within .005 as outlined here: https://docs.google.com/document/d/1wrhsrCn5WYz4chahFlfl9cQ9SAnOuDMvSGCQlMolW4w/edit#heading=h.apluhpaiz3iy "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plot_price_deltas(.005)\n",
+    "#jan 2022 above 7%, many other months around 7"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Finally we count the total rows in certain views.  We expect _MSRB_only_usable_, _trade_history_, and _trade_history_with_reference_data_ to eliminate some rows.  _MSRB_only_usable eliminates_ trades that lack necessary data to be usable.   _Trade_history_ elminates cancellation messages.  _Latest_trades_with_ratings_and_reference_data_ eliminates ~1.4m historical trades for which we do not have reference data.  "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def count_total_rows (query):\n",
+    "    query_job = bq_client.query(\n",
+    "        query,\n",
+    "        location='US')\n",
+    "    results = query_job.result()\n",
+    "    return int(format(results.total_rows))\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "query_unioned = ('SELECT rtrs_control_number FROM `eng-reactor-287421.auxiliary_views.msrb_unioned`')\n",
+    "query_usable = ('SELECT rtrs_control_number FROM `eng-reactor-287421.auxiliary_views.msrb_only_usable` ')\n",
+    "#query_th = ('SELECT rtrs_control_number FROM `eng-reactor-287421.auxiliary_views.trade_history`')\n",
+    "query_ltrrd = ('SELECT distinct rtrs_control_number FROM `eng-reactor-287421.auxiliary_views.latest_trades_with_ratings_and_reference_data`')\n",
+    "query_thrd = ('SELECT distinct cusip FROM `eng-reactor-287421.primary_views.trade_history_with_reference_data` ')\n",
+    "query_sth = ('SELECT distinct cusip FROM `eng-reactor-287421.primary_views.speedy_trade_history`')\n",
+    "query_pd = ('SELECT distinct rtrs_control_number FROM `eng-reactor-287421.auxiliary_views.calc_date_and_price`')\n",
+    "query_duplicates = (\"SELECT rtrs_control_number FROM ( SELECT DISTINCT rtrs_control_Number, COUNT(rtrs_control_Number) cnt FROM eng-reactor-287421.auxiliary_views.materialized_trade_history WHERE MSRB_valid_to_date > current_datetime('America/New_York')  GROUP BY rtrs_control_Number) where cnt > 1 \")\n",
+    "duplicate_count = count_total_rows(query_duplicates)\n",
+    "\n",
+    "if duplicate_count > 1:\n",
+    "    print(f'Warning!! There are {duplicate_count} duplicate rows in materialized_trade_history.')\n",
+    "\n",
+    "print(f'MSRB_unioned has {count_total_rows(query_unioned)} rows. MSRB_only_usable has {count_total_rows(query_usable)} rows. Latest_trades_with_ratings_and_reference_data has {count_total_rows(query_ltrrd)} rows. Speedy_trade_history has {count_total_rows(query_sth)} rows. Trade_history_with_reference_data has {count_total_rows(query_thrd)} rows. Price_deltas has {count_total_rows(query_pd)} rows.')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "query_num_cusips_msrb = ('SELECT distinct (cusip) FROM `MSRB.msrb_trade_messages`')\n",
+    "query_num_cusips_traded_more_than_once= ('SELECT DISTINCT cusip FROM ( SELECT cusip, COUNT(DISTINCT rtrs_control_number) cnt FROM `MSRB.msrb_trade_messages` GROUP BY cusip) WHERE cnt > 1') \n",
+    "query_trade_restrictions = ('SELECT distinct (cusip) FROM `MSRB.msrb_trade_messages` WHERE trade_type IS NOT NULL AND par_traded IS NOT NULL AND dollar_price IS NOT NULL AND yield IS NOT NULL AND yield >= 0 and par_traded >= 10000')\n",
+    "query_training_pipeline= ('select distinct cusip from `auxiliary_views.materialized_trade_history` where outstanding_indicator is true')\n",
+    "query_prod_pipeline = ('SELECT distinct (cusip) FROM `eng-reactor-287421.auxiliary_views.trade_history_latest_ref_data_minimal_exclusions` where outstanding_indicator is true')\n",
+    "query_ice_flat= ('SELECT distinct (cusip) FROM `primary_views.ice_flat` where ref_valid_to_date > current_timestamp and outstanding_indicator is true')\n",
+    "\n",
+    "msrb_total = count_total_rows(query_num_cusips_msrb)\n",
+    "traded_more_than_once_total = count_total_rows(query_num_cusips_traded_more_than_once)\n",
+    "trade_restrictions_total = count_total_rows(query_trade_restrictions)\n",
+    "training_pipe_line_total = count_total_rows(query_training_pipeline)\n",
+    "prod_pipeline_total = count_total_rows(query_prod_pipeline)\n",
+    "\n",
+    "traded_once_percent = round((msrb_total-traded_more_than_once_total)/msrb_total *100, 2)\n",
+    "trade_restrictions_percent = round((msrb_total-trade_restrictions_total)/msrb_total *100, 2)\n",
+    "interest_payment_restrctions_percent = round (((msrb_total - training_pipe_line_total) - (msrb_total-traded_more_than_once_total) -(msrb_total-trade_restrictions_total) )/msrb_total *100, 2)\n",
+    "training_percent_of_msrb = round(training_pipe_line_total/msrb_total, 4) * 100\n",
+    "msrb_percent_of_prod = round(msrb_total/prod_pipeline_total* 100, 2)\n",
+    "training_percent_of_prod = round(training_pipe_line_total/prod_pipeline_total, 4) * 100"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Restrictions\n",
+    "\n",
+    "This notebook has a number of restrictions. We think about these restrictions in terms of numbers of CUSIPs excluded, because this is the unit of measurement that is important for the customer.\n",
+    "\n",
+    "First, the pipeline is based on trades.  This means that some ~35% of CUSIPs for which we don't have trades in the MSRB data (but do have ICE data) are absent here. These are included in our production pipeline. \n",
+    "\n",
+    "Secondly, a technical limitation of the self-join used in creating the trade history is that if a CUSIP has only traded once we do not include it.  This eliminates about 9% of the MSRB total.  A possible improvement to this pipeline would be to replace the self join with a windowing function.\n",
+    "\n",
+    "A third restriction is that we exclude trades under 10000 in par traded, and trades with no reported dollar price, yield or negative yield.  This has the effect of eliminating 4% of CUSIPs in the MSRB data.\n",
+    "\n",
+    "A fourth restriction is that we only include CUSIPs with a regular interest payment frequency (monthly, quarterly, annual, and semi-annual).  This represents about 3% of the MSRB total. \n",
+    "\n",
+    "The training pipeline therefore has about 83% of the total CUSIPs in the MSRB data and about 52% of the CUSIPs in the production pipeline."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print('CUSIPs that have traded once are ' + str(traded_once_percent) +'% of the MSRB total. Trade restrictions ' + str(trade_restrictions_percent) +'% of the MSRB total. Interest payment restrictions are ' + str(interest_payment_restrctions_percent) +'% of the MSRB total.')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print('MSRB has ' + str(msrb_percent_of_prod) +'% of the total CUSIPs in the production pipeline. The training pipeline has  ' + str(training_percent_of_msrb) +'% of the total CUSIPs in the MSRB data. The training pipeline has ' + str(training_percent_of_prod ) +'% of the total number of CUSIPs in the production pipeline.')"
+   ]
+  }
+ ],
+ "metadata": {
+  "environment": {
+   "kernel": "python3",
+   "name": "tf2-gpu.2-8.m91",
+   "type": "gcloud",
+   "uri": "gcr.io/deeplearning-platform-release/tf2-gpu.2-8:m91"
+  },
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.15"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}

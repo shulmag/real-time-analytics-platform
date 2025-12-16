@@ -1,0 +1,264 @@
+/*
+Written by: Gil
+Last Editor: Gil
+Last Edit Date: 2025-03-24
+Description: Muni List with Integrated Search
+*/
+
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import { API_BASE_URL } from '../App';
+import { formatDateET } from '../utils/dateUtils';
+
+const TRADE_TYPE_OPTIONS = [
+  { key: 'D', text: 'Inter-Dealer' },
+  { key: 'P', text: 'Bid Side' },
+  { key: 'S', text: 'Offered Side' },
+];
+
+const LIMIT_OPTIONS = [
+  { value: 10, label: '10 results' },
+  { value: 20, label: '20 results' },
+  { value: 50, label: '50 results' },
+  { value: 200, label: '200 results' }
+];
+
+function BlockchainPrices({ initialLimit = 10 }) {
+  const [prices, setPrices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [limit, setLimit] = useState(initialLimit);
+  const [searchCusip, setSearchCusip] = useState('');
+  const [searchResults, setSearchResults] = useState(null);
+  const [isSearchMode, setIsSearchMode] = useState(false);
+
+  useEffect(() => {
+    if (!isSearchMode) {
+      fetchBlockchainPrices();
+    }
+  }, [limit, isSearchMode]);
+
+  const fetchBlockchainPrices = async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(`${API_BASE_URL}/latest_prices?limit=${limit}`);
+      if (response.data.status === 'success') {
+        setPrices(response.data.prices);
+      } else {
+        throw new Error(response.data.message || 'Error fetching prices');
+      }
+    } catch (err) {
+      setError(err.message || 'Error fetching blockchain prices');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSearchBlockchain = async () => {
+    if (!searchCusip) return;
+    
+    try {
+      setLoading(true);
+      setIsSearchMode(true);
+      const response = await axios.get(`${API_BASE_URL}/get_price/${searchCusip}`);
+      console.log("Search results:", response.data);
+      setSearchResults(response.data);
+    } catch (err) {
+      setError(err.response?.data?.message || `No results found for CUSIP ${searchCusip}`);
+      setSearchResults(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClearSearch = () => {
+    setSearchCusip('');
+    setSearchResults(null);
+    setIsSearchMode(false);
+    setError(null);
+  };
+
+  return (
+    <div className="card shadow-sm mb-4">
+      <div className="card-header bg-light d-flex justify-content-between align-items-center">
+        <h5 className="card-title mb-0">
+          {isSearchMode && searchResults 
+            ? `Search Results for ${searchResults.cusip}` 
+            : "Latest Blockchain Prices"}
+        </h5>
+        
+        {!isSearchMode && (
+          <select
+            className="form-select form-select-sm"
+            value={limit}
+            onChange={(e) => setLimit(Number(e.target.value))}
+            style={{ width: 'auto' }}
+          >
+            {LIMIT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        )}
+        
+        {isSearchMode && (
+          <button 
+            className="btn btn-sm btn-outline-secondary"
+            onClick={handleClearSearch}
+          >
+            <i className="bi bi-arrow-left me-1"></i>
+            Back to All Prices
+          </button>
+        )}
+      </div>
+      
+      <div className="card-body border-bottom">
+        <div className="row g-3 align-items-end">
+          <div className="col-12 col-md-8">
+            <label htmlFor="searchCusip" className="form-label">
+              Search Historical Prices
+              <i className="bi bi-info-circle ms-2" title="Enter a CUSIP to search blockchain prices"></i>
+            </label>
+            <input 
+              id="searchCusip" 
+              type="text" 
+              className="form-control"
+              placeholder="Enter CUSIP to search"
+              value={searchCusip}
+              onChange={(e) => setSearchCusip(e.target.value)}
+              onKeyPress={(e) => {
+                if (e.key === 'Enter' && searchCusip) {
+                  handleSearchBlockchain();
+                }
+              }}
+            />
+          </div>
+          <div className="col-12 col-md-4">
+            <button 
+              className="btn btn-secondary w-100"
+              onClick={handleSearchBlockchain}
+              disabled={!searchCusip || loading}
+            >
+              {loading ? (
+                <span className="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true" />
+              ) : (
+                <i className="bi bi-search me-2"></i>
+              )}
+              Search Blockchain
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div className="alert alert-danger mt-3" role="alert">
+            <i className="bi bi-exclamation-triangle me-2"></i>
+            {error}
+          </div>
+        )}
+      </div>
+      
+      <div className="card-body">
+        {loading ? (
+          <div className="text-center">
+            <div className="spinner-border text-primary" role="status">
+              <span className="visually-hidden">Loading...</span>
+            </div>
+          </div>
+        ) : error ? (
+          <div className="alert alert-danger" role="alert">{error}</div>
+        ) : isSearchMode && searchResults ? (
+          // Search Results Table
+          <div>
+            {searchResults.history && searchResults.history.length > 0 ? (
+              <div className="table-responsive">
+                <table className="table table-striped table-hover">
+                  <thead>
+                    <tr>
+                      <th>Timestamp</th>
+                      <th>Price</th>
+                      <th>Amount</th>
+                      <th>Trade Type</th>
+                      <th>Yield</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {searchResults.history.map((item) => (
+                      <tr key={item.transaction_hash || Math.random()}>
+                        <td>
+                          {formatDateET(item.timestamp)}
+                        </td>
+                        <td>
+                          ${item.price?.toFixed(3) || 'N/A'}
+                        </td>
+                        <td>
+                          {item.trade_amount?.toLocaleString() || 'N/A'}
+                        </td>
+                        <td>
+                          {item.trade_type
+                            ? TRADE_TYPE_OPTIONS.find(
+                                (opt) => opt.key === item.trade_type
+                              )?.text || item.trade_type
+                            : 'N/A'}
+                        </td>
+                        <td>
+                          {item.yield_value
+                            ? `${item.yield_value.toFixed(3)}%`
+                            : 'N/A'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="alert alert-info">
+                <i className="bi bi-info-circle me-2"></i>
+                No historical price data found for CUSIP {searchResults.cusip}
+              </div>
+            )}
+          </div>
+        ) : (
+          // Regular Prices Table
+          <div className="table-responsive">
+            <table className="table table-hover table-striped">
+              <thead>
+                <tr>
+                  <th>CUSIP</th>
+                  <th>Date</th>
+                  <th>Amount (000s)</th>
+                  <th>Type</th>
+                  <th>Price</th>
+                  <th>Yield</th>
+                </tr>
+              </thead>
+              <tbody>
+                {prices.map((price) => (
+                  <tr key={price.cusip}>
+                    <td>{price.cusip}</td>
+                    <td>{formatDateET(price.timestamp)}</td>
+                    <td>{price.trade_amount ? 
+                      `${price.trade_amount.toLocaleString()}` : 
+                      'N/A'
+                    }</td>
+                    <td>{TRADE_TYPE_OPTIONS.find((opt) => opt.key === price.trade_type)?.text || 'N/A'}</td>
+                    <td>{price.price ? 
+                      `$${price.price.toFixed(3)}` : 
+                      'N/A'
+                    }</td>
+                    <td>{price.yield_value ? 
+                      `${price.yield_value.toFixed(3)}%` : 
+                      'N/A'
+                    }</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default BlockchainPrices;

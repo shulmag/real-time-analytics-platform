@@ -1,0 +1,159 @@
+/*
+ * @Date: 2021-10-11 
+ */
+
+import React from "react"; 
+import Button from 'react-bootstrap/Button';
+import Form from "react-bootstrap/Form"
+import InputGroup from "react-bootstrap/InputGroup"
+import Row from "react-bootstrap/Row";
+import Col from "react-bootstrap/Col";
+import Spinner from 'react-bootstrap/Spinner';
+
+function TabsSearchForm({searchValues, set, tradeType, onSubmit, isPricing}) {    //props should include func and states
+
+    return(
+        <>
+            <Form onSubmit={onSubmit}>
+                <Row className="align-items-end">
+                    <Col md={3}> 
+                        <Form.Group>
+                            <Form.Label 
+                                className="text-secondary mb-2"
+                                style={{ fontSize: '0.9rem', fontWeight: '500' }}
+                            >
+                                CUSIP
+                            </Form.Label>
+                            <Form.Control 
+                                required 
+                                minLength="8" 
+                                maxLength="9" 
+                                name="cusip" 
+                                id="cusip" 
+                                value={searchValues.cusip.toUpperCase()} 
+                                onChange={set('cusip')}
+                                style={{
+                                    borderRadius: '6px',
+                                    padding: '10px 12px',
+                                    border: '1px solid #e2e8f0',
+                                    fontSize: '0.95rem'
+                                }}
+                                className="shadow-sm"
+                            />
+                        </Form.Group>
+                    </Col>
+                    <Col md={3}>
+                        <Form.Group>
+                            <Form.Label 
+                                className="text-secondary mb-2"
+                                style={{ fontSize: '0.9rem', fontWeight: '500' }}
+                            >
+                                Trade Amount (thousands)
+                            </Form.Label>
+                            <InputGroup>    
+                                <InputGroup.Text
+                                    style={{
+                                        backgroundColor: '#f8fafc',
+                                        border: '1px solid #e2e8f0',
+                                        borderRight: 'none'
+                                    }}
+                                >
+                                    $ (k)
+                                </InputGroup.Text>
+                                <Form.Control 
+                                    placeholder="Dollar Amount" 
+                                    type="number" 
+                                    required 
+                                    min="5" 
+                                    max="10000" 
+                                    name="amount" 
+                                    value={searchValues.amount} 
+                                    onChange={set('amount')}
+                                    style={{
+                                        borderRadius: '0 6px 6px 0',
+                                        padding: '10px 12px',
+                                        border: '1px solid #e2e8f0',
+                                        fontSize: '0.95rem'
+                                    }}
+                                    className="shadow-sm"
+                                />
+                            </InputGroup>
+                        </Form.Group>
+                    </Col>
+                    <Col md={3}>
+                        <Form.Group>
+                            <Form.Label 
+                                className="text-secondary mb-2"
+                                style={{ fontSize: '0.9rem', fontWeight: '500' }}
+                            >
+                                Trade Type
+                            </Form.Label> 
+                            <Form.Select 
+                                required 
+                                name="tradeType" 
+                                value={searchValues.tradeType} 
+                                onChange={set('tradeType')}
+                                style={{
+                                    borderRadius: '6px',
+                                    padding: '10px 12px',
+                                    border: '1px solid #e2e8f0',
+                                    fontSize: '0.95rem'
+                                }}
+                                className="shadow-sm"
+                            >
+                                {tradeType.map((o) => (
+                                    <option key={o.key} value={o.key}>{o.text}</option>
+                                ))}
+                            </Form.Select>
+                        </Form.Group>
+                    </Col>
+                    <Col md="auto" style={{ paddingBottom: '1px' }}>
+                        {isPricing ? (
+                            <Button 
+                                disabled
+                                style={{
+                                    padding: '10px 20px',
+                                    backgroundColor: '#3182ce',
+                                    border: 'none',
+                                    borderRadius: '6px'
+                                }}
+                            >
+                                <Spinner 
+                                    as="span" 
+                                    animation="border" 
+                                    size="sm" 
+                                    role="status" 
+                                    aria-hidden="true"
+                                    className="me-2"
+                                /> 
+                                Pricing...
+                            </Button>
+                        ) : (
+                            <Button 
+                                type="submit"
+                                style={{
+                                    padding: '10px 20px',
+                                    backgroundColor: '#3182ce',
+                                    border: 'none',
+                                    borderRadius: '6px',
+                                    transition: 'all 0.2s ease'
+                                }}
+                                onMouseOver={(e) => e.target.style.backgroundColor = '#2c5282'}
+                                onMouseOut={(e) => e.target.style.backgroundColor = '#3182ce'}
+                            >
+                                Get YTW and Price
+                            </Button>
+                        )}
+                    </Col>
+                </Row>
+            
+            {/* <p class="font-weight-light">Date: {searchValues.date} Time: {searchValues.time}</p>
+            <Form.Control disabled={true} size="sm" type="date" name="date" value={searchValues.date} hidden/>
+            <Form.Control disabled={true} size="sm" type="time" name="time" value={searchValues.time} hidden/> */}
+                
+            </Form>
+        </>  
+    );
+}
+
+export default TabsSearchForm;

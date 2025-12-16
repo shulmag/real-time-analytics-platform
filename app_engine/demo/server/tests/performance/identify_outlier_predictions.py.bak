@@ -1,0 +1,68 @@
+'''
+Author: Developer Ray
+Date: 2023-03-23
+Last Editor: Developer Ray
+Last Edit Date: 2023-04-26
+'''
+import numpy as np
+import pandas as pd
+
+from modules.ficc.utils.auxiliary_functions import sqltodf
+
+from modules.test.auxiliary_variables import DIRECTORY
+from modules.test.auxiliary_functions import response_from_batch_pricing, get_bq_client
+
+
+LIMIT = 1000
+
+
+def test_nc10_cusips():
+    '''Compute the mean YTW for NC-10 CUSIPs with a certain coupon (say 5%) and a certain rating (say AA- or higher) 
+    from the MSRB data. Query Bigquery for a list of CUSIPs with the same qualities and get predictions for those 
+    CUSIPs. Return the predictions that are furthest from the mean computed from the MSRB data. Investigate these 
+    outliers by hand. Outlier is defined as the gap between the actual and the mean being in the 90+ percentile. 
+    NOTE: this is NOT a test in the traditional sense of having ground truth values.'''
+    bq_client = get_bq_client()
+
+    num_years_lower_bound = 6
+    num_years_upper_bound = 10
+    coupon = 5
+
+    query = f'''
+        SELECT cusip,
+               recent[SAFE_OFFSET(0)].yield,
+               recent[SAFE_OFFSET(0)].dollar_price
+        FROM `auxiliary_views.trade_history_latest_ref_data_minimal_exclusions`
+        WHERE DATE_DIFF(DATE(recent[SAFE_OFFSET(0)].trade_datetime), current_date, day) < 7
+          AND coupon = {coupon}
+          AND (sp_long = ('AAA')
+            OR sp_long = ('AA')
+            OR sp_long = ('AA+')
+            OR sp_long = ('AA-') )
+          AND DATE_DIFF(next_call_date, current_date, year) > {num_years_lower_bound}
+          AND DATE_DIFF(next_call_date, current_date, year) < {num_years_upper_bound}
+          AND federal_tax_status = 2
+        ORDER BY recent[SAFE_OFFSET(0)].trade_datetime DESC
+        LIMIT {LIMIT}'''
+    df = sqltodf(query, bq_client)
+    df['yield'] = df['yield'].astype(float)
+    avg_ytw = df['yield'].mean()
+    df['dollar_price'] = df['dollar_price'].astype(float)
+    avg_price = df['dollar_price'].mean()
+
+    cusip_list = df['cusip'].tolist()
+    request_obj = response_from_batch_pricing(f'{DIRECTORY}/nc10_cusips.csv', cusip_list)
+    assert request_obj.ok    # successful response; checks whether the status_code is less than 400
+    content = request_obj.content.decode('utf-8')
+    content = content.split('\n')
+    columns = content[0].split(',')    # first row is the column names
+    content = content[1:-1]    # first row is the column names, last row is an empty line
+    content = [row.split(',') for row in content]
+
+    df = pd.DataFrame(content, columns=columns)
+    df['gap_from_avg_ytw'] = np.abs(df['ytw'].astype(float) - avg_ytw)
+    # df['gap_from_avg_price'] = abs(df['dollar_price'] - avg_price)
+    df = df[df['gap_from_avg_ytw'] >= df['gap_from_avg_ytw'].quantile(0.9)]    # define outlier as `gap_from_avg_ytw` is in the 90+ percentile
+    filename = f'{DIRECTORY}/nc10_cusips_outliers.csv'
+    df.to_csv(filename, index=None)
+    assert True    # verifies that we have reached the end of the function

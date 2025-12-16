@@ -1,0 +1,59 @@
+'''
+ '''
+
+import pandas as pd
+import yfinance as yf
+from google.cloud import bigquery
+
+tickers = ['^IRX', '^FVX','^TNX','^TYX']
+
+TABLE = {'^IRX' :  'thirteen_week_t_rate',
+        '^FVX' :  'five_year_t_rate',
+        '^TNX' :  'ten_year_t_rate',
+        '^TYX' :  'thirty_year_t_rate'}
+
+def sqltodf(sql, bq_client):
+    bqr = bq_client.query(sql).result()
+    return bqr.to_dataframe()
+
+def uploadData(df,table_name):
+    schema = [bigquery.SchemaField("Date", "DATETIME"),
+              bigquery.SchemaField("Yield", "FLOAT")]
+
+    client = bigquery.Client(project="eng-reactor-287421",
+                             location="US")
+                             
+    job_config = bigquery.LoadJobConfig(schema = schema,
+                                        write_disposition="WRITE_APPEND")
+
+    job = client.load_table_from_dataframe(df,
+                                           f"eng-reactor-287421.treasury_yield.{table_name}",
+                                           job_config=job_config)
+
+
+def get_last_time(table_name):
+    query = f'''SELECT Date FROM `eng-reactor-287421.treasury_yield.{table_name}` order by Date desc limit 1'''
+    client = bigquery.Client(project="eng-reactor-287421",location="US")
+    df = sqltodf(query, client)
+    time = df.values[0][0]
+    return time
+
+def main(args):
+    data = yf.download(tickers=tickers, period='max', interval='1m', group_by='ticker')
+    
+    for ticker in tickers:
+        temp_data = data[ticker]
+        temp_data['Date'] = list(temp_data.index.copy())
+        temp_data.loc[:,'Date'] = pd.to_datetime(temp_data.Date.dt.strftime('%Y-%m-%d %H:%M'))
+        temp_data = temp_data[['Date','Close']]
+        temp_data.columns = ['Date','Yield']
+        temp_data.reset_index(drop=True, inplace=True)
+        
+        table_name = TABLE[ticker]
+        last_time = get_last_time(table_name)
+        temp_data = temp_data[temp_data.Date > last_time]
+        
+        uploadData(temp_data, table_name)
+    
+    return "SUCCESS"
+    

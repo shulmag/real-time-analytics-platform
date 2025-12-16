@@ -1,0 +1,1 @@
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/wasm32-unknown-unknown/release/soroban_muni_contract.wasm: /Users/gil/git/ficc/blockchain/soroban-muni-contracts/contracts/munis/src/lib.rs

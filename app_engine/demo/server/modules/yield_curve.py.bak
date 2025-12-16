@@ -1,0 +1,55 @@
+'''
+ # @ Author: Developer Ray
+ # @ Create date: 2024-04-05
+ # @ Modified by: Developer
+ # @ Modified date: 2024-04-08
+ # @ Description: Functions that support displaying the yield curve on the UI.
+ '''
+import numpy as np
+from flask import jsonify, make_response
+
+from modules.ficc.utils.nelson_siegel_model import yield_curve_level
+
+from modules.auxiliary_variables import NUM_CHARS_IN_YEAR_MONTH_DAY, DISPLAY_PRECISION, X_AXIS_LABEL_FOR_YIELD_CURVE, Y_AXIS_LABEL_FOR_YIELD_CURVE, ACCEPTABLE_DISPLAY_TYPES_FOR_YIELD_CURVE
+from modules.logging_functions import log_usage
+
+
+def _get_yield_curve_func(trade_date, user, display_type, api_call):
+    '''This function returns a yield curve as of this minute. In the future, this function should 
+    use the datetime given by the user.'''
+    try:    # wrap in try except to perform logging even when there is an error
+        # determine the step size based on whether the display output will be a table or a plot (plot requires more points to look smooth and thus a smaller step size)
+        assert display_type in ACCEPTABLE_DISPLAY_TYPES_FOR_YIELD_CURVE, f'`display_type` is {display_type}, but must be in {ACCEPTABLE_DISPLAY_TYPES_FOR_YIELD_CURVE}'
+        
+        # create all the maturities for which we want the yields
+        step = 1 if display_type == 'table' else 0.1
+        num_years = 30
+        maturities = np.arange(step, num_years + step, step)
+        
+        # create json response with the maturities and the yield values
+        separator = ':'
+        trade_date = trade_date[:NUM_CHARS_IN_YEAR_MONTH_DAY] + separator + trade_date[NUM_CHARS_IN_YEAR_MONTH_DAY + 1:]    # change time format for input into `yield_curve_level`
+        yields = yield_curve_level(maturities, trade_date)
+        yields = [np.round(yield_value / 100, DISPLAY_PRECISION) for yield_value in yields]
+        json_response_body = {X_AXIS_LABEL_FOR_YIELD_CURVE: maturities.tolist(), Y_AXIS_LABEL_FOR_YIELD_CURVE: yields}
+        response = make_response(jsonify(json_response_body), 200)
+
+        log_usage(user=user, 
+                  api_call=api_call, 
+                  real_time_yield_curve=True)
+        
+        return response
+    except Exception as e:
+        log_usage(user=user, 
+                  api_call=api_call, 
+                  real_time_yield_curve=True, 
+                  error=True)
+        raise e
+
+
+def get_yield_curve_plot(trade_date, user, api_call):
+    return _get_yield_curve_func(trade_date, user, 'plot', api_call)
+
+
+def get_yield_curve_table(trade_date, user, api_call):
+    return _get_yield_curve_func(trade_date, user, 'table', api_call)

@@ -1,0 +1,29 @@
+{
+    "attemptDeadline": "1500s",
+    "description": "Updates the file that stores all CUSIPs that are not outstanding. This file is used to speed up pricing of the entire universe since we can disregard all CUSIPs that are not outstanding. Since the timezone is set to America/Los_Angeles, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "headers": {
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/update_cusips_not_outstanding",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/update_cusips_not_outstanding"
+    },
+    "lastAttemptTime": "2025-01-12T04:00:00.882946Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/update_cusips_not_outstanding",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "0s",
+        "minBackoffDuration": "5s"
+    },
+    "schedule": "0 20 * * 6",
+    "scheduleTime": "2025-01-19T04:00:00.178455Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/Los_Angeles",
+    "userUpdateTime": "2024-11-05T01:19:54Z"
+}

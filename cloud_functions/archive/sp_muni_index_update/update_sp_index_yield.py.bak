@@ -1,0 +1,62 @@
+# -*- coding: utf-8 -*-
+# @Author: shayaan
+# @Date:   2021-04-19 08:28:57
+# @Last Modified by:   Developer-ficc
+# @Last Modified time: 2021-04-28 16:17:46
+import urllib.request
+import pandas as pd
+import os
+from google.cloud import storage
+from google.cloud import bigquery
+opener=urllib.request.build_opener()
+opener.addheaders=[('User-Agent','Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1941.0 Safari/537.36')]
+urllib.request.install_opener(opener)
+
+table_headers = ["date", "ytw"]
+link = "https://www.spglobal.com/spdji/en/idsexport/file.xls?hostIdentifier=48190c8c-42c4-46af-8d1a-0cd5db894797&redesignExport=true&languageId=1&selectedModule=YieldToWorstGraphView&selectedSubModule=Graph&yearFlag=threeYearFlag&indexId=30000005"
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"]="/Users/shayaan/ficc/eng-reactor-287421-112eb767e1b3.json"
+PROJECT_ID = "eng-reactor-287421"
+TABLE_ID = "eng-reactor-287421.spBondIndex.sp_muni_index_yield"
+
+
+def getData(link):
+	urllib.request.urlretrieve(link,"/tmp/temp.xls")
+
+def convertTypes(df):
+	df.date = pd.to_datetime(df.date, format="%Y-%m-%d")
+	df.ytw = df.ytw * 100
+	return df
+
+def getSchema():
+	schema = [
+				bigquery.SchemaField("date", "DATE"),
+				bigquery.SchemaField("ytw","FLOAT")
+			]
+	return schema
+
+def uploadData(df):
+	client = bigquery.Client(project=PROJECT_ID, location="US")
+	job_config = bigquery.LoadJobConfig(schema = getSchema(),
+									   write_disposition="WRITE_APPEND"
+									   )
+
+	job = client.load_table_from_dataframe(df, TABLE_ID,job_config=job_config)
+
+	try:
+		job.result()
+		print("Upload Successful")
+	except Exception as e:
+		print("Failed to Upload")
+		raise e
+
+def main(args):
+	getData(link)
+	df = pd.read_excel("/tmp/temp.xls")
+	# To remove the headers and tail disciption
+	df.rename(columns={'Unnamed: 0':'date', 'Unnamed: 1':'ytw'}, inplace=True)
+	df = df[8:-4]	
+	df = convertTypes(df)
+
+	# Get the last row as dataframe
+	df = df[-1:]
+	uploadData(df)

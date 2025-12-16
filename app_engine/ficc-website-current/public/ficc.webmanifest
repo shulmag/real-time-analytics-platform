@@ -1,0 +1,21 @@
+{
+  "short_name": "ficc.ai",
+  "name": "ficc.ai",
+  "description": "TBD",
+  "icons": [
+    {
+      "src": "/img/android-chrome-192x192",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/img/android-chrome-256x256",
+      "type": "image/png",
+      "sizes": "256x256"
+    }
+  ],
+  "background_color": "#303030",
+  "theme_color": "#303030",
+  "display": "standalone",
+  "scope": "/"
+}

@@ -1,0 +1,10 @@
+# Written by Developer
+# 2025-09-04
+# Last Edited by Developer 
+# 2025-09-04
+
+This cloud function creates the ficc AAA benchmarks.  It is currently built and deployed automatically by GCP when a commit is pushed to GitHub.   
+
+Therefore, in order to assure that a commit won't break the cloud function, please run ```test_main.py``` and ```test_scheduler.py``` by creating a virtual environment in python3.10, installing the requirements, and additionally installing pytest ```pip install pytest```.  
+
+Then from the root directory of create-aaa-benchmark simply run ```pytest -s``` in the terminal.  This will run all the functionality in testing mode and assure you that the cloud function will likely run properly with your commit.  

@@ -1,0 +1,12 @@
+-- Create Date: 2025-01-02
+-- Last Edit Date: 2025-01-02
+-- Description: Creates table with all of the reference data, trade history, and similar trade history to be used in automated training.
+-- Schedule: Every day at 1:05 UTC
+CREATE OR REPLACE TABLE
+  `jesse_tests.trade_history_same_issue_5_yr_mat_bucket_1_materialized` AS
+SELECT
+  *
+FROM
+  `eng-reactor-287421.jesse_tests.trade_history_ref_data_same_issue_5_yr_mat_bucket_1_coupon`
+WHERE
+  trade_date > DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)

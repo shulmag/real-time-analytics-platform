@@ -1,0 +1,264 @@
+'''
+Author: Developer Ray
+Date: 2023-04-13
+Last Editor: Developer Ray
+Last Edit Date: 2023-01-03
+'''
+from auxiliary_variables import QUANTITY, TRADE_TYPE, CUSIP_ERROR_MESSAGE, DOLLAR_PRICE_MODEL_DISPLAY_TEXT
+from auxiliary_functions import run_multiple_times_before_failing, response_from_individual_pricing, check_if_string_value_can_be_represented_as_a_number, check_if_string_value_cannot_be_represented_as_a_number
+
+
+def check_if_successful_price_received(cusip, trade_type=TRADE_TYPE, quantity=QUANTITY):
+    '''Tests that individual pricing successfully returns a price for `cusip` for 
+    `trade_type` and `quantity`.'''
+    response_dict = response_from_individual_pricing(cusip, trade_type, quantity)
+    assert 'error' not in response_dict, f'For CUSIP {cusip}, quantity (in thousands) {quantity}, and trade type {trade_type}, pricing should not have an error, but has an error: {response_dict["error"]}'
+
+
+def check_if_successful_price_received_and_dollar_price_model_used(cusip, trade_type=TRADE_TYPE, quantity=QUANTITY, reason_for_dollar_price_model=None):
+    '''Tests that individual pricing successfully returns a price for `cusip` for 
+    `trade_type` and `quantity`, and also that there is a predicted price, but not a 
+    predicted yield, which indicates that the dollar price model was used, since we 
+    currently do not predict a yield when using the dollar price model.'''
+    response_dict = response_from_individual_pricing(cusip, trade_type, quantity)
+    assert 'error' not in response_dict, f'For CUSIP {cusip}, quantity (in thousands) {quantity}, and trade type {trade_type}, pricing should not have an error, but has an error: {response_dict["error"]}'
+    response_dict = response_dict[0]    # extracting the dict since there is only a single item since this function is only used for individual pricing
+    price, ytw = response_dict['price'], response_dict['ficc_ytw']    # TODO: make sure these are the correct fields in `response_dict`
+    check_if_string_value_can_be_represented_as_a_number(price, 'price')
+    
+    if reason_for_dollar_price_model is not None:
+        reason_for_dollar_price_model = DOLLAR_PRICE_MODEL_DISPLAY_TEXT[reason_for_dollar_price_model]
+        assert ytw == reason_for_dollar_price_model, f'YTW value should be {reason_for_dollar_price_model}, but was instead {ytw}'
+    else:
+        check_if_string_value_cannot_be_represented_as_a_number(ytw, 'YTW')
+
+
+def check_if_error_received(cusip, error_key, trade_type=TRADE_TYPE, quantity=QUANTITY):
+    '''Tests that individual pricing successfully returns an error for `cusip` for 
+    `trade_type` and `quantity`, and that the error message corresponding to `error_key` 
+    is the correct one.'''
+    def error_message_matches(response_error, error_key):
+        expected_error = CUSIP_ERROR_MESSAGE[error_key]
+        if callable(expected_error):    # if `expected_error` is a function, then call it with some dummy input to get a string error message and compare everything before and after the dummy input when checking that the error message is correct
+            dummy_input_number = 1
+            expected_error = expected_error(dummy_input_number)
+            num_chars_before_input = expected_error.index(str(dummy_input_number))
+            num_chars_after_input = len(expected_error) - num_chars_before_input - 1
+            before_input_matches = expected_error[:num_chars_before_input] == response_error[:num_chars_before_input]
+            after_input_matches = expected_error[-num_chars_after_input:] == response_error[-num_chars_after_input:]
+            return before_input_matches and after_input_matches
+        else:
+            return response_error == expected_error
+
+    response_dict = response_from_individual_pricing(cusip, trade_type, quantity)
+    assert 'error' in response_dict and error_message_matches(response_dict['error'], error_key), f'The response should have an error, since CUSIP {cusip} has issue corresponding to the following error_key: {error_key}'
+
+
+@run_multiple_times_before_failing
+def test_64971XQM3_all_trade_types():
+    '''Tests that individual pricing successfully returns a price for 64971XQM3 for all trade types.'''
+    trade_types = ['D', 'S', 'P']
+    for trade_type in trade_types:
+        check_if_successful_price_received('64971XQM3', trade_type)
+
+
+@run_multiple_times_before_failing
+def test_assorted_8_digit():
+    '''Tests that individual pricing is successful for 8 digit CUSIPs.'''
+    cusip_list = ['64971XQM',
+                  '6461367J',
+                  '13063DU8',
+                  '160429B8',
+                  '13063DLJ',
+                  '54466HJM',
+                  '650036CJ']
+    for cusip in cusip_list:
+        check_if_successful_price_received(cusip)
+
+    cusip_list_with_error_key = [('40064UAW', 'not_outstanding'), ('431669AR', 'defaulted')]
+    for cusip, error_key in cusip_list_with_error_key:
+        check_if_error_received(cusip, error_key)
+
+
+@run_multiple_times_before_failing
+def test_40064UAW2():
+    '''Tests that individual pricing successfully returns an error message indicating that the CUSIP is outstanding.'''
+    check_if_error_received('40064UAW2', 'not_outstanding')
+
+
+@run_multiple_times_before_failing
+def test_73358WK60():
+    '''Tests that individual pricing successfully returns an error message indicating that the CUSIP is missing dates 
+    necessary to compute yield.'''
+    check_if_error_received('73358WK60', 'not_outstanding')
+
+
+## The below test has been commented out since 090491R37 is no longer missing the coupon value in the reference data.
+# @run_multiple_times_before_failing
+# def test_090491R37():
+#     '''Tests that individual pricing successfully returns an error message indicating that the CUSIP is missing the 
+#     coupon value necessary to compute yield.'''
+#     check_if_error_received('090491R37', 'insufficient_data')
+
+
+## The below test has been commented out since bonds with missing or negative yields in the history are supported with the dollar price model.
+# @run_multiple_times_before_failing
+# def test_69379BAA1():
+#     '''This CUSIP has MSRB reported yields in the history that are null, so we refuse to price it. This 
+#     CUSIP had an issue in the past where the `issue_amount` feature was 0 and was thus causing negative 
+#     values when taking the log.'''
+#     check_if_error_received('69379BAA1', 'negative_yield_in_history')
+
+
+## The below test has been commented out since we now support CUSIPs with `maturity_description_code` == 2
+# @run_multiple_times_before_failing
+# def test_894375DP6():
+#     '''Tests that individual pricing successfully returns an error message indicating that the CUSIP is not a bond.'''
+#     check_if_error_received('894375DP6', 'not_bonds')
+
+
+@run_multiple_times_before_failing
+def test_950885SN4():
+    '''Tests that individual pricing successfully returns a price for 950885SN4.'''
+    check_if_successful_price_received('950885SN4')
+
+
+@run_multiple_times_before_failing
+def test_914811NS9():
+    '''Tests that individual pricing successfully returns a price for 914811NS9. This CUSIP has caused issues in 
+    the past because it has rating CC which was not found with old encoders.'''
+    check_if_successful_price_received('914811NS9')
+
+
+@run_multiple_times_before_failing
+def test_798755EC4():
+    '''Tests that CUSIP that is within 60 days to the calc date returns an error message indicating that the 
+    bond is maturing soon.
+    Old: Tests that individual pricing successfully returns a price for 798755EC4. This CUSIP does not have a call 
+    date but is refunded, which was causing an issue when assigning variables intended to display the correct 
+    calculation date on the front end.'''
+    check_if_error_received('798755EC4', 'maturing_soon')
+
+
+@run_multiple_times_before_failing
+def test_677525WD5():
+    '''Tests that individual pricing successfully returns an error message indicating that the CUSIP has defaulted.'''
+    check_if_error_received('677525WD5', 'defaulted')
+
+
+@run_multiple_times_before_failing
+def test_452226Y31():
+    '''Tests that individual pricing successfully returns an error message indicating that the bond is a private 
+    placement bond or a bank loan.'''
+    check_if_error_received('452226Y31', 'bank_loan')
+
+
+@run_multiple_times_before_failing
+def test_488386JA2():
+    '''Tests that CUSIP that is within 60 days to the calc date returns an error message indicating that the 
+    bond is maturing soon.
+    Old: Tests that individual pricing successfully returns a price for 488386JA2. This CUSIP does not have a last 
+    dollar price, so causes issues when the dollar price model is used on it.'''
+    check_if_error_received('488386JA2', 'maturing_soon')
+
+
+@run_multiple_times_before_failing
+def test_64542PDM4():
+    '''Tests that individual pricing successfully returns an error message indicating that the recent yields are 
+    abnormally high.'''
+    check_if_error_received('64542PDM4', 'high_yield_in_history')
+
+
+@run_multiple_times_before_failing
+def test_76803EAB4():
+    '''Tests that individual pricing successfully returns an error message indicating that the bond is a private 
+    placement bond or a bank loan.'''
+    check_if_error_received('76803EAB4', 'bank_loan')
+
+
+@run_multiple_times_before_failing
+def test_106134AP4():
+    '''Tests that a CUSIP with coupon_type 10 successfully returns an error message indicating that the bond has 
+    an irregular coupon rate.'''
+    check_if_error_received('106134AP4', 'irregular_coupon_rate')
+
+
+@run_multiple_times_before_failing
+def test_83412PEH1():
+    '''Tests that a CUSIP with coupon_type 10 successfully returns an error message indicating that the bond has 
+    an irregular coupon rate.'''
+    check_if_error_received('83412PEH1', 'irregular_coupon_rate')
+
+
+@run_multiple_times_before_failing
+def test_671409G87():
+    '''Tests that a CUSIP that is within 60 days to the calc date returns an error message indicating that the 
+    bond is maturing soon.'''
+    check_if_error_received('671409G87', 'maturing_soon')
+
+
+## The below test has been commented out since the CUSIP has recently traded and no longer has the issue where there is a null dollar price in the history
+# @run_multiple_times_before_failing
+# def test_228130JU5():
+#     '''Tests that individual pricing successfully returns an error message indicating that the dollar price is 
+#     missing from recent trades.'''
+#     check_if_error_received('228130JU5', 'null_dollar_price_in_history')
+
+
+@run_multiple_times_before_failing
+def test_71910EAM1():
+    '''Tests that individual pricing successfully uses a dollar price model for a bond with negative yields in 
+    the history.'''
+    check_if_successful_price_received_and_dollar_price_model_used('71910EAM1', reason_for_dollar_price_model='missing_or_negative_yields')
+
+
+## The below test has been commented out since the CUSIP has defaulted
+# @run_multiple_times_before_failing
+# def test_240463JX8():
+#     '''Tests that individual pricing successfully uses a dollar price model for a bond with null yields in the history.'''
+#     check_if_successful_price_received_and_dollar_price_model_used('240463JX8', reason_for_dollar_price_model='missing_or_negative_yields')
+
+
+@run_multiple_times_before_failing
+def test_880461ES3():
+    '''Tests that individual pricing successfully uses a dollar price model for a PAC bond.'''
+    check_if_successful_price_received_and_dollar_price_model_used('880461ES3', reason_for_dollar_price_model='pac_bond')
+
+
+@run_multiple_times_before_failing
+def test_93978TN88():
+    '''Tests that individual pricing successfully uses a dollar price model for a PAC bond.'''
+    check_if_successful_price_received_and_dollar_price_model_used('93978TN88', reason_for_dollar_price_model='pac_bond')
+
+
+@run_multiple_times_before_failing
+def test_014464XR7():
+    ''''Tests that individual pricing successfully returns an error message indicating that the quantity of 
+    the hypothetical trade is larger than the outstanding amount.'''
+    check_if_error_received('014464XR7', 'quantity_greater_than_outstanding_amount', quantity=5000)
+
+
+@run_multiple_times_before_failing
+def test_646136TN1():
+    '''Tests that individual pricing successfully returns a price for 646136TN1. This CUSIP has a data issue 
+    where the outstanding amount is 0, but we should still be able to price it and not raise the error that 
+    the amount priced is greater than the outstanding amount.'''
+    check_if_successful_price_received('646136TN1')
+
+
+@run_multiple_times_before_failing
+def test_798712BK0():
+    '''Tests that individual pricing successfully returns an error message indicating that the bond is under review.'''
+    check_if_error_received('798712BK0', 'under_review')
+
+
+@run_multiple_times_before_failing
+def test_leading_space():
+    '''Tests that individual pricing successfully returns a price for a CUSIP with a leading space.'''
+    check_if_successful_price_received(' 64971XQM')
+
+
+@run_multiple_times_before_failing
+def test_trailing_space():
+    '''Tests that individual pricing successfully returns a price for a CUSIP with a trailing space.'''
+    check_if_successful_price_received('64971XQM ')

@@ -1,0 +1,42 @@
+'''
+ # @ Author: Developer Shayaan
+ # @ Create date: 2022-03-01
+ # @ Modified by: Developer
+ # @ Modified date: 2024-05-31
+ # @ Description: Convenience functions to upload and download data from Google cloud buckets.
+ '''
+import urllib3
+import requests
+import pickle
+
+from google.api_core.exceptions import TooManyRequests
+
+from modules.ficc.utils.auxiliary_functions import run_multiple_times_before_failing
+
+
+@run_multiple_times_before_failing((TooManyRequests,), 10)    # google.api_core.exceptions.TooManyRequests: 429 POST
+def upload_data(storage_client, bucket_name, file_name, path_to_file=None):
+    '''This function is used to upload data to the cloud bucket.'''
+    if path_to_file is None: path_to_file = file_name
+    bucket = storage_client.get_bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    blob.upload_from_filename(path_to_file)
+    print(f'File from {path_to_file} uploaded to Google cloud storage: {bucket_name}/{file_name}.')
+
+
+@run_multiple_times_before_failing((KeyError, urllib3.exceptions.SSLError, requests.exceptions.SSLError, TooManyRequests), 10)    # catches KeyError: 'email', KeyError: 'expires_in', urllib3.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad, requests.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac, google.api_core.exceptions.TooManyRequests: 429 POST
+def download_pickle_file(storage_client, bucket_name, file_name):
+    '''This function is used to download the data from the GCP storage bucket.
+    It is assumed that we will be downloading a pickle file. The decorator solves 
+    the following problem: GCP limits how quickly files can be downloaded from 
+    buckets and raises an `SSLError` or a `KeyError` when the buckets are accessed 
+    too quickly in succession.'''
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    if not blob.exists():    # `file_name` in `bucket_name` does not exist
+        print(f'File {file_name} does not exist in {bucket_name}.')
+        return None
+    pickle_in = blob.download_as_string()
+    data = pickle.loads(pickle_in)
+    # print(f'File {file_name} downloaded from {bucket_name}.')    # legacy debugging print statement
+    return data

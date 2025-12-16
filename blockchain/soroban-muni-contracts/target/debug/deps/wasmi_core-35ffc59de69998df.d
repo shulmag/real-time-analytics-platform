@@ -1,0 +1,11 @@
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/libwasmi_core-35ffc59de69998df.rmeta: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/host_error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/nan_preserving_float.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/trap.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/units.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/untyped.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/value.rs
+
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/wasmi_core-35ffc59de69998df.d: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/host_error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/nan_preserving_float.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/trap.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/units.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/untyped.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/value.rs
+
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/lib.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/host_error.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/nan_preserving_float.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/trap.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/units.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/untyped.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasmi_core-0.13.0/src/value.rs:

@@ -1,0 +1,75 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.cod-card-5-col {
+  flex: 0 0 20%;
+  max-width: 20%;
+}
+
+.dashboard {
+  background-color: #f8fafc;
+}
+
+.hover-effect:hover {
+  background-color: #f7fafc;
+}
+
+.nav-pills .nav-link.active {
+  background-color: #1a365d;
+}
+
+.nav-pills .nav-link {
+  color: #4a5568;
+}
+
+.nav-pills .nav-link:hover:not(.active) {
+  background-color: #e2e8f0;
+}
+
+.card {
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+
+.text-success {
+  color: #38a169 !important;
+}
+
+.text-danger {
+  color: #e53e3e !important;
+}
+
+/* Loading animation for navbar */
+@keyframes fadeInOut {
+  0% { opacity: 0.5; }
+  50% { opacity: 1; }
+  100% { opacity: 0.5; }
+}
+
+.loading-text {
+  animation: fadeInOut 1.5s ease-in-out infinite;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .card-body {
+    padding: 1rem;
+  }
+  
+  h3 {
+    font-size: 1.5rem;
+  }
+  
+  h5 {
+    font-size: 1.1rem;
+  }
+}

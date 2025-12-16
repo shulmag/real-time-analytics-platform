@@ -1,0 +1,47 @@
+@use "../lib" as *;
+
+
+main {
+
+  & > section:nth-of-type(even) {
+    background: color('surface.secondary.1');
+  }
+}
+
+
+#contact-us {
+  background: color('surface.secondary.1');
+}
+
+
+#senior-advisors {
+  @include region-buffer;
+  
+  & > div {
+
+    & > div {
+      margin-block-start: spacing();
+      gap: 2px;
+      background: color('grey');
+      padding: 2px;
+    }
+  }
+
+  h2 {
+    @include col;
+  }
+  
+  h2, h3, p {
+    color: color('text.contrast')
+  }
+
+  section {
+    @include col;
+    padding: spacing();
+    background: color('surface.secondary.1');
+
+    @include screen {
+      @include col(span 6)
+    }
+  }
+}

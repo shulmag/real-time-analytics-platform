@@ -1,0 +1,6 @@
+# Function dependencies, for example:
+# package>=version
+
+quandl
+google-cloud-bigquery
+pyarrow

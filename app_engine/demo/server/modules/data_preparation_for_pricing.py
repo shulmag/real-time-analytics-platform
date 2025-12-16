@@ -1,0 +1,546 @@
+'''
+Description: Functions that support preparation of the data before calling the model.
+'''
+# import traceback    # used to print error stack trace; cannot print traceback because Google Cloud logging interprets it as an actual error that has not been caught causing alerts to go off
+import warnings    # used to ignore warnings
+import numpy as np
+import pandas as pd
+import pickle
+from datetime import datetime
+
+from modules.ficc.utils.diff_in_days import diff_in_days_two_dates
+from modules.ficc.utils.gcp_storage_functions import download_pickle_file
+from modules.ficc.utils.auxiliary_variables import CATEGORICAL_FEATURES, \
+                                                   NON_CAT_FEATURES, \
+                                                   BINARY, \
+                                                   NON_CAT_FEATURES_DOLLAR_PRICE, \
+                                                   CATEGORICAL_FEATURES_DOLLAR_PRICE, \
+                                                   BINARY_DOLLAR_PRICE
+from modules.ficc.utils.auxiliary_functions import run_five_times_before_raising_redis_connector_error
+from modules.ficc.data.process_data import process_data
+from modules.ficc.utils.trade_dict_to_list import TRADE_FEATURE_TO_INDEX, \
+                                                  NECESSARY_FEATURES_FOR_PROCESSING_TRADE_HISTORY, \
+                                                  ADDITIONAL_FEATURES_EXTRACTED_FROM_TRADE_IN_TRADE_HISTORY
+
+from modules.auxiliary_variables import TRADE_MAPPING, \
+                                        NN_PRED_LIST, \
+                                        NN_PRED_LIST_DOLLAR_PRICE, \
+                                        USE_CACHE_FOR_GET_DATA_FOR_SINGLE_CUSIP, \
+                                        SEQUENCE_LENGTH, \
+                                        SEQUENCE_LENGTH_DOLLAR_PRICE, \
+                                        NUM_FEATURES, \
+                                        REFERENCE_DATA_FEATURES, \
+                                        USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING, \
+                                        get_treasury_rate_df, \
+                                        get_holidays, \
+                                        storage_client, \
+                                        bq_client
+from modules.auxiliary_functions import get_feature_value, cache_output_cusip_trade_datetime, is_none_or_nan
+from modules.point_in_time_pricing import create_reference_data_and_trade_history, get_point_in_time_reference_data_from_cusip_list, get_trade_history_data_from_cusip_list
+from modules.similar_trade_history import get_similar_trade_history_data
+from modules.exclusions import CUSIPS_UNDER_REVIEW, missing_important_features, missing_important_dates_or_dates_are_out_of_bounds, yield_in_history_is_high, dollar_price_in_history_is_null, irregular_coupon_rate
+
+
+FEATURES_FOR_PROCESSING_TRADE_HISTORY = NECESSARY_FEATURES_FOR_PROCESSING_TRADE_HISTORY + ADDITIONAL_FEATURES_EXTRACTED_FROM_TRADE_IN_TRADE_HISTORY
+FEATURES_UNNECESSARY_FOR_PROCESSING_TRADE_HISTORY = [feature for feature in TRADE_FEATURE_TO_INDEX.keys() if feature not in FEATURES_FOR_PROCESSING_TRADE_HISTORY]
+
+
+def target_trade_processing_for_attention(row):
+    target_trade_features = [row['quantity']] + TRADE_MAPPING[row['trade_type']]
+    return np.tile(target_trade_features, (1, 1))
+
+
+def pre_processing(df):
+    '''This function performs pre-processing for trade and reference data before it is sent 
+    to the model.'''
+    if type(df) == str: return df    # NB: When df is a str, it is an error message, but these error messages don't correspond to those in `process_data`
+    df = df.copy()
+    df.loc[:, 'target_attention_features'] = df.apply(target_trade_processing_for_attention, axis=1)
+    return df
+
+
+def get_encoders(use_dollar_price_model) :
+    '''Create function instead of loading as a global variable so we can get the most updated 
+    value every time we price a CUSIP.'''
+    encoders_filename = 'encoders_dollar_price.pkl' if use_dollar_price_model else 'encoders.pkl'
+    return download_pickle_file(storage_client, 'automated_training', encoders_filename)    
+
+
+def features_for_input_to_nn(df: pd.DataFrame, use_dollar_price_model: bool, using_archived_vertexai_model: bool = False):
+    '''Returns inputs for the neural network. When calling the Vertex AI model on the endpoint versus using an 
+    archived one, the structure of the inputs is different, and so the boolean flag `using_archived_vertexai_model` 
+    determines which structure is created. In this case, the input should be represented as an array list.'''
+    encoders = get_encoders(use_dollar_price_model)    # do not make `encoders` a global variable because the only way to use the updated encoders is to re-deploy the server, and we would like to use updated encoders even if there is no server code change
+    datalist = []
+    non_cat_features = NON_CAT_FEATURES_DOLLAR_PRICE if use_dollar_price_model else NON_CAT_FEATURES
+    binary = BINARY_DOLLAR_PRICE if use_dollar_price_model else BINARY
+    noncat_and_binary = [np.expand_dims(df[f].to_numpy().astype('float64'), axis=1) for f in non_cat_features + binary]
+    noncat_and_binary = np.concatenate(noncat_and_binary, axis=-1)
+    if not using_archived_vertexai_model: noncat_and_binary = noncat_and_binary.tolist()
+    datalist.append(noncat_and_binary)
+
+    categorical_features = CATEGORICAL_FEATURES_DOLLAR_PRICE if use_dollar_price_model else CATEGORICAL_FEATURES
+    for f in categorical_features:
+        try:
+            encoded = encoders[f].transform(df[f])
+        except Exception as e:    # the reference data occasionally keeps categorical features blank as the data is slowly filled in, during this time we should refuse to price these CUSIPs
+            print(f'Categorical feature: {f} has an issue being transformed. dataframe is what contained the value:\n{df[["cusip", f]].to_markdown()}')
+            raise e
+        encoded = encoded.astype('float64')
+        if not using_archived_vertexai_model: encoded = encoded.tolist()
+        datalist.append(encoded)
+    return datalist
+
+
+def get_inputs_for_nn(df: pd.DataFrame, use_dollar_price_model: bool, use_similar_trade_history: bool = True, using_archived_vertexai_model: bool = False):
+    '''Returns inputs for the neural network as a list of dictionaries. When calling the Vertex AI model on the 
+    endpoint versus using an archived one, the structure of the inputs is different, and so the boolean flag 
+    `using_archived_vertexai_model` determines which structure is created.'''
+    trade_history_input = df['trade_history_dollar_price'] if use_dollar_price_model else df['trade_history']
+    trade_history_input = np.stack(trade_history_input.to_numpy())
+    if not using_archived_vertexai_model: trade_history_input = trade_history_input.tolist()
+
+    target_attention_features_input = np.stack(df['target_attention_features'].to_numpy())
+    if not using_archived_vertexai_model: target_attention_features_input = target_attention_features_input.tolist()
+
+    similar_trade_history_input = []
+    if (not use_dollar_price_model) and use_similar_trade_history:    # dollar price model does not use similar trades
+        similar_trade_history_input = np.stack(df['similar_trade_history'].to_numpy())
+        if not using_archived_vertexai_model: similar_trade_history_input = similar_trade_history_input.tolist()
+        similar_trade_history_input = [similar_trade_history_input]    # add extra brackets to make the Python list concatenation a one line statement
+    
+    inputs = similar_trade_history_input + [trade_history_input, target_attention_features_input] + features_for_input_to_nn(df, use_dollar_price_model, using_archived_vertexai_model)
+    if using_archived_vertexai_model: return inputs
+
+    nn_pred_list = NN_PRED_LIST_DOLLAR_PRICE if use_dollar_price_model else NN_PRED_LIST
+    if not use_similar_trade_history: nn_pred_list = [predictor for predictor in nn_pred_list if predictor != 'similar_trade_history_input']    # remove `similar_trade_history_input` if not using yield spread with similar trades model
+    num_cusips = len(df)
+    inputs_as_list_of_dicts = [{nn_pred: inputs[idx][cusip_idx] for idx, nn_pred in enumerate(nn_pred_list)} for cusip_idx in range(num_cusips)]
+    return inputs_as_list_of_dicts
+
+
+def reverse_direction_concat(df: pd.DataFrame, interdealer: bool = False):
+    '''Copies a dataframe, inverts trade_type dependent features for 'S' and 'P' trades and concatenates 
+    the new trades to the dataframe. For 'D' trades, two copies of the dataframe are made with both 'S' 
+    and 'P' trades.
+
+    Multiple calls to `process_data(...)` would be highly inefficient, so we minimize repeated computations/data 
+    retrievals by just changing target trade dependent features: `*_ttypes` and `trade_type`. Note that 
+    `target_attention_features` does not need to be changed here because they are changed in `pre_processing(...)`.
+    This is a column-wise pandas operation which should, in theory, be much faster than calling `process_data(...)` again. 
+    Memory consumption should be the same, if not better, than multiple calls to `process_data(...)`, since the function 
+    call stack and intemediate memory used by `process_data(...)` might be more.'''
+    if not len(df): return df    # if df empty, exit
+
+    if interdealer:
+        assert (df['trade_type'] == 'D').all(), f'Since `interdealer={interdealer}`, all trade type values must be `D`, but has the following counts: {df["trade_type"].value_counts().to_dict()}'
+    else:
+        assert df['trade_type'].isin(['P', 'S']).all(), f'Since `interdealer={interdealer}`, all trade type values must be `P` or `S`, but has the following counts: {df["trade_type"].value_counts().to_dict()}'
+
+    # an example of the value of one of these features is `SP` where the first character (`S`) is the trade type of the trade of interest (e.g., for `max_ys_ttypes` this would be the trade with the maximum yield spread in the history), and the second character (`P`) is the trade type of the current trade
+    ttype_features = ['max_ys_ttypes', 
+                      'min_ys_ttypes', 
+                      'max_dp_ttypes', 
+                      'min_dp_ttypes', 
+                      'max_qty_ttypes', 
+                      'min_ago_ttypes', 
+                      'D_min_ago_ttypes', 
+                      'P_min_ago_ttypes', 
+                      'S_min_ago_ttypes']   
+    df_cols = set(df.columns)
+    temp = df.copy()
+    if interdealer: temp_P = df.copy()    # `temp` will have `trade_type` of `S`
+    if 'original_trade' in df_cols:
+        temp['original_trade'] = False    # the copied `df` is used to contain the flipped (not original) trades
+        if interdealer: temp_P['original_trade'] = False
+
+    flip = {'P': 'S', 'S': 'P'}
+    
+    for col in ttype_features + ['trade_type']:
+        if col not in df_cols:    # yield spread model uses `*_ys_*` and dollar price model uses `*_dp_*`
+            continue
+        elif col == 'trade_type':
+            if interdealer:
+                temp[col] = 'S'
+                temp_P[col] = 'P'
+            else:
+                target_trade_type = temp[col].iloc[0]    # used to maintain the order for single CUSIP pricing
+                temp[col] = temp[col].apply(flip.get)    # `trade_type` is inverted by just flipping the first character
+        else:
+            trade_type_of_trade_of_interest = temp[col].str[0]
+            if interdealer:
+                temp[col] = trade_type_of_trade_of_interest + 'S'
+                temp_P[col] = trade_type_of_trade_of_interest + 'P'
+            else:
+                trade_type_of_current_trade_flipped = temp[col].str[1].apply(flip.get)    # trade history derived ttype is inverted by flipping the second character
+                temp[col] = trade_type_of_trade_of_interest + trade_type_of_current_trade_flipped
+
+    # for single CUSIP pricing, we use a consistent order where the first row is S and the second row is P
+    # for batch pricing this does not matter, so we define `target_trade_type` as the first item in `temp` arbitrarily
+    if interdealer:
+        order = [df, temp, temp_P]
+    else:
+        order = [df, temp] if target_trade_type == 'S' else [temp, df]
+    return pd.concat(order)
+
+
+def cusip_is_invalid(cusip):
+    return len(cusip) < 8 or not cusip.isalnum()    # can handle weird Excel scientific notation CUSIPs, so remove invalid condition of `len(cusip) > 9`; see `fix_cusip_improperly_formatted_from_excel_automatic_scientific_notation(...)`
+
+
+def fix_cusip_improperly_formatted_from_excel_automatic_scientific_notation(cusip):
+    '''There are some CUSIPs that end in “E#” where # is a digit. This causes Excel to represent 
+    the CUSIP in scientific notation where “E#” represents 10^#. For example, 1073356E6 becomes 
+    1073356000000. We can recover the original CUSIP, when the CUSIP has greater than 9 characters 
+    (where all the trailing characters are 0s). Similarly, we can also recover the original CUSIP 
+    when it has 7 characters, where the CUSIP should have ended in “E0”. In contrast, when we have 
+    8 digits or 9 digits, we should not perform any additional modification beyond adding the check 
+    digit for the 8 digit CUSIP since we cannot distinguish between an 8 digit CUSIP entered by the 
+    user and one where Excel has mutated it based on scientific notation.'''
+    if len(cusip) <= 9: return cusip    # no modification can be done to the CUSIP
+    for idx, char in enumerate(cusip):
+        if not ((idx >= 7 and char == '0') or (idx < 7 and char.isdigit())):    # if idx is greater than 7, then the character must be 0, otherwise the character must be a digit
+            return cusip    # no modification can be done to the CUSIP since it has alphanumeric characters or does not have trailing 0's
+    num_zeros = len(cusip) - 7
+    corrected_cusip = cusip[:7] + f'E{num_zeros}'
+    print(f'*** Excel altered CUSIP of {cusip} was converted to: {corrected_cusip} ***')
+    return corrected_cusip
+
+
+def convert_isin_to_cusip(isin):
+    '''Converts ISIN value to CUSIP value, by removing the first two characters, which are 
+    'US' and removing the final ISIN check digit. E.g. 'US796647AC99' --> '796647AC9'.'''
+    if len(isin) == 12 and isin[0] == 'U' and isin[1] == 'S':
+        return isin[2:-1]
+    else:
+        return isin    # this value is not an ISIN value, so return it without modification
+
+
+def calculate_cusip_check_digit(cusip):
+    '''Computes the check digit for an 8 digit CUSIP.'''
+    if len(cusip) == 9: return ''
+
+    cusip = cusip.upper()
+    total = 0
+    for idx, char in enumerate(cusip):
+        if idx >= 8: break
+
+        if char.isdigit(): value = int(char)
+        elif char.isalpha(): value = ord(char) - ord('A') + 10
+        else: raise ValueError('Invalid character in CUSIP: ' + char)
+
+        if idx % 2 == 1: value *= 2
+        total += value // 10 + value % 10
+
+    check_digit = (10 - (total % 10)) % 10
+    return str(check_digit)    # this value is later appended to a string representation of CUSIP so we prefer `check_digit` to be in string form
+
+
+def cusip_check_digit_which_is_not_a_digit(cusip: str) -> bool:
+    '''Checks if the CUSIP has a check digit and if so, return `True` if it is not a digit.'''
+    if len(cusip) == 9:
+        check_digit = cusip[-1]
+        return not check_digit.isdigit()    # compare the last character of the CUSIP with the calculated check digit
+    else:
+        return False
+
+
+def process_cusip(cusip):
+    if len(cusip) == 8:
+        check_digit = calculate_cusip_check_digit(cusip)
+        orig_cusip = cusip    # `orig_cusip` used for print statement
+        cusip = cusip + check_digit
+        print(f'*** 8 digit CUSIP of {orig_cusip} was converted to 9 digit CUSIP: {cusip} ***')
+    cusip = convert_isin_to_cusip(cusip)
+    cusip = fix_cusip_improperly_formatted_from_excel_automatic_scientific_notation(cusip)
+    return cusip
+
+
+@run_five_times_before_raising_redis_connector_error
+def cusip_exists_in_redis(cusip: str, redis_client):
+    '''Creating this function in order to be able to decorate it so that it retries when 
+    `redis.exceptions.ConnectionError` is raised.'''
+    return redis_client.exists(cusip)
+
+
+@run_five_times_before_raising_redis_connector_error
+def get_cusip_in_redis(cusip: str, redis_client):
+    '''Creating this function in order to be able to decorate it so that it retries when 
+    `redis.exceptions.ConnectionError` is raised.'''
+    return pickle.loads(redis_client.get(cusip))
+
+
+def get_processed_data_for_single_cusip(cusip_idx: int, 
+                                        cusip: str, 
+                                        trade_date: pd.Timestamp, 
+                                        trade_datetime: datetime | None,    # used only for caching; set to `None` when doing real-time pricing
+                                        reference_data: np.ndarray | pd.Series | str, 
+                                        trade_history_data, 
+                                        similar_trade_history_data, 
+                                        cusip_and_trade_datetime_to_reference_data_or_error_message: dict) -> tuple[pd.Series | None, pd.Series | None, dict]:
+    '''Get redis data for a single CUSIP. Put the data into the correct list
+    based on if the data was found or not. If `reference_data` is a string, then 
+    it must be one of the keys in `exclusions.py::CUSIP_ERROR_MESSAGE` and 
+    indicates that there is an error for the CUSIP.'''
+    get_cusip_cannot_be_priced_series = lambda cusip_idx, cusip, message: pd.Series({'cusip': cusip, 'message': message}, name=cusip_idx)    # use `.rename(...)` to change name to be `cusip_idx` in order to preserve original ordering
+
+    if type(reference_data) == str: return None, get_cusip_cannot_be_priced_series(cusip_idx, cusip, reference_data), cusip_and_trade_datetime_to_reference_data_or_error_message    # `reference_data` is given the error message if the CUSIP cannot be priced
+    
+    cache_key = (cusip, trade_datetime) if trade_datetime is not None else cusip
+    if USE_CACHE_FOR_GET_DATA_FOR_SINGLE_CUSIP and cache_key in cusip_and_trade_datetime_to_reference_data_or_error_message:    # `cusip_and_trade_datetime_to_reference_data_or_error_message` is a cache that maps a CUSIP and trade datetime to either the reference_data (if it can be priced) or the error message string (if it cannot be priced)
+        reference_data_or_error_message = cusip_and_trade_datetime_to_reference_data_or_error_message[cache_key]
+        if type(reference_data_or_error_message) == str:    # `reference_data_or_error_message` is an error message
+            return None, get_cusip_cannot_be_priced_series(cusip_idx, cusip, reference_data_or_error_message), cusip_and_trade_datetime_to_reference_data_or_error_message
+        else:    # `reference_data_or_error_message` is a pandas dataframe of the reference data with the trade history in the `recent` column
+            return reference_data_or_error_message.rename(cusip_idx), None, cusip_and_trade_datetime_to_reference_data_or_error_message    # use `.rename(...)` to change name to be `cusip_idx` in order to preserve original ordering
+    
+    error_string = None    # if this becomes a string value after the next few logical operators, then the CUSIP cannot be priced
+    reason_for_using_dollar_price_model = ''    # if this becomes a non-empty string value after the next few logical operators, then the CUSIP must be priced with the dollar price model
+    try:    # need to check for errors before checking to price with dollar price model
+        if cusip in CUSIPS_UNDER_REVIEW:
+            error_string = 'under_review'
+        elif pd.notna(get_feature_value(reference_data, 'outstanding_indicator')) and get_feature_value(reference_data, 'outstanding_indicator') == False:    # must use `==` instead of `is` since the data type is `np.bool_` and `is` checks if it is the exact same object as the Python boolean literal
+            error_string = 'not_outstanding'
+        elif missing_important_features(reference_data) or missing_important_dates_or_dates_are_out_of_bounds(reference_data, trade_date):
+            error_string = 'insufficient_data'
+        elif pd.notna(get_feature_value(reference_data, 'sale_type')) and get_feature_value(reference_data, 'sale_type') == 4:    # need to check whether `sale_type` is pd.NA otherwise `pd.NA == 4` returns `pd.NA` instead of the expected `False` leading to `TypeError: boolean value of NA is ambiguous`
+            error_string = 'bank_loan'
+        elif dollar_price_in_history_is_null(trade_history_data):
+            error_string = 'null_dollar_price_in_history'
+        elif irregular_coupon_rate(reference_data):
+            error_string = 'irregular_coupon_rate'
+        elif (pd.notna(get_feature_value(reference_data, 'default_exists')) and get_feature_value(reference_data, 'default_exists') == True) or (pd.notna(get_feature_value(reference_data, 'default_indicator')) and get_feature_value(reference_data, 'default_indicator')) == True:    # must use `==` instead of `is` since the data type is `np.bool_` and `is` checks if it is the exact same object as the Python boolean literal
+            # error_string = 'defaulted'
+            reason_for_using_dollar_price_model = 'defaulted'
+        elif diff_in_days_two_dates(get_feature_value(reference_data, 'maturity_date'), trade_date, convention='exact') <= 60:
+            # error_string = 'maturing_soon'
+            reason_for_using_dollar_price_model = 'maturing_soon'
+        elif yield_in_history_is_high(trade_history_data):
+            # error_string = 'high_yield_in_history'
+            reason_for_using_dollar_price_model = 'high_yield_in_history'
+    
+    except Exception as e:    # CUSIP was not found in the redis
+        error_string = 'not_found'
+        print(f'Error in data_preparation_for_pricing.py::get_processed_data_for_single_cusip(...). CUSIP {cusip} not found.\n\t{type(e)}: {e}')
+        # print(traceback.format_exc())    # cannot print traceback because Google Cloud logging interprets it as an actual error that has not been caught causing alerts to go off
+
+    # CUSIP cannot be priced
+    if error_string is not None:
+        if USE_CACHE_FOR_GET_DATA_FOR_SINGLE_CUSIP: cusip_and_trade_datetime_to_reference_data_or_error_message[cache_key] = error_string
+        return None, get_cusip_cannot_be_priced_series(cusip_idx, cusip, error_string), cusip_and_trade_datetime_to_reference_data_or_error_message
+
+    # CUSIP can be priced
+    reference_data_df = pd.Series(reference_data, index=REFERENCE_DATA_FEATURES) if isinstance(reference_data, np.ndarray) else reference_data    # `if` statement prevents overriding the `reference_data` with a version that does not have the `trade_datetime` in case it was used during point-in-time pricing
+    reference_data_df = reference_data_df.copy(deep=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+        reference_data_df.loc['recent'] = trade_history_data
+        reference_data_df.loc['recent_similar'] = similar_trade_history_data
+        reference_data_df.loc['reason_for_using_dollar_price_model'] = reason_for_using_dollar_price_model
+    if USE_CACHE_FOR_GET_DATA_FOR_SINGLE_CUSIP: cusip_and_trade_datetime_to_reference_data_or_error_message[cache_key] = reference_data_df
+    return reference_data_df.rename(cusip_idx), None, cusip_and_trade_datetime_to_reference_data_or_error_message    # use `.rename(...)` to change name to be `cusip_idx` in order to preserve original ordering
+
+
+def get_reference_data_trade_history_similar_trade_history_from_redis(cusip: str, current_date: pd.Timestamp, reference_data_and_trade_history):
+    reference_data, trade_history_data = reference_data_and_trade_history
+    if reference_data is None and trade_history_data is None:
+        print(f'{cusip} not in the reference data redis nor the trade history redis. The error message comes from trying to call `pickle.loads(...)` with a `NoneType` object to create `reference_data`.')
+    elif reference_data is None:
+        print(f'{cusip} not in the reference data redis. The error message comes from trying to call `pickle.loads(...)` with a `NoneType` object to create `reference_data`.')
+    elif trade_history_data is None:
+        # print(f'{cusip} not in the trade history redis.')
+        pass    # remove the print statement (which was originally used for debugging) to not overload the logs
+    
+    if reference_data is None:
+        reference_data, trade_history_data = 'not_found', []    # `reference_data` is given the error message if the CUSIP cannot be priced
+    elif trade_history_data is None:
+        trade_history_data = []
+    
+    similar_trade_history_data = get_similar_trade_history_data(reference_data, cusip, current_date)
+    return reference_data, trade_history_data, similar_trade_history_data
+
+
+def check_cusip_and_get_raw_data_for_single_cusip(cusip: str, cusip_idx: int, trade_date_or_datetime: pd.Timestamp | datetime, user_prices: list | None, need_to_process_cusip: bool, from_redis: bool, cusip_data) -> tuple:
+    '''`user_prices` is only used for compliance. `need_to_process_cusip` is a boolean that determines whether we must call 
+    `process_cusip(...)` before getting the data. `from_redis` is a boolean that determines whether we are getting the data 
+    from redis or from a DataFrame. `cusip_data` is a dictionary that maps `cusip` to their reference data and trade history 
+    data or a dataframe with this information that has been selected for `cusip`.'''
+    if len(cusip) == 0: return None, None, None    # ignore an empty line
+    
+    cusip = cusip.strip()    # remove leading and trailing whitespaces from CUSIP column
+    if need_to_process_cusip: cusip = process_cusip(cusip)
+    if cusip_is_invalid(cusip):    # all CUSIPs must have length >= 8
+        reference_data, trade_history_data, similar_trade_history_data = 'invalid', [], []    # `reference_data` is given the error message if the CUSIP cannot be priced
+    elif cusip_check_digit_which_is_not_a_digit(cusip):
+        reference_data, trade_history_data, similar_trade_history_data = 'invalid_check_digit', [], []    # `reference_data` is given the error message if the CUSIP has an incorrect check digit and so the row should not be priced
+    elif user_prices is not None and user_prices[cusip_idx] is None:
+        reference_data, trade_history_data, similar_trade_history_data = 'invalid_user_price', [], []    # `reference_data` is given the error message if the `user_price` is invalid and so the row should not be priced
+    else:
+        get_data_func = get_reference_data_trade_history_similar_trade_history_from_redis if from_redis else get_reference_data_trade_history_from_df
+        reference_data, trade_history_data, similar_trade_history_data = get_data_func(cusip, trade_date_or_datetime, cusip_data)
+    return reference_data, trade_history_data, similar_trade_history_data
+
+
+def get_data_from_redis(cusips, 
+                        current_date: pd.Timestamp, 
+                        user_prices=None, 
+                        same_day_datetime: datetime = None):
+    '''Return the data found in the redis from a list of cusips. If `return_cusips_not_found` 
+    is `True`, then we return the data not found in the redis. `user_prices` is not `None` 
+    only when this function is being called as part of the compliance module. `same_day_datetime` 
+    is not `None` only when we are doing same day point-in-time pricing (i.e., the date is the 
+    current date, but the time is sometime in the past) so that we get the data from redis but
+    use the Vertex AI deployed model.
+    NOTE: experiments with parallelization for getting the data from redis did not give any speedup.'''
+    if type(cusips) != list: cusips = [cusips]    # this means that a single cusip was passed in, but not in a list
+    if user_prices is not None and type(user_prices) != list: user_prices = [user_prices]    # this means that a single cusip was passed in, but not in a list
+
+    unique_cusips = set()
+    for cusip_idx, cusip in enumerate(cusips):
+        if len(cusip) == 0: continue    # ignore an empty line
+        cusip = cusip.strip()    # remove leading and trailing whitespaces from CUSIP column
+        if not cusip_is_invalid(cusip) and not (user_prices is not None and user_prices[cusip_idx] is None):
+            cusip = process_cusip(cusip)
+            cusips[cusip_idx] = cusip
+            unique_cusips.add(cusip)
+    unique_cusips = list(unique_cusips)
+    reference_data_for_each_cusip = get_point_in_time_reference_data_from_cusip_list(unique_cusips, same_day_datetime)
+    trade_history_data_for_each_cusip = get_trade_history_data_from_cusip_list(unique_cusips, same_day_datetime is None)
+    cusip_to_reference_data_trade_history = dict(zip(unique_cusips, zip(reference_data_for_each_cusip, trade_history_data_for_each_cusip)))    # cusip -> (reference_data, trade_history)
+
+    cusips_can_be_priced_df, cusips_cannot_be_priced_df = [], []
+    cusip_to_reference_data_or_error_message = dict()    # `cusip_to_reference_data_or_error_message` is a cache that maps a CUSIP to either the reference_data (if it can be priced) or the error message string (if it cannot be priced)
+    for cusip_idx, cusip in enumerate(cusips):
+        reference_data, trade_history_data, similar_trade_history_data = check_cusip_and_get_raw_data_for_single_cusip(cusip, cusip_idx, current_date, user_prices, False, True, cusip_to_reference_data_trade_history[cusip] if cusip in cusip_to_reference_data_trade_history else None)    # ternary statement in final argument prevents `KeyError` when trying to access a CUSIP that does not exist because of an upstream exclusion such as `user_price` not existing for this CUSIP
+        if reference_data is None: continue    # ignore empty line
+        cusip_can_be_priced_series, cusip_cannot_be_priced_series, cusip_to_reference_data_or_error_message = get_processed_data_for_single_cusip(cusip_idx, cusip, current_date, None, reference_data, trade_history_data, similar_trade_history_data, cusip_to_reference_data_or_error_message)
+        can_be_priced, cannot_be_priced = cusip_can_be_priced_series is not None, cusip_cannot_be_priced_series is not None
+        assert can_be_priced ^ cannot_be_priced, f'{cusip} must either be able to be priced or not able to be priced; can be priced? {can_be_priced}, cannot be priced? {cannot_be_priced}'    # `^` is an XOR operator for boolean values
+        if can_be_priced: cusips_can_be_priced_df.append(cusip_can_be_priced_series)
+        if cannot_be_priced: cusips_cannot_be_priced_df.append(cusip_cannot_be_priced_series)
+    cusips_can_be_priced_df = pd.concat(cusips_can_be_priced_df, axis=1).T if cusips_can_be_priced_df != [] else pd.DataFrame()    # list of series to dataframe: https://stackoverflow.com/questions/55478191/list-of-series-to-dataframe
+    cusips_cannot_be_priced_df = pd.concat(cusips_cannot_be_priced_df, axis=1).T if cusips_cannot_be_priced_df != [] else pd.DataFrame()     # list of series to dataframe: https://stackoverflow.com/questions/55478191/list-of-series-to-dataframe
+    return cusips_can_be_priced_df, cusips_cannot_be_priced_df
+
+
+def convert_trade_history_dict_to_numpy_array(trade_history) -> np.ndarray:
+    '''`trade_history` is a list of dictionaries where each dictionary represents a different trade in the history, if it comes from 
+    a BigQuery call, or it is a numpy array if it comes from redis.'''
+    if is_none_or_nan(trade_history) or len(trade_history) == 0: return np.array([])    # `trade_history` may be `None` in the event of an error or `nan` in the event of similar trade history not existing for this CUSIP which can happen in point in time pricing if there is a CUSIP that creates a group that has no trades in it in the past; cannot use `pd.isna(...)` for this check because for a list, the `pd.isna(...)` function is passed through every item in the list and then `.any()` or `.all()` must be used to avoid error
+    if isinstance(trade_history[0], np.ndarray): return trade_history    # already a numpy array since it is coming from redis; need to check index 0 instead of just `trade_history` since it may be that `trade_history` is a numpy array where each item is a dictionary
+    trade_history = pd.DataFrame.from_records(trade_history)[FEATURES_FOR_PROCESSING_TRADE_HISTORY]    # create trade history as a dataframe to manipulate columns appropriately
+    trade_history[FEATURES_UNNECESSARY_FOR_PROCESSING_TRADE_HISTORY] = np.nan    # fill unnecessary features with NaN value so that `trade_dict_to_list(...)` has the expected trade array size
+    return trade_history[TRADE_FEATURE_TO_INDEX.keys()].to_numpy()    # convert to numpy to represent the data as it comes from the redis
+
+
+@cache_output_cusip_trade_datetime    # use `cache_output_cusip_trade_datetime` instead of `cache_output_cusip_trade_datetime_verbose` (which was originally used for debugging) to not overload the logs
+def get_trade_history_and_similar_trade_history_from_df(cusip,    # used solely for caching
+                                                        trade_datetime,    # used solely for caching
+                                                        trade_history_data: list, 
+                                                        similar_trade_history_data: list):
+    '''The decorator `@cache_output_cusip_trade_datetime prevents unnecessary calls to 
+    `convert_trade_history_dict_to_numpy_array(...)`.'''
+    trade_history_data = convert_trade_history_dict_to_numpy_array(trade_history_data)
+    if USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING: similar_trade_history_data = convert_trade_history_dict_to_numpy_array(similar_trade_history_data)
+    return (trade_history_data, similar_trade_history_data) if USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING else (trade_history_data, np.array([]))
+
+
+def get_reference_data_trade_history_from_df(cusip, 
+                                             trade_datetime,    # used solely for caching in `get_trade_history_and_similar_trade_history_from_df(...)`
+                                             reference_data: pd.Series):
+    trade_history_data, similar_trade_history_data = None, None    # required initialization, otherwise calling `get_trade_history_and_similar_trade_history_from_df(...)` will raise an error
+    try:
+        trade_history_data = reference_data['recent']
+        if USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING: similar_trade_history_data = reference_data['recent_similar']
+    except Exception as e:    # this means that the cusip was not found in `cusip_with_trade_history_and_reference_data_df`
+        print(f'Error in `data_preparation_for_pricing.py::get_reference_data_trade_history_from_df(...). {cusip} not in dataframe.\n\t{type(e)}: {e}')
+    
+    return (reference_data,) + get_trade_history_and_similar_trade_history_from_df(cusip, trade_datetime, trade_history_data, similar_trade_history_data)
+
+
+def get_data_from_df(cusips, quantities, trade_types, trade_datetimes, user_prices=None, cusip_with_trade_history_and_reference_data_df: pd.DataFrame = None):
+    '''Used by point-in-time pricing to get the data for each item for its corresponding trade datetime in `trade_datetimes`. `user_prices` is 
+    not `None` only when this function is being called as part of the compliance module. `cusip_with_trade_history_and_reference_data_df` is an 
+    optional DataFrame where each line item contains the reference data and trade history meaning that we do not need to perform data processing, 
+    and is used when performing point-in-time pricing for trades in materialized trade history.'''
+    if type(cusips) != list: cusips = [cusips]    # this means that a single cusip was passed in, but not in a list
+    if type(quantities) != list: quantities = [quantities]    # this means that a single cusip was passed in, but not in a list
+    if type(trade_types) != list: trade_types = [trade_types]    # this means that a single cusip was passed in, but not in a list
+    if type(trade_datetimes) != list: trade_datetimes = [trade_datetimes]    # this means that a single cusip was passed in, but not in a list
+    if user_prices is not None and type(user_prices) != list: user_prices = [user_prices]    # this means that a single cusip was passed in, but not in a list
+
+    if cusip_with_trade_history_and_reference_data_df is None:
+        to_be_priced_df = pd.DataFrame({'cusip': cusips, 
+                                        'quantity': quantities, 
+                                        'trade_type': trade_types, 
+                                        'trade_datetime': trade_datetimes})
+        
+        def create_reference_data_and_trade_history_and_keep_trade_datetime(trade_datetime: datetime, trade_datetime_df: pd.DataFrame) -> pd.DataFrame:
+            df = create_reference_data_and_trade_history(trade_datetime_df, trade_datetime, reset_index=False)
+            df = df.copy() 
+            df.loc[:, 'trade_datetime'] = trade_datetime
+            return df
+        
+        cusip_with_trade_history_and_reference_data_df = [create_reference_data_and_trade_history_and_keep_trade_datetime(trade_datetime, trade_datetime_df) for trade_datetime, trade_datetime_df in to_be_priced_df.groupby('trade_datetime')]
+        cusip_with_trade_history_and_reference_data_df = pd.concat(cusip_with_trade_history_and_reference_data_df)
+        cusip_with_trade_history_and_reference_data_df = to_be_priced_df.merge(cusip_with_trade_history_and_reference_data_df, on=['cusip', 'trade_datetime'], how='left')    # ensures that all of the original CUSIPs are present in the final dataframe to be priced; CUSIPs that could not be found in BigQuery will have nan values and the `error_string` will be `insufficient_data` since important features will be nan
+        cusips_from_cusip_with_trade_history_and_reference_data_df = cusip_with_trade_history_and_reference_data_df['cusip'].to_numpy()
+        assert (cusips == cusips_from_cusip_with_trade_history_and_reference_data_df).all(), f'`cusips` must match `cusips_from_cusip_with_trade_history_and_reference_data_df`\n\tcusips={cusips}\n\tcusips_from_cusip_with_trade_history_and_reference_data_df={cusips_from_cusip_with_trade_history_and_reference_data_df}'
+
+    cusips_can_be_priced_df, cusips_cannot_be_priced_df = [], []
+    cusip_to_reference_data_or_error_message = dict()    # `cusip_to_reference_data_or_error_message` is a cache that maps a CUSIP to either the reference_data (if it can be priced) or the error message string (if it cannot be priced)
+    for cusip_idx, (cusip, trade_datetime) in enumerate(zip(cusips, trade_datetimes)):
+        reference_data, trade_history_data, similar_trade_history_data = check_cusip_and_get_raw_data_for_single_cusip(cusip, cusip_idx, trade_datetime, user_prices, True, False, cusip_with_trade_history_and_reference_data_df.iloc[cusip_idx])
+        if reference_data is None: continue    # ignore empty line
+        cusip_can_be_priced_series, cusip_cannot_be_priced_series, cusip_to_reference_data_or_error_message = get_processed_data_for_single_cusip(cusip_idx, cusip, trade_datetime.date(), trade_datetime, reference_data, trade_history_data, similar_trade_history_data, cusip_to_reference_data_or_error_message)    # use `pd.NA` as the missing value for similar trade history so that the column gets filled with a value that is not ambigious with empty similar trade history, such as an empty list, and also is a low memory version of null
+        can_be_priced, cannot_be_priced = cusip_can_be_priced_series is not None, cusip_cannot_be_priced_series is not None
+        assert can_be_priced ^ cannot_be_priced, f'{cusip} must either be able to be priced or not able to be priced; can be priced? {can_be_priced}, cannot be priced? {cannot_be_priced}'    # `^` is an XOR operator for boolean values
+        if can_be_priced: cusips_can_be_priced_df.append(cusip_can_be_priced_series)
+        if cannot_be_priced: cusips_cannot_be_priced_df.append(cusip_cannot_be_priced_series)
+    cusips_can_be_priced_df = pd.concat(cusips_can_be_priced_df, axis=1).T if cusips_can_be_priced_df != [] else pd.DataFrame()    # list of series to dataframe: https://stackoverflow.com/questions/55478191/list-of-series-to-dataframe
+    cusips_cannot_be_priced_df = pd.concat(cusips_cannot_be_priced_df, axis=1).T if cusips_cannot_be_priced_df != [] else pd.DataFrame()     # list of series to dataframe: https://stackoverflow.com/questions/55478191/list-of-series-to-dataframe
+    return cusips_can_be_priced_df, cusips_cannot_be_priced_df    # `cusips_cannot_be_priced` only has columns `cusip` and `message` if it has any data in it at all
+
+
+def process_data_for_pricing(df: pd.DataFrame, 
+                             quantity, 
+                             trade_type, 
+                             current_date: datetime, 
+                             settlement_date: datetime, 
+                             current_datetime: datetime, 
+                             is_batch_pricing: bool = False, 
+                             use_trade_datetime_column_for_pricing: bool = False, 
+                             use_similar_trade_history: bool = True) -> pd.DataFrame:
+    '''If `is_batch_pricing` is `True`, then `quantity` and `trade_type` are lists of length `len(df)`.  Setting `use_trade_datetime_column_for_pricing` to `True` 
+    is to declare that the `trade_datetime` is not the `current_datetime`, but instead the `trade_datetime` column of the data.'''
+    df = df.copy()
+
+    df.loc[:, 'par_traded']       = quantity
+    df.loc[:, 'trade_type']       = trade_type
+    df.loc[:, 'settlement_date']  = settlement_date
+    df.loc[:, 'transaction_type'] = 'I'
+
+    if use_trade_datetime_column_for_pricing:
+        assert 'trade_datetime' in df.columns, 'trade_datetime not in `df.columns`'    # this assert checks that no matter the value of `use_trade_datetime_column_for_pricing`, `df` contains the `trade_datetime` column
+        if 'trade_date' not in df.columns: df.loc[:, 'trade_date'] = df['trade_datetime'].dt.date   # removes the timestamp
+        df.loc[:, 'trade_date'] = pd.to_datetime(df['trade_date'])
+        print(f'Since `use_trade_datetime_column_for_pricing` is `True`, we will be using archived models')
+    else:
+        assert current_datetime.date() == current_date.date(), 'Current datetime has a different date than current date'
+        df.loc[:, 'trade_datetime'] = current_datetime
+        df.loc[:, 'trade_date']     = current_date
+
+    treasury_rate_df = get_treasury_rate_df()
+    holidays = get_holidays()
+    return process_data(df, 
+                        current_datetime, 
+                        bq_client, 
+                        SEQUENCE_LENGTH, 
+                        SEQUENCE_LENGTH_DOLLAR_PRICE, 
+                        NUM_FEATURES,  
+                        min_trades_in_history=0, 
+                        process_ratings=False, 
+                        treasury_rate_df=treasury_rate_df, 
+                        holidays=holidays, 
+                        is_batch_pricing=is_batch_pricing, 
+                        use_similar_trade_history=use_similar_trade_history)

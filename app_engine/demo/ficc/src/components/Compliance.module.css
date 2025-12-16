@@ -1,0 +1,25 @@
+.ratingGreat {
+    background-color: #4CAF50 !important; /* Green */
+    color: white !important;
+}
+
+.ratingGood {
+    background-color: #FFEB3B !important; /* Amber */
+    color: black !important;
+}
+
+.ratingFair {
+    background-color: #FFC107 !important; /* Yellow */
+    color: black !important;
+}
+
+.ratingPoor {
+    background-color: #F44336 !important; /* Red */
+    color: white !important;
+}
+
+.submitButtonMargin {
+    align-self: flex-start;
+    padding-top: 3px !important;
+    margin-top: 2px !important;
+}

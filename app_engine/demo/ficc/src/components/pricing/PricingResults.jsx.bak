@@ -1,0 +1,203 @@
+/*
+ * @Author: Gil Shulman 
+ * @Date: 2025-02-25
+ * @Last Modified by: Gil Shulman
+ * @Last Modified time: 2025-03-14
+ */
+
+import React from 'react';
+import Card from 'react-bootstrap/Card';
+import Table from 'react-bootstrap/Table';
+import { Tooltip } from 'react-tooltip';
+import { statesDict, purposeClassDict, ratingsDict } from './relatedVarDict';
+import { yearMonthDayToMonthDayYear } from '../../utils/dateUtils';
+
+function PricingResults({ 
+  cusipForDisplay,
+  isPriceHidden,
+  predictedPrice,
+  displayTextForYtw,
+  usedDollarPriceModel,
+  reasonForUsingDollarPriceModel,
+  dollarPriceModelDisplayText,
+  ytw,
+  calcMethod,
+  displayPriceForYtw,
+  referenceFeatures,
+  searchCusipMaturityDate
+}) {
+  // Styling for the component
+  const styles = {
+    resultsContainer: {
+      marginTop: '32px',  // Add significant top margin for spacing from the form
+      marginBottom: '32px'
+    },
+    card: {
+      borderRadius: '10px',
+      border: '1px solid #e2e8f0',
+      boxShadow: '0 2px 5px rgba(0,0,0,0.05)',
+    },
+    cardHeader: {
+      backgroundColor: '#f7fafc',
+      padding: '16px 20px',
+      borderBottom: '1px solid #e2e8f0'
+    },
+    headerTitle: {
+      color: '#2d3748',
+      fontSize: '1.1rem',
+      fontWeight: '600',
+      margin: 0
+    },
+    resultsTable: {
+      marginBottom: 0
+    },
+    tableHeader: {
+      backgroundColor: '#edf2f7',
+      fontWeight: '600',
+      color: '#4a5568',
+      fontSize: '0.9rem',
+      padding: '12px 16px'
+    },
+    tableCell: {
+      padding: '12px 16px',
+      borderBottom: '1px solid #e2e8f0'
+    },
+    highlightCell: {
+      backgroundColor: '#ebf8ff',
+      fontWeight: '600',
+      color: '#2b6cb0',
+      padding: '4px 10px',
+      borderRadius: '4px',
+      display: 'inline-block'
+    },
+    sectionTitle: {
+      fontSize: '1rem',
+      fontWeight: '600',
+      color: '#2d3748',
+      marginTop: '1.5rem',
+      marginBottom: '1rem',
+      paddingBottom: '0.5rem',
+      borderBottom: '1px solid #f7fafc'
+    },
+    featuresTable: {
+      borderRadius: '8px',
+      overflow: 'hidden',
+      marginBottom: '1.5rem'
+    },
+    resultsHeader: {
+      fontSize: '1.1rem',
+      fontWeight: '600',
+      color: '#2d3748',
+      marginBottom: '1.5rem'
+    }
+  };
+
+  const getDisplayTextForYtw = (displayText) => {
+    // For refund, we want to display 'yield to worst' since 'yield to refund' is not correct terminology
+    if (displayText === 'Refund') { return 'Worst'; } 
+    else { return displayText; }
+  };
+
+  const getDisplayTextForYtwDate = (displayText) => {
+    if (displayText === 'Worst') { return 'Yield to Worst'; }
+    else { return displayText; }
+  };
+
+  if (isPriceHidden) {
+    return null;
+  }
+
+  return (
+    <div style={styles.resultsContainer}>
+      <Card style={styles.card}>
+        <Card.Header style={styles.cardHeader}>
+          <h5 style={styles.headerTitle}>Evaluation Results for {cusipForDisplay}</h5>
+        </Card.Header>
+        <Card.Body className="pt-4 pb-4">
+          <Table style={styles.resultsTable}>
+            <thead>
+              <tr>
+                <th style={styles.tableHeader}>Evaluated Price (%)</th>
+                <th style={styles.tableHeader}>Evaluated Yield to {getDisplayTextForYtw(displayTextForYtw)} (%)</th>
+                {!usedDollarPriceModel && <th style={styles.tableHeader}> Priced to date (%)</th>}
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={styles.tableCell}>
+                  <span style={styles.highlightCell}>{predictedPrice}</span>
+                </td>
+                <td style={styles.tableCell}>
+                  {usedDollarPriceModel ? (
+                    <>
+                    {/* <Tooltip id="price-model-tooltip" />
+                      <span 
+                        style={styles.highlightCell}
+                        data-tooltip-id="price-model-tooltip" 
+                        data-tooltip-content={dollarPriceModelDisplayText[reasonForUsingDollarPriceModel][1]}
+                      >
+                        {dollarPriceModelDisplayText[reasonForUsingDollarPriceModel][0]}
+                      </span> */}
+                    </>
+                  ) : (
+                    <span style={styles.highlightCell}>{ytw}</span>
+                  )}
+                </td>
+                {!usedDollarPriceModel && (
+                  <td style={styles.tableCell}>
+                    {calcMethod + ' @ ' + displayPriceForYtw.toString()}
+                  </td>
+                )}
+              </tr>
+            </tbody>
+          </Table>
+
+          <h5 style={styles.sectionTitle}>Key reference features for {cusipForDisplay}</h5>
+          <Table bordered style={styles.featuresTable}>
+            <thead>
+              <tr>
+                <th style={styles.tableHeader}>State</th>
+                <th style={styles.tableHeader}>Dated Date</th>
+                <th style={styles.tableHeader}>S&P</th>
+                <th style={styles.tableHeader}>Purpose Class</th>
+                <th style={styles.tableHeader}>Description</th>
+                <th style={styles.tableHeader}>Coupon</th>
+                <th style={styles.tableHeader}>Maturity Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={styles.tableCell}>
+                  {(referenceFeatures.state in statesDict) ? statesDict[referenceFeatures.state] : 'None'}
+                </td>
+                <td style={styles.tableCell}>
+                  {yearMonthDayToMonthDayYear(referenceFeatures.datedDate)}
+                </td>
+                <td style={styles.tableCell}>
+                  {(referenceFeatures.rating in ratingsDict) ? ratingsDict[referenceFeatures.rating] : 'None'}
+                </td>
+                <td style={styles.tableCell}>
+                  {(referenceFeatures.purposeClass === 0) ? 
+                    'No purpose class reported' : 
+                    purposeClassDict[referenceFeatures.purposeClass]
+                  }
+                </td>
+                <td style={{ ...styles.tableCell, width: '25%' }}>
+                  {referenceFeatures.desc}
+                </td>
+                <td style={styles.tableCell}>
+                  {+parseFloat(referenceFeatures.coupon).toFixed(3)}
+                </td>
+                <td style={styles.tableCell}>
+                  {yearMonthDayToMonthDayYear(searchCusipMaturityDate)}
+                </td>
+              </tr>
+            </tbody>
+          </Table>
+        </Card.Body>
+      </Card>
+    </div>
+  );
+}
+
+export default PricingResults;

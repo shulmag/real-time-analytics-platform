@@ -1,0 +1,109 @@
+# Blockchain Muni Price Service - WIP
+# Creted by: Gil
+
+Flask server for managing municipal bond price data on the Stellar blockchain.
+
+## Deployment
+
+Deploy to Cloud Run using the following command:
+
+```bash
+gcloud run deploy blockchain \
+  --source . \
+  --allow-unauthenticated \
+  --region us-central1 \
+  --cpu 1 \
+  --memory 512Mi \
+  --timeout 300 \
+  --execution-environment gen2
+```
+
+### Deployment Configuration Explained
+
+- `--source .`: Deploys from current directory
+- `--allow-unauthenticated`: Allows public access
+- `--region us-central1`: Deploys to US Central region
+- `--cpu 1`: Allocates 1 CPU core (sufficient for API and blockchain operations)
+- `--memory 512Mi`: Allocates 512MB memory (adequate for typical workload)
+- `--timeout 300`: Sets 5-minute timeout for requests
+- `--execution-environment gen2`: Uses Cloud Run's second-generation execution environment
+
+
+Blockchain Muni Price Service
+# Created by: Gil
+# Last Update: 02-25-2025
+
+Flask server for managing municipal bond price data on the Stellar blockchain.
+
+## Prerequisites
+
+- Google Cloud SDK installed
+- Google Cloud project with billing enabled
+- Required APIs enabled:
+  - Cloud Run
+  - Secret Manager
+  - Cloud Build
+
+API Endpoints
+Read Operations (No Authentication Required)
+
+GET /health: Check server and Soroban connection status
+GET /get_price/<cusip>: Get complete price history for a CUSIP
+GET /latest_prices?limit=N: Get latest prices for all tracked CUSIPs (optional limit parameter)
+GET /ticker: Get top holdings with current blockchain prices
+
+Write Operations (Requires Authentication)
+
+POST /add_price: Save muni price data directly
+POST /get_and_update_price: Fetch real-time FICC price and save to blockchain
+
+Returns price immediately while blockchain transaction processes
+Includes transaction hash for tracking
+
+Sample API Responses
+Get Price History:
+jsonCopy{
+    "status": "success",
+    "cusip": "YOUR_CUSIP",
+    "history": [
+        {
+            "price": 100.302,
+            "yield_value": 3.856,
+            "trade_amount": 1000,
+            "trade_type": "D",
+            "timestamp": 1737159267
+        }
+    ]
+}
+Get and Update Price:
+jsonCopy{
+    "status": "success",
+    "message": "Price fetched and blockchain update initiated",
+    "cusip": "YOUR_CUSIP",
+    "stored_data": {
+        "price": 98.494,
+        "yield": 4.110,
+        "amount": 25,
+        "trade_type": "S"
+    },
+    "transaction_status": "pending",
+    "transaction_hash": "241ffa..."
+}
+Testing
+After deployment, test the endpoints:
+bashCopy# Health check
+curl https://YOUR-SERVICE-URL/health
+
+# Get price history
+curl https://YOUR-SERVICE-URL/get_price/YOUR_CUSIP
+
+# Get latest prices
+curl https://YOUR-SERVICE-URL/latest_prices?limit=10
+
+# Get and update price
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"cusip":"YOUR_CUSIP","quantity":100,"tradeType":"BUY"}' \
+  https://YOUR-SERVICE-URL/get_and_update_price
+Replace YOUR-SERVICE-URL with the URL provided after deployment.
+Data Sources

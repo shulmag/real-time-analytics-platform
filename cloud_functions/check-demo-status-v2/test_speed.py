@@ -1,0 +1,150 @@
+'''
+'''
+from auxiliary_variables import QUANTITY, TRADE_TYPE
+from auxiliary_functions import run_multiple_times_before_failing, response_from_individual_pricing, get_filename_from_cusip_list, response_from_batch_pricing, check_that_batch_pricing_gives_output_for_all_cusips
+
+
+INDIVIDUAL_SPEED_THRESHOLD = 5    # in seconds
+
+
+def _test_individual_pricing(cusip, quantity=QUANTITY, trade_type=TRADE_TYPE):
+    '''Tests that pricing an individual CUSIP `cusip` takes less than `INDIVIDUAL_SPEED_THRESHOLD` seconds.'''
+    response_dict, time_elapsed = response_from_individual_pricing(cusip, trade_type, quantity, return_execution_time=True)
+    assert 'error' not in response_dict, f'Pricing {cusip} should not have an error, but has an error: {response_dict["error"]}'
+    assert time_elapsed < INDIVIDUAL_SPEED_THRESHOLD, f'For CUSIP {cusip}, quantity (in thousands) {quantity}, and trade type {trade_type}, pricing should not take more than {INDIVIDUAL_SPEED_THRESHOLD} seconds, but took {time_elapsed} seconds'
+    print(f'For CUSIP {cusip}, quantity (in thousands) {quantity}, and trade type {trade_type}, pricing took {time_elapsed} seconds')
+
+
+def _test_batch_pricing(cusip_list, threshold):
+    '''Tests that pricing `cusip_list` with batch pricing takes less than `threshold` seconds.'''
+    request_obj, time_elapsed = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list[:5]), cusip_list, return_execution_time=True)    # slice to the first 5 CUSIPs to not make the filename unreasonably long
+    check_that_batch_pricing_gives_output_for_all_cusips(request_obj, cusip_list)
+    assert time_elapsed < threshold, f'Pricing {len(cusip_list)} CUSIPs should not take more than {threshold} seconds, but took {time_elapsed} seconds'
+    print(f'Pricing {len(cusip_list)} CUSIPs took {time_elapsed} seconds')
+
+
+@run_multiple_times_before_failing
+def test_64971XQM3():
+    '''Tests that pricing CUSIP 64971XQM3 takes less than `INDIVIDUAL_SPEED_THRESHOLD` seconds. A common cause 
+    for failure of this test is if the yield curve redis is not being updated properly, and so for each CUSIP to be priced, 
+    it takes a long time to get the most recent timestamp that exists in the redis. The procedure that finds the most recent 
+    timestamp in the yield curve redis is ficc/app_engine/demo/server/modules/ficc/utils/yc_data.py::find_last_minute(...).'''
+    _test_individual_pricing('64971XQM3', quantity=250)
+
+
+@run_multiple_times_before_failing
+def test_98322QPL5():
+    '''Tests that pricing CUSIP 98322QPL5 takes less than `INDIVIDUAL_SPEED_THRESHOLD` seconds. A common cause 
+    for failure of this test is if the yield curve redis is not being updated properly, and so for each CUSIP to be priced, 
+    it takes a long time to get the most recent timestamp that exists in the redis. The procedure that finds the most recent 
+    timestamp in the yield curve redis is ficc/app_engine/demo/server/modules/ficc/utils/yc_data.py::find_last_minute(...).'''
+    _test_individual_pricing('98322QPL5')
+
+
+@run_multiple_times_before_failing
+def test_batch_100():
+    '''Batch price an assorted list of 100 CUSIPs that should give a price. Should take less than 12 seconds. A common cause 
+    for failure of this test is if the yield curve redis is not being updated properly, and so for each CUSIP to be priced, 
+    it takes a long time to get the most recent timestamp that exists in the redis. The procedure that finds the most recent 
+    timestamp in the yield curve redis is ficc/app_engine/demo/server/modules/ficc/utils/yc_data.py::find_last_minute(...).'''
+    cusip_list = ['56117FAE8', 
+                  '701403AD9', 
+                  '802242EQ6', 
+                  '74441XGP8', 
+                  '773335RC0', 
+                  '57776QAJ3', 
+                  '78388KAF0', 
+                  '949119CU3', 
+                  '786230AE2', 
+                  '588102AB9', 
+                  '9771232R8', 
+                  '823483HA3', 
+                  '140542ES6', 
+                  '199817AF4', 
+                  '686087D79', 
+                  '04033EAF9', 
+                  '647201BN1', 
+                  '277484CR0', 
+                  '697074AA0', 
+                  '652759CT6', 
+                  '83712DS64', 
+                  '91743PAD7', 
+                  '83712DN93', 
+                  '658207SR7', 
+                  '806193AA6', 
+                  '88271HFW4', 
+                  '604829CZ2', 
+                  '87122NEZ8', 
+                  '052466AE9', 
+                  '88275FPN3', 
+                  '92818GY98', 
+                  '72316WC39', 
+                  '01170RJE3', 
+                  '25932GBP8', 
+                  '42727LAA5', 
+                  '43113VAA3', 
+                  '406028GZ7', 
+                  '505205BN3', 
+                  '880461ZG6', 
+                  '606072LC8', 
+                  '473532CJ6', 
+                  '108709RF5', 
+                  '68840XAB4', 
+                  '60416S5C0', 
+                  '538005AA7', 
+                  '117745DH9', 
+                  '83756CZH1', 
+                  '509552Z32', 
+                  '671556JU3', 
+                  '60416TFJ2', 
+                  '14054CEP0', 
+                  '34585PAD8', 
+                  '45201Y6V4', 
+                  '45129WPB0', 
+                  '014085AP9', 
+                  '658207XJ9', 
+                  '380278AC5', 
+                  '880461UM8', 
+                  '196479H69', 
+                  '15102HAF4', 
+                  '64966GMJ8', 
+                  '83712DWJ1', 
+                  '434749GP6', 
+                  '843021AA4', 
+                  '395308NP0', 
+                  '519685AK7', 
+                  '39465GGZ7', 
+                  '83756CQZ1', 
+                  '76881XAR2', 
+                  '578469KP2', 
+                  '16559WAD2', 
+                  '71783DAD7', 
+                  '16559WAC4', 
+                  '34682FEH9', 
+                  '64469MFH9', 
+                  '797283TJ7', 
+                  '60416QFW9', 
+                  '658909HW9', 
+                  '34347VAP7', 
+                  '647201PY2', 
+                  '83712DL53', 
+                  '010662MV3', 
+                  '82621CPA2', 
+                  '01030N3U3', 
+                  '277482AK1', 
+                  '894905DF2', 
+                  '714376GH7', 
+                  '72316WD20', 
+                  '575133DF7', 
+                  '621545GR7', 
+                  '078876AA7', 
+                  '83756CT21', 
+                  '888804BB6', 
+                  '373541RU7', 
+                  '60637BPR5', 
+                  '88033SQ64', 
+                  '443852SL3', 
+                  '31350ACL0', 
+                  '60637BTL4', 
+                  '69671TCQ0']
+    _test_batch_pricing(cusip_list, 12)    # in seconds

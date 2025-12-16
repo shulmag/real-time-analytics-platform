@@ -1,0 +1,5 @@
+google-cloud-storage
+pandas
+google-cloud-bigquery
+google-cloud-secret-manager
+pyarrow 

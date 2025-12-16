@@ -1,0 +1,396 @@
+'''
+Author: Gil Shulman
+Date: 2021-10-15
+Last Editor: Developer Watson
+Last Edit Date: 2025-05-28
+'''
+import os
+import requests
+import logging as python_logging    # to not confuse with google.cloud.logging
+import json
+import pickle
+from datetime import datetime, timedelta
+
+from flask import request
+from flask_restful import Resource
+
+from google.cloud import storage
+from modules.get_creds import get_creds
+get_creds()
+
+from modules.auxiliary_variables import EASTERN, DEFAULT_QUANTITY, DEFAULT_TRADE_TYPE
+from modules.errors import CustomMessageError, NO_TOKEN_ERROR_MESSAGE
+
+
+
+from modules.ficc.utils.auxiliary_functions import run_multiple_times_before_failing
+from modules.ficc.utils.gcp_storage_functions import upload_data, download_pickle_file
+
+
+
+
+error_response = lambda error_message: CustomMessageError(error_message).get_json_response()
+
+API_KEY = 'AIzaSyAmNhC6vHOEVjoNjOlGsUkc_pR4dSx6eGg'
+
+FIREBASE_AUTH_TOKENS_FILENAME = 'firebase_auth_tokens.pkl'
+FIREBASE_AUTH_TOKENS_GCP_BUCKET = 'firebase_auth_tokens'
+
+
+def _get_credentials_cache():
+    '''Read from the credentials cache pickle file. If unable to read from it, sometimes due to 
+    high volume usage, return an empty dictionary.'''
+    try:
+        cache = download_pickle_file(storage.Client(), FIREBASE_AUTH_TOKENS_GCP_BUCKET, FIREBASE_AUTH_TOKENS_FILENAME)
+    except Exception as e:    # transient exceptions arise during times of high volume
+        cache = None
+        print(f'WARNING: unable to read {FIREBASE_AUTH_TOKENS_GCP_BUCKET}/{FIREBASE_AUTH_TOKENS_FILENAME} due to {type(e)}: {e}')
+    return dict() if cache is None else cache    # return empty dictionary if the file does not exist in GCP Storage
+
+
+@run_multiple_times_before_failing((FileNotFoundError,), 10)    # when the server is overloaded we occassionally get `FileNotFoundError: [Errno 2] No such file or directory: '/tmp/firebase_auth_tokens.pkl'` 
+def _upload_credentials_cache_to_gcp_storage(credentials_cache: dict):
+    local_filepath_for_firebase_auth_tokens = f'/tmp/{FIREBASE_AUTH_TOKENS_FILENAME}'
+    with open(local_filepath_for_firebase_auth_tokens, 'wb') as file:
+        pickle.dump(credentials_cache, file)
+    upload_data(storage.Client(), FIREBASE_AUTH_TOKENS_GCP_BUCKET, FIREBASE_AUTH_TOKENS_FILENAME, local_filepath_for_firebase_auth_tokens)
+    if os.path.exists(local_filepath_for_firebase_auth_tokens): os.remove(local_filepath_for_firebase_auth_tokens)    # no need to keep this file around after the fact (it may get stale)
+    return local_filepath_for_firebase_auth_tokens
+
+
+def sign_in_with_email_and_password(email, password):
+    '''Provides login credentials for `email` and `password`. Uses a cache to determine whether the user attempted to sign in 
+    within the last 30 minutes and if so, then provides this access token instead of creating a new access token. This helps when 
+    a single user is making repeated calls to the server. An example is when we are performing large batch pricing.'''
+    credentials_cache = _get_credentials_cache()
+    current_datetime = datetime.now(EASTERN)
+    if email in credentials_cache:
+        cached_password, access_token, datetime_in_est_of_creation = credentials_cache[email]
+        if (password == cached_password) and (current_datetime - datetime_in_est_of_creation <= timedelta(minutes=30)):    # ensures that the password is correct
+            print(f'INFO: Using access token found in cache for {email}, created at {datetime_in_est_of_creation} EST')    # python_logging.info(f'Using access token found in cache for {email}, created at {datetime_in_est_of_creation} EST')
+            return access_token
+        
+    request_ref = f'https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key={API_KEY}'
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+    data = json.dumps({'email': email, 'password': password, 'returnSecureToken': True})
+    request_object = requests.post(request_ref, headers=headers, data=data)
+    
+    try:
+        access_token = request_object.json()['idToken']
+    except Exception as e:
+        print(f'WARNING: `app_engine/demo/server/resources.py::sign_in_with_email_and_password(...)` failed with {type(e)}: {e}')    # python_logging.warning(f'`app_engine/demo/server/resources.py::sign_in_with_email_and_password(...)` failed with {type(e)}: {e}')
+        try:
+            print(f'WARNING: request_object.json():\n{request_object.json()}')    # python_logging.warning(f'request_object.json():\n{request_object.json()}')
+        except Exception as e1:
+            print(f'WARNING: Request object cannot be converted to JSON. {type(e1)}: {e1}')    # python_logging.warning(f'Request object cannot be converted to JSON. {type(e1)}: {e1}')
+            print(f'WARNING: request_object:\n{request_object}')    # python_logging.warning(f'request_object:\n{request_object}')
+        return None
+    
+    credentials_cache[email] = (password, access_token, current_datetime)
+    _upload_credentials_cache_to_gcp_storage(credentials_cache)
+    return access_token
+
+
+def is_authenticated(access_token, username=None, password=None):
+    '''Checks whether the user has authentication. Returns a boolean 
+    indicating whether the user is authenticated and the email address.'''
+    api_call = False
+    no_access_output = False, '', api_call, None    # second argument: blank string represnts no email address; third argument: dummy variable that is not used if no_access_output is returned, but we need the correct number of arguments to match the case where access_token is found; fourth argument is None representing no token
+
+    if username is not None:
+        access_token = sign_in_with_email_and_password(username, password)
+        api_call = True
+
+    if access_token is None:
+        return no_access_output
+    
+    try:
+        from firebase_admin import auth    # lazy loading for lower latency
+
+        decoded_token = auth.verify_id_token(access_token)
+        _ = decoded_token['uid']    # TODO: why are we selecting the 'uid'? We do not do anything with it in the body of this function. Is it to check whether the decoded token even has it, and if it doesn't, we throw an error?
+        email = decoded_token['email']
+        return True, email, api_call, access_token
+    except Exception:
+        return no_access_output
+
+
+def get_trade_datetime(request):
+    '''Get trade date and trade time from `request` and concatenate 
+    them together with a single space separator.'''
+    return request.args.get('date') + ' ' + request.args.get('time')
+
+
+def get_username_password_access_token_from_form(request):
+    username = request.form.get('username')
+    if username == 'None': username = None
+    password = request.form.get('password')
+    if password == 'None': password = None
+    access_token = request.form.get('access_token')
+    if access_token == 'None': access_token = None
+    return username, password, access_token
+
+
+class GetPriceAndYTW(Resource): 
+    def get(self):
+        from modules.individual_pricing import get_prediction_from_individual_pricing    # lazy loading for lower latency
+
+        username = request.args.get('username')
+        password = request.args.get('password')
+        access_token = request.args.get('access_token')
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            if request.method == 'GET':
+                if 'cusip' in request.args:
+                    cusip = request.args.get('cusip')
+                    quantity = request.args.get('amount')
+                    trade_type =  request.args.get('tradeType')
+                    
+                    data = get_prediction_from_individual_pricing(cusip, quantity, trade_type, user, api_call)
+                    return data
+                else:
+                    return error_response('Error in API call')
+            else:
+                return error_response('No parameters passed')
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)
+
+
+class _YieldCurve(Resource):
+    '''Template class for YieldCurvePlot and YieldCurveTable.'''
+    def get(self, get_yield_curve_func):
+        username = request.args.get('username')
+        password = request.args.get('password')
+        access_token = request.args.get('access_token')
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            trade_datetime = get_trade_datetime(request)
+            yield_curve = get_yield_curve_func(trade_datetime, user, api_call)
+            return yield_curve
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)
+
+
+class YieldCurvePlot(_YieldCurve):
+    def get(self):
+        from modules.yield_curve import get_yield_curve_plot    # lazy loading for lower latency
+
+        return _YieldCurve.get(self, get_yield_curve_plot)
+
+
+class YieldCurveTable(_YieldCurve):
+    def get(self):
+        from modules.yield_curve import get_yield_curve_table    # lazy loading for lower latency
+
+        return _YieldCurve.get(self, get_yield_curve_table)
+
+
+class DailySchoonover(Resource):
+    def get(self):
+        from modules.muni_stats import get_daily_schoonover    # lazy loading for lower latency
+
+        username = request.args.get('username')
+        password = request.args.get('password')
+        access_token = request.args.get('access_token')
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            return get_daily_schoonover(user, api_call)
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)  
+
+
+def file_or_dataframe(response, filename='preds.csv'):
+    if type(response) == str:    # filename has been returned
+        from flask import send_file    # lazy loading for lower latency
+
+        return send_file(response, as_attachment=True, mimetype='text/csv', download_name=filename)
+    else:    # dataframe has been returned
+        return response.to_json(orient='columns')
+    
+
+def get_quantities_from_quantity_list(request_form) -> list:
+    '''Convert each quantity from quantityList in `request_form` to an int. Need to use `round(float(x))` instead of 
+    `int(x)` since the value may come in as a decimal, and in this case the value should be rounded.'''
+    quantity_list_name = 'quantityList'
+    if quantity_list_name not in request_form: return None
+    quantity_list = []
+    for quantity in request_form.getlist(quantity_list_name):
+        try:
+            quantity_list.append(round(float(quantity)))
+        except Exception as e:
+            print(f'WARNING: converting {quantity} from quantityList to an int resulted in the following {type(e)}: {e}')
+            quantity_list.append(DEFAULT_QUANTITY)
+    return quantity_list
+
+
+class _RouteToDifferentServer(Resource):
+    '''This class is only to be used as a superclass which sets up the `__init__` method to route traffic to a different server.'''
+    def __init__(self, route_to_different_server):
+        self.route_to_different_server = route_to_different_server    # boolean argument determining whether the request needs to be routed to another a server
+
+
+def get_quantity_and_trade_type(request_form):
+    quantity = request_form.get('amount') if 'amount' in request_form else DEFAULT_QUANTITY
+    trade_type = request_form.get('tradeType') if 'tradeType' in request_form else DEFAULT_TRADE_TYPE
+    return quantity, trade_type
+
+
+def convert_string_to_boolean(string: str, name: str = None) -> bool:
+    '''`name` is used for debugging print only.'''
+    boolean = True if string in ('True', 'true') else False
+    if name is not None: print(f'Converted {name} with value: {string}, to Boolean value: {boolean}')
+    return boolean
+
+
+def convert_strings_to_booleans_in_request_form(request_form, names: list[str], argument_names: list[str]) -> dict:
+    '''Return a dictionary mapping each name in `argument_names` to the boolean value 
+    corresponding to the respective `name` in `names` if `name` appears in  `request_form`.'''
+    return {arg_name: convert_string_to_boolean(request_form.get(name)) for name, arg_name in zip(names, argument_names) if name in request_form}
+
+
+class BatchPricing(_RouteToDifferentServer):
+    def post(self):
+        from modules.batch_pricing import get_predictions_from_batch_pricing    # lazy loading for lower latency
+
+        username, password, access_token = get_username_password_access_token_from_form(request)
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            if 'file' in request.files:    # file was passed in
+                argument_passed_in = request.files['file']
+            else:    # since file wasn't passed in, we assume that `cusipList` was passed in
+                cusip_list = request.form.getlist('cusipList')
+                quantity_list = get_quantities_from_quantity_list(request.form)
+                trade_type_list = list(map(str, request.form.getlist('tradeTypeList'))) if 'tradeTypeList' in request.form else None
+                argument_passed_in = (cusip_list, quantity_list, trade_type_list)
+            quantity, trade_type = get_quantity_and_trade_type(request.form)
+            
+            optional_arguments = {}
+            form_names = ['download', 'ignoreErrorCusips', 'setQuantityToAmountOutstandingIfLessThanGivenQuantity', 'discardFailedBatches']    # `download` is `True` when the button is pressed on the frontend to download the CSV that has already been priced
+            python_names = ['download_csv', 'ignore_error_cusips', 'set_quantity_to_amount_outstanding_if_less_than_given_quantity', 'discard_failed_batches']
+            optional_arguments = optional_arguments | convert_strings_to_booleans_in_request_form(request.form, form_names, python_names)
+            if 'currentTime' in request.form: optional_arguments['current_time'] = request.form.get('currentTime')
+            
+            #COMMENTING OUT AS THIS IS CREATING TOO MUCH LOGGING 2025-08-28
+            #if len(optional_arguments) > 0: print(f'INFO: Using the following optional arguments:\n\t{optional_arguments}')    # python_logging.info(f'Using the following optional arguments:\n\t{optional_arguments}')
+            res = get_predictions_from_batch_pricing(argument_passed_in, quantity, trade_type, user, api_call, access_token, username, password, route_to_different_server=self.route_to_different_server, **optional_arguments)
+            return file_or_dataframe(res)
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)  
+
+
+class Compliance(_RouteToDifferentServer):
+    def post(self):
+        from modules.batch_pricing import get_predictions_from_batch_pricing    # lazy loading for lower latency
+
+        username, password, access_token = get_username_password_access_token_from_form(request)
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            if 'file' in request.files:    # file was passed in
+                argument_passed_in = request.files['file']
+            else:    # since file wasn't passed in, we assume that `cusipList` was passed in
+                cusip_list = request.form.getlist('cusipList')
+                quantity_list = get_quantities_from_quantity_list(request.form)
+                trade_type_list = list(map(str, request.form.getlist('tradeTypeList'))) if 'tradeTypeList' in request.form else None
+                user_price_list = list(map(str, request.form.getlist('userPriceList'))) if 'userPriceList' in request.form else None
+                trade_datetime_list = list(map(str, request.form.getlist('tradeDatetimeList'))) if 'tradeDatetimeList' in request.form else None
+                argument_passed_in = (cusip_list, quantity_list, trade_type_list, user_price_list, trade_datetime_list)
+            quantity, trade_type = get_quantity_and_trade_type(request.form)
+            download_csv = request.form.get('download') if 'download' in request.form else False    # button that is pressed on the frontend to download the CSV that has already been priced
+            use_cached_priced_file = request.form.get('useCachedPricedFile') if 'useCachedPricedFile' in request.form else False    # this forces the list to be priced and makes sure that a cached file is not returned
+            
+            res = get_predictions_from_batch_pricing(argument_passed_in, quantity, trade_type, user, api_call, access_token, username, password, use_for_compliance=True, download_csv=download_csv, route_to_different_server=self.route_to_different_server, use_cached_priced_file=use_cached_priced_file)
+            return file_or_dataframe(res)
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)  
+
+
+class NewProspect(Resource):
+    def post(self):
+        from modules.add_customer import add_prospect    # lazy loading for lower latency
+
+        data = request.get_json(silent=True)
+        company_name = data.get('company_name')
+        customer_name = data.get('customer_name')
+        customer_email = data.get('customer_email')
+        customer_message = data.get('customer_message')
+        res = add_prospect(company_name, customer_name, customer_email, customer_message)
+        return res
+
+
+def is_undefined_or_none(value: str) -> bool:
+    '''Check whether `value` is either 'undefined' or None or 'None'.'''
+    return value in ('undefined', 'None', None)    # `None` is used when the value is not passed in at all, while 'undefined' is used when the value is passed in but is not defined
+
+
+def get_coupon_value(name: str, default_value: int) -> int:
+    coupon_value = request.args.get(name)
+    if is_undefined_or_none(coupon_value): coupon_value = default_value
+    return int(coupon_value) / 100    # value comes 100 times larger than actual value due to implementation of the multi range slider
+
+
+def get_date_value(name: str, default_value: str) -> str:
+    date_value = request.args.get(name)
+    if is_undefined_or_none(date_value): date_value = default_value
+    return date_value
+
+
+class GetSimilarBonds(Resource):
+    def get(self):
+        from modules.similar_trades_for_ui import get_similar_bonds    # lazy loading for lower latency
+
+        username = request.args.get('username')
+        password = request.args.get('password')
+        access_token = request.args.get('access_token')
+        is_auth, user, api_call, access_token = is_authenticated(access_token, username, password)
+        if is_auth:
+            purpose_class = request.args.get('purposeClass')
+            # purpose_sub_class = request.args.get('purposeSubClass')
+            state = request.args.get('state')
+            # coupon = request.args.get('coupon')
+            min_coupon = get_coupon_value('minCoupon', 0)    # must match `app_engine/demo/ficc/src/components/pricing.jsx::defaultMinCoupon`
+            max_coupon = get_coupon_value('maxCoupon', 1000)    # must match `app_engine/demo/ficc/src/components/pricing.jsx::defaultMaxCoupon`
+            description = request.args.get('desc')
+            cusip = request.args.get('cusip')
+
+            # check whether `predicted_yield` and `predicted_price` can be interpreted as numerical values before passing them into the query
+            predicted_yield = request.args.get('yield')
+            predicted_price = request.args.get('price')
+            try:
+                predicted_yield, predicted_price = float(predicted_yield), float(predicted_price)
+            except ValueError:    # `ValueError: could not convert string to float` arises when attempting to convert a string to a float that cannot be represented as a number
+                predicted_yield, predicted_price = None, None
+
+            realtime = request.args.get('realtime')
+            issuer_choice = request.args.get('issuerChoice')
+            rating = request.args.get('rating')
+            min_maturity_date = get_date_value('minMaturityDate', '2025-01-01')    # must match `app_engine/demo/ficc/src/components/pricing.jsx::defaultMinMaturityDate`
+            max_maturity_date = get_date_value('maxMaturityDate', '2125-12-31')    # must match `app_engine/demo/ficc/src/components/pricing.jsx::defaultMaxMaturityDate`
+            # min_calculation_year = request.args.get('minCalculationYear')
+            # max_calculation_year = request.args.get('maxCalculationYear')
+            amount = request.args.get('amount')
+            user_triggered = request.args.get('userTriggered')
+            
+            similar_bonds_table = get_similar_bonds(user, 
+                                                    api_call, 
+                                                    user_triggered, 
+                                                    cusip, 
+                                                    predicted_yield, 
+                                                    predicted_price, 
+                                                    realtime, 
+                                                    issuer_choice, 
+                                                    purpose_class, 
+                                                    # purpose_sub_class, 
+                                                    # coupon, 
+                                                    min_coupon, 
+                                                    max_coupon, 
+                                                    state, 
+                                                    description, 
+                                                    rating, 
+                                                    min_maturity_date, 
+                                                    max_maturity_date, 
+                                                    # min_calculation_year, 
+                                                    # max_calculation_year, 
+                                                    amount)
+            return similar_bonds_table
+        else:
+            return error_response(NO_TOKEN_ERROR_MESSAGE)

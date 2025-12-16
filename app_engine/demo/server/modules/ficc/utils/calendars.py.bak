@@ -1,0 +1,55 @@
+'''
+ # @ Modified by: Developer
+ # @ Modified time: 2023-08-02
+ '''
+from datetime import datetime
+
+from pandas.tseries.holiday import get_calendar, HolidayCalendarFactory, GoodFriday    # , \
+                                #    AbstractHolidayCalendar, Holiday, nearest_workday, USMartinLutherKingJr, USPresidentsDay, USMemorialDay, USLaborDay, USThanksgivingDay, USFederalHolidayCalendar
+
+from pandas.tseries.offsets import BusinessDay
+
+
+# Juneteenth = Holiday(
+#             'Juneteenth National Independence Day',
+#             month=6,
+#             day=19,
+#             start_date='2021-06-18',
+#             observance=nearest_workday,
+#         )
+
+cal = get_calendar('USFederalHolidayCalendar')    # create calendar instance
+
+TradingCalendar = HolidayCalendarFactory('TradingCalendar', cal, GoodFriday)
+
+# class USTradingCalendar(AbstractHolidayCalendar):
+#     rules = [
+#         USFederalHolidayCalendar,
+#         GoodFriday,
+#         Holiday('NewYearsDay', month=1, day=1, observance=nearest_workday),
+#         USMartinLutherKingJr,
+#         USPresidentsDay,
+#         GoodFriday,
+#         USMemorialDay,
+#         Holiday('USIndependenceDay', month=7, day=4, observance=nearest_workday),
+#         USLaborDay,
+#         USThanksgivingDay,
+#         Holiday('vDay', month=11, day=11),
+#         Holiday('Christmas', month=12, day=25, observance=nearest_workday)
+#         # Holiday('Columbus Day', month=10, day=1, offset=<DateOffset: kwds={'weekday': MO(+2))
+#     ]
+
+
+def get_trading_close_holidays(trade_date):
+    return {t.date() for t in TradingCalendar().holidays(datetime(trade_date.year - 1, 12, 31), datetime(trade_date.year, 12, 31))}
+
+
+def get_all_trading_holidays():
+    return {t.date() for t in TradingCalendar().holidays(datetime(2019, 3, 1), datetime.now())}    # the range starts at the earliest that our trade history goes to 100 years from the current year
+
+
+def get_day_before(trade_date, holidays):
+    if holidays is None: holidays = get_trading_close_holidays(trade_date)
+    day_before = (trade_date - BusinessDay(1)).date()
+    if day_before in holidays: day_before = (day_before - BusinessDay(1)).date()
+    return day_before

@@ -1,0 +1,47 @@
+/*
+ * @Date: 2023-02-21
+ */
+import Container from 'react-bootstrap/Container'
+
+import { useState, useEffect } from 'react'
+import { useNavigate, Link } from 'react-router-dom'
+
+import { getAuth, onAuthStateChanged } from 'firebase/auth'
+
+import NavBarTop from './navBarTop'
+
+import FONT_SIZE from './pricing/globalVariables'
+
+
+function ContactTab() {
+    const nav = useNavigate()
+    const [userEmail, setUserEmail] = useState('')
+
+    function redirectToLogin() {
+        nav('/login')
+    }
+
+    useEffect(() => {
+        const auth = getAuth()
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                user.getIdToken(true).then((token) => {
+                    setUserEmail(user.email)
+                })
+            } else {
+                redirectToLogin()
+            }
+        })
+    }, [])
+    
+    return (
+        <Container fluid class='flex' className='justify-content-center' style={{ fontSize: FONT_SIZE }}>
+            <div>
+            <NavBarTop userEmail={userEmail}/>
+            <div>For more information, please visit <Link>ficc.ai</Link> or email Myles Schoonover at <Link>myles@ficc.ai</Link>.</div>
+            </div>
+        </Container>
+    )
+}
+
+export default ContactTab

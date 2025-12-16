@@ -1,0 +1,7 @@
+The code here demonstrates how to train and experiment with models on Vertex AI's model development API. This should take some complexity of out running training and experimenting, particularly simpler experiments such as hyperparameter tuning, since Vertex AI allows for tracking of results and scaling of resources to allow parallelization. 
+
+There are 4 key benefits over using a VM on compute engine: 
+1. Better utilization of resources, since Vertex AI only utilizes resources when a new job is created and then releases them once training is done. This is in contrast to having a VM on as experiments run, during which it may or may not be fully utilized and may not be switched off once experimentation is done.
+2. Better organization of results, since logs from a given experiment are all collated on Vertex AI.
+3. Because scripts are standardized and the entire training application is containerized, work is reproducible by anybody and consistent across runs.
+4. Experiments will be quicker, since Vertex AI can scale resources accordingly to run several runs within an experiment in parallel.   

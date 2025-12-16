@@ -1,0 +1,30 @@
+{
+    "attemptDeadline": "1800s",
+    "description": "Updates reference_data_redis_v3 with updated reference data 30 minutes after it is loaded to BQ at 6:00. Since the timezone is set to America/New_York, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "headers": {
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/reference_data_redis_update_v3",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/reference_data_redis_update_v3"
+    },
+    "lastAttemptTime": "2025-01-17T11:30:00.108204Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/reference_data_redis_update_v3",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "0s",
+        "minBackoffDuration": "5s",
+        "retryCount": 1
+    },
+    "schedule": "30 6 * * 1-5",
+    "scheduleTime": "2025-01-20T11:30:00.673793Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/New_York",
+    "userUpdateTime": "2024-12-22T19:16:11Z"
+}

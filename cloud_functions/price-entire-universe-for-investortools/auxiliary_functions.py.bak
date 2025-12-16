@@ -1,0 +1,105 @@
+'''
+Author: Developer Ray
+Date: 2024-05-23
+Last Editor: Developer Ray
+Last Edit Date: 2024-05-28
+'''
+import urllib3
+import requests
+import time
+from datetime import timedelta
+from functools import wraps
+import pickle
+import logging as python_logging    # to not confuse with google.cloud.logging
+
+from auxiliary_variables import API_URL
+
+
+def function_timer(function_to_time):
+    '''This function is to be used as a decorator. It will print out the execution time of `function_to_time`. 
+    It is very similar to the decorator by the same name in `app_engine/demo/server/modules/ficc/utils/auxiliary_functions.py`.'''
+    @wraps(function_to_time)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        python_logging.info(f'BEGIN {function_to_time.__name__}')
+        print(f'BEGIN {function_to_time.__name__}')    # need this for local testing since python_logging does not print to the terminal which is the only display for text that is visible during local testing
+        start_time = time.time()
+        result = function_to_time(*args, **kwargs)
+        end_time = time.time()
+        python_logging.info(f'END {function_to_time.__name__}. Execution time: {timedelta(seconds=end_time - start_time)}')
+        print(f'END {function_to_time.__name__}. Execution time: {timedelta(seconds=end_time - start_time)}')    # need this for local testing since python_logging does not print to the terminal which is the only display for text that is visible during local testing
+        return result
+    return wrapper
+
+
+def run_multiple_times_before_failing(error_types: tuple, max_runs: int):
+    '''This function returns a decorator. It will run `function` over and over again until it does not 
+    raise an Exception for a maximum of `max_runs` times.
+    NOTE: max_runs = 1 is the same functionality as not having this decorator.
+    NOTE: this is taken directly from `app_engine/demo/server/modules/ficc/utils/auxiliay_functions.py::run_multiple_times_before_failing(...)`'''
+    def decorator(function):
+        @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+        def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+            runs_so_far = 0
+            while runs_so_far < max_runs:
+                try:
+                    return function(*args, **kwargs)
+                except error_types as e:
+                    runs_so_far += 1
+                    if runs_so_far >= max_runs:
+                        python_logging.warning(f'Already caught {type(e)}: {e}, {max_runs} times in {function.__name__}, so will now raise the error')
+                        raise e
+                    python_logging.warning(f'Caught {type(e)}: {e}, and will retry {function.__name__} {max_runs - runs_so_far} more times')
+                    time.sleep(1)    # have a one second delay to prevent overloading the server
+        return wrapper
+    return decorator
+
+
+def get_api_call(cusip_list: list, quantity_list: list, trade_type_list: list, username: str, password: str):
+    assert len(cusip_list) == len(quantity_list) == len(trade_type_list), f'Number of CUSIPs: {len(cusip_list)} is not equal to the number of quantities: {len(quantity_list)} is not equal to the number of trade types: {len(trade_type_list)}'
+    url = API_URL + '/api/batchpricing'
+    data = {'username': username, 
+            'password': password}
+    data['cusipList'] = cusip_list
+    data['quantityList'] = quantity_list
+    data['tradeTypeList'] = trade_type_list
+
+    # provide InvestorTools specific arguments to the API call
+    data['ignoreErrorCusips'] = True
+    data['setQuantityToAmountOutstandingIfLessThanGivenQuantity'] = True
+    return url, data
+
+
+@run_multiple_times_before_failing((KeyError, urllib3.exceptions.SSLError, requests.exceptions.SSLError), 10)    # catches KeyError: 'email', KeyError: 'expires_in', urllib3.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad, requests.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac 
+def download_pickle_file(storage_client, bucket_name, file_name):
+    '''This function is used to download the data from the GCP storage bucket.
+    It is assumed that we will be downloading a pickle file. The decorator solves 
+    the following problem: GCP limits how quickly files can be downloaded from 
+    buckets and raises an `SSLError` or a `KeyError` when the buckets are accessed 
+    too quickly in succession.'''
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    if not blob.exists():    # `file_name` in `bucket_name` does not exist
+        print(f'File {file_name} does not exist in {bucket_name}.')
+        return None
+    pickle_in = blob.download_as_string()
+    data = pickle.loads(pickle_in)
+    print(f'File {file_name} downloaded from {bucket_name}.')
+    return data
+
+
+@run_multiple_times_before_failing((KeyError, urllib3.exceptions.SSLError, requests.exceptions.SSLError), 10)    # catches KeyError: 'email', KeyError: 'expires_in', urllib3.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad, requests.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac 
+def download_file(storage_client, bucket_name, file_name, local_file_name):
+    '''This function is used to download the data in `file_name` from the 
+    GCP storage bucket to a `local_file_name`. The decorator solves 
+    the following problem: GCP limits how quickly files can be downloaded from 
+    buckets and raises an `SSLError` or a `KeyError` when the buckets are accessed 
+    too quickly in succession.
+    NOTE: this is based heavily off `download_pickle_file(...)`.'''
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    if not blob.exists():    # `file_name` in `bucket_name` does not exist
+        print(f'File {file_name} does not exist in {bucket_name}.')
+        return None
+    blob.download_to_filename(local_file_name)
+    print(f'File {file_name} downloaded from {bucket_name} and saved to {local_file_name}.')
+    return local_file_name

@@ -1,0 +1,120 @@
+'''
+Description: Functions that support logging user activity to BigQuery. More details in https://www.notion.so/Log-Usage-for-Product-aed87e70670941eca59a532f4e9f3283.
+'''
+import time as python_time
+import uuid    # used to create a unique identifier when saving a file to Google Cloud Storage
+import pickle
+import logging as python_logging    # to not confuse with google.cloud.logging
+from datetime import timedelta
+
+from google.cloud import bigquery
+
+from modules.auxiliary_variables import LOGGING_FEATURES, RECENT_FEATURES, bq_client, storage_client, PROJECT_ID
+from modules.auxiliary_functions import round_for_logging, current_datetime_as_string
+from modules.ficc.utils.auxiliary_functions import remove_hours_and_fractional_seconds_beyond_3_digits
+from modules.ficc.utils.gcp_storage_functions import upload_data
+
+
+def get_user(usage_dict: list, user):    # putting a type annotation of `str` for `user` has VSCode claiming that all the code is unreachable
+    if user is not None: return user
+    if len(usage_dict) == 0: raise RuntimeError('Logging failed. `usage_dict` and `user` can not both be `None`.')
+    return usage_dict[0]['user']    # assumes that the user is the same for every item in the `usage_dict`
+
+
+def save_usage_to_file(usage_dict: list, user: str):
+    '''Save `usage_dict` which is a list of dictionaries to a file in Google Cloud Storage to be later 
+    uploaded to the `api_calls_tracker/usage_data` BigQuery table.'''
+    current_datetime = current_datetime_as_string('--')
+    current_date = current_datetime[:10]    # the first 10 characters are YYYY-MM-DD
+    filename = f'usage_{user}_{current_datetime}_{uuid.uuid4()}.pkl'    # `uuid.uuid4()` is used to generate a random identifier: https://docs.python.org/3/library/uuid.html
+    local_filename = f'/tmp/{filename}'
+    with open(local_filename, 'wb') as file:
+        pickle.dump(usage_dict, file)
+    upload_data(storage_client, 'server_logging', f'{current_date}/{filename}', local_filename)
+
+
+def save_usage_to_file_or_upload_to_bigquery_immediately(list_of_usage_dict: list, user: str):
+    '''Save `list_of_usage_dict` to a file in Google Cloud Storage or upload to logs immediately to the BigQuery table based on the user.'''
+    # if user != 'cf_test@ficc.ai':    # keeping immediate logging for 'cf_test@ficc.ai' since this is used in the automated tests to check whether logging is working appropriately
+    save_usage_to_file(list_of_usage_dict, user)
+    # else:
+    #     table_name = 'usage_data_internal' if '@ficc.ai' in user else 'usage_data'
+    #     table_id = f'{PROJECT_ID}.api_calls_tracker.{table_name}'
+
+    #     # create schema
+    #     logging_schema = [bigquery.SchemaField(feature, dtype) for feature, dtype in LOGGING_FEATURES.items()]
+    #     recent_schema = bigquery.SchemaField('recent', 'RECORD', mode='REPEATED', fields=[bigquery.SchemaField(feature, 'numeric') for feature in RECENT_FEATURES])
+    #     logging_schema.append(recent_schema)
+    #     job_config = bigquery.LoadJobConfig(schema=logging_schema)
+    
+    #     bq_client.load_table_from_json(list_of_usage_dict, table_id, job_config=job_config)    # assigning the result of this command and calling `load_job.result()` waits for the job to complete before proceeding, and so the current code makes the logging procedure asynchronous, whereas the commented out code below forces the program to wait until the logging is complete
+    #     # load_job = bq_client.load_table_from_json(usage_dict, table_id, job_config=job_config)
+    #     # try:
+    #     #     start_time = python_time.time()
+    #     #     load_job.result()    # Waits for the job to complete.
+    #     #     end_time = python_time.time()
+    #     #     print(f'INFO: Execution time of logging usage with `load_job.result()`: {remove_hours_and_fractional_seconds_beyond_3_digits(timedelta(seconds=end_time - start_time))}')
+    #     # except Exception as e:
+    #     #     print(f'WARNING: when logging usage the following error occurs {type(e)}:{e}')
+    #     #     print(load_job.errors)
+    #     #     raise e
+
+
+def log_usage(usage_dict=None,    # if this value is not None, then it will overwrite all other arguments passed in 
+              user=None, 
+              api_call=False, 
+              time=None, 
+              cusip=None, 
+              direction=None, 
+              quantity=None, 
+              ficc_price=None, 
+              ficc_ytw=None, 
+              yield_spread=None, 
+              ficc_ycl=None, 
+              calc_date=None, 
+              daily_schoonover_report=False, 
+              real_time_yield_curve=False, 
+              batch=False, 
+              show_similar_bonds=False, 
+              error=False, 
+              model_used=None, 
+              recent=None):
+    '''Logs usage whenever demo is used.'''
+    if usage_dict is None and user is None:
+        print('Logging failed. `usage_dict` and `user` can not both be `None`.')
+        return None
+
+    if time is None: time = current_datetime_as_string()
+
+    try:
+        if usage_dict is None:
+            if type(recent) == list and len(recent) <= 5:
+                recent = [{feature: round_for_logging(recent[idx]) if idx < len(recent) else None for idx, feature in enumerate(RECENT_FEATURES)}]
+            else:
+                print(f'`recent` ({recent}) is not a list of length less than or equal to 5 and so it will not be logged')
+                recent = [{feature: None for feature in RECENT_FEATURES}]
+
+            usage_dict = {'user': user, 
+                          'api_call': api_call, 
+                          'time': time, 
+                          'cusip': cusip, 
+                          'direction': direction, 
+                          'quantity': quantity, 
+                          'ficc_price': ficc_price, 
+                          'ficc_ytw': ficc_ytw, 
+                          'yield_spread': yield_spread, 
+                          'ficc_ycl': ficc_ycl, 
+                          'calc_date': calc_date, 
+                          'daily_schoonover_report': daily_schoonover_report, 
+                          'real_time_yield_curve': real_time_yield_curve, 
+                          'batch': batch, 
+                          'show_similar_bonds': show_similar_bonds, 
+                          'error': error, 
+                          'model_used': model_used, 
+                          'recent': recent}
+            # print(f'INFO: Usage dict: {usage_dict}')    # python_logging.info(usage_dict)    # ensures that all `usage_dict`s are outputted to the server logs
+        if type(usage_dict) is dict: usage_dict = [usage_dict]    # if you're a customer and you just priced an individual bond, `usage_dict` will be the particular the fields as a dict, but `load_table_from_json` requires a list of dicts. For batch pricing, we call `log_usage` with a list of dicts so no conversion is necesssary
+        user = get_user(usage_dict, user)    # does not matter if we override `user` since we do not user it later in this function
+        save_usage_to_file_or_upload_to_bigquery_immediately(usage_dict, user)    # this will save to file or upload to logs immediately based on the user
+    except Exception as e:
+        print(f'\nERROR: Logging error. {type(e)}: {e}\n')    # print the exception so to not terminate the program in case there is a logging error

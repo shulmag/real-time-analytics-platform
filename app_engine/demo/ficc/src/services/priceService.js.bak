@@ -1,0 +1,136 @@
+/*
+ * @Last Modified by: Developer
+ * @Last Modified time: 2025-04-11
+ */
+import http from './httpService'
+
+
+export async function getPrice(access_token, cusip, tradeType, amount, date, time) {
+    const urlStr = '/api/price?access_token=' + access_token + '&cusip=' + cusip + '&tradeType='+tradeType + '&amount=' + amount + '&date=' + date + '&time=' + time 
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function getDailySchoonover(access_token) {
+    const urlStr = '/api/dailySchoonover?access_token=' + access_token
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function getRealtimeYieldCurve(access_token, date, time) {
+    const urlStr = '/api/realtimeyieldcurve?access_token=' + access_token + '&date=' + date + '&time=' + time 
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function getCusipTradeStats(access_token, cusip) {
+    const urlStr = '/api/getcusiptradestats?access_token=' + access_token + '&cusip=' + cusip 
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function getCusipLastTradeDate(access_token, cusip) {
+    const urlStr = '/api/getlasttradedate?access_token=' + access_token + '&cusip=' + cusip 
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function getSimilarBonds(access_token, 
+                                      cusip, 
+                                      predicted_yield, 
+                                      predicted_price, 
+                                      // coupon, 
+                                      minCoupon, 
+                                      maxCoupon, 
+                                      state, 
+                                      purposeClass, 
+                                      // purposeSubClass, 
+                                      desc, 
+                                      rating, 
+                                      minMaturityDate, 
+                                      maxMaturityDate, 
+                                      // minCalculationYear, 
+                                      // maxCalculationYear, 
+                                      amount, 
+                                      realtime, 
+                                      issuerChoice, 
+                                      userTriggered) {
+    if (typeof rating !== 'undefined') {
+        if (Array.isArray(rating)) {rating = rating[0]}    // if the rating is a one-item list, then extract this item
+        rating = rating.includes('+')    // need to replace '+' with a %2B since '+' is a reserved character for URL's: https://stackoverflow.com/questions/5450190/how-to-encode-the-plus-symbol-in-a-url
+                ? rating.replace('+', '%2B')
+                : rating
+    }
+    const urlStr = '/api/getsimilarbonds?access_token=' + 
+                   access_token + 
+                   '&cusip=' + 
+                   cusip + 
+                   '&yield=' + 
+                   predicted_yield + 
+                   '&price=' + 
+                   predicted_price + 
+                   '&minCoupon=' + 
+                   minCoupon + 
+                   '&maxCoupon=' + 
+                   maxCoupon + 
+                   // '&coupon=' + 
+                   // coupon + 
+                   '&state=' + 
+                   state + 
+                   '&purposeClass=' + 
+                   purposeClass +
+                   // '&purposeSubClass=' + 
+                   // purposeSubClass + 
+                   '&desc=' + 
+                   desc + 
+                   '&rating=' + 
+                   rating + 
+                   '&minMaturityDate=' + 
+                   minMaturityDate + 
+                   '&maxMaturityDate=' + 
+                   maxMaturityDate + 
+                   // '&minCalculationYear=' + 
+                   // minCalculationYear + 
+                   // '&maxCalculationYear=' + 
+                   // maxCalculationYear + 
+                   '&amount=' + 
+                   amount + 
+                   '&realtime=' + 
+                   realtime + 
+                   '&issuerChoice=' + 
+                   issuerChoice + 
+                   '&userTriggered=' + 
+                   userTriggered
+  
+    const { data: returnedData } = await http.get(urlStr)
+    return returnedData
+}
+
+
+export async function uploadFile(formData) {
+    const urlStr = '/api/batchpricing'
+    const data = await http.post(urlStr, formData, {headers: {'Content-Type': 'multipart/form-data'}, 
+                                                    responseType: 'blob'})
+    return data
+}
+
+export async function uploadComplianceFile(formData) {
+    const urlStr = '/api/compliance'
+    const data = await http.post(urlStr, formData, {headers: {'Content-Type': 'multipart/form-data'}, 
+                                                    responseType: 'blob'})
+    return data
+}
+
+export async function createCustomer(company, name, email, message) {
+    const urlStr = '/api/createcustomer'
+    const data = await http.post(urlStr, {company_name: company,
+                                          customer_name: name,
+                                          customer_email: email, 
+                                          customer_message: message})
+    return data
+}

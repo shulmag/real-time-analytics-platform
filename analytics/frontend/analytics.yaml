@@ -1,0 +1,38 @@
+runtime: nodejs20
+env: standard
+service: analytics
+
+handlers:
+  # Handler 1: Serve Vite's hashed assets (JS, CSS, etc.).
+  # These files are immutable because their names change when their content changes.
+  # We instruct browsers to cache them for 1 year.
+  - url: /assets
+    static_dir: dist/assets
+    secure: always
+    http_headers:
+      Cache-Control: 'public, max-age=31536000'
+
+  # Handler 2: Serve other static files that don't have hashed names.
+  # A shorter cache (1 day) is a safe default for these.
+  - url: /(.*\.(json|ico|png|txt))$
+    static_files: dist/\1
+    upload: dist/.*\.(json|ico|png|txt)$
+    secure: always
+    http_headers:
+      Cache-Control: 'public, max-age=86400'
+
+  # Handler 3: Serve the main index.html for all SPA routes.
+  # forcing browser to always get the latest version of new hashed assets.
+  - url: /.*
+    static_files: dist/index.html
+    upload: dist/index.html
+    secure: always
+    http_headers:
+      Cache-Control: 'no-cache, no-store, must-revalidate'
+
+# Environment variables
+env_variables:
+  NODE_ENV: 'production'
+
+automatic_scaling:
+  min_idle_instances: 1

@@ -1,0 +1,5 @@
+These folders contain the code for cloud functions to perform debiasing and notebooks to monitor the MAE performance of debiased predictions. 
+- deployment contains code for the cloud function 'debiasing'. This function processes trade data from the msrb_intraday_real_time_trade_files storage bucket, calls Vertex AI to perform predictions and saves the frame to cloud storage.
+- bias-calculator contains code for the cloud function 'bias-calculator'. This function calculates biases using the trades processed by  the cloud function 'debiasing' using pre-set parameters and uploads to cloud storage.
+
+Function deployment is most effectively executed using the deployment-gcs.sh shell scripts in each of the cloud function folders. This is because there are too many subfolders and files in 'modules' to upload manually. deployment-gcf.sh sometimes work but for more complex configurations direct uploads are not recommended. Instead, configure the cloud functions on the cloud console directly then upload code from the cloud bucket.

@@ -1,0 +1,42 @@
+/*
+ * @Author: Gil Shulman 
+ * @Date: 2021-10-11 
+ * @Last Modified by: Gil Shulman
+ * @Last Modified time: 2022-07-23 
+ */
+import React from "react"; 
+import Button from 'react-bootstrap/Button';
+import Form from "react-bootstrap/Form";
+import InputGroup from "react-bootstrap/InputGroup";
+
+function SearchForm({searchValues, set, tradeType, onSubmit, searchResults}){    //props should include func and states
+
+    return(
+        <div>   
+        <Form onSubmit={onSubmit}>
+            <Form.Group>
+                <Form.Label size="sm" for="cusip">CUSIP</Form.Label>
+                <Form.Control style={{color:"#ffffff",backgroundColor:"#303030"}} size="sm" required minLength="9" maxLength="9" name="cusip" id="cusip" value={searchValues.cusip.toUpperCase()}  onChange={set('cusip')}/>
+                <Form.Label size="sm"> Dollar Amount</Form.Label>
+                <InputGroup size="sm">
+                        <InputGroup.Text>$</InputGroup.Text>
+                    <Form.Control style={{color:"#ffffff",backgroundColor:"#303030"}} size="sm" placeholder="Dollar Amount" type="number" required min="1" name="amount" value={searchValues.amount} onChange={set('amount')}/>
+                </InputGroup>
+                <Form.Label size="sm"> Trade Type</Form.Label> 
+                <Form.Control style={{color:"#ffffff",backgroundColor:"#303030"}} as="select" size="sm" required name="tradeType" value={searchValues.tradeType} onChange={set('tradeType')}>
+                    <option value="">Trade Type</option>
+                        {tradeType.map((o) => (<option value={o.key}>{o.text}</option>))}
+                </Form.Control>
+                <Form.Label size="sm">Date</Form.Label> 
+                <Form.Control disabled={true} style={{color:"#ffffff",backgroundColor:"#303030"}} size="sm" type="date" name="date" onChange={set('date')} value={searchValues.date}/>
+                <Form.Label size="sm">Time (ET)</Form.Label> 
+                <Form.Control disabled={true} style={{color:"#ffffff",backgroundColor:"#303030"}} size="sm" type="time" name="time" onChange={set('time')} value={searchValues.time}/>
+            
+                <Button style={{color:"#313131",backgroundColor:"#80e0f8"}} className="mt-2" type="submit" variant="info">Search</Button> 
+            </Form.Group>
+        </Form>
+        </div>
+    );
+}
+
+export default SearchForm;

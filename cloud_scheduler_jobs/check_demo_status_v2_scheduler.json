@@ -1,0 +1,29 @@
+{
+    "attemptDeadline": "1800s",
+    "description": "Run check_demo_status_v2 every hour from 1am to 5pm eastern time. Since the timezone is set to America/New_York, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "headers": {
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/check_demo_status_v2",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/check_demo_status_v2"
+    },
+    "lastAttemptTime": "2025-01-17T22:00:00.147499Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/check_demo_status_v2_scheduler",
+    "retryConfig": {
+        "maxBackoffDuration": "10s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "1800s",
+        "minBackoffDuration": "5s"
+    },
+    "schedule": "0 1-17 * * 1-5",
+    "scheduleTime": "2025-01-20T06:00:00.082745Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/New_York",
+    "userUpdateTime": "2024-11-05T01:11:48Z"
+}

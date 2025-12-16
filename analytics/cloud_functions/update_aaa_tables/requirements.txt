@@ -1,0 +1,11 @@
+functions-framework
+google-cloud-bigquery>=3.25.0
+google-cloud-bigquery-storage
+pandas>=2.2.2
+numpy>=2.0.0
+pyarrow>=17.0.0
+redis>=5.0.7
+python-dateutil>=2.9.0
+pytz>=2024.1
+db-dtypes
+pandas-gbq

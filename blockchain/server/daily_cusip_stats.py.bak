@@ -1,0 +1,190 @@
+'''
+Author: Gil Shulman
+Create Date: 2025-03-25
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-11
+Description: Fetches the most actively traded seasoned CUSIP from yesterday
+             and saves to Cloud Storage for efficient access
+'''
+import pandas as pd
+import json
+import os
+import io
+
+from google.cloud import bigquery, storage
+from datetime import datetime, timedelta
+
+from pandas.tseries.offsets import CustomBusinessDay
+from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday
+from pytz import timezone
+
+eastern = timezone('US/Eastern')
+
+class USHolidayCalendarWithGoodFriday(USFederalHolidayCalendar):
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
+BUSINESS_DAY = CustomBusinessDay(calendar=USHolidayCalendarWithGoodFriday())
+
+# Global variables for configuration
+BUCKET_NAME = "ficc_blockchain"  # Your bucket name
+STATS_PREFIX = "daily_cusip_stats"  # Prefix for stats files
+
+# Query to get yesterday's most actively traded seasoned CUSIP
+MOST_ACTIVE_SEASONED_QUERY = """
+WITH trades AS (
+    SELECT
+        *,
+        DATE_DIFF(trade_date, dated_date, YEAR) AS years_since_dated_date
+    FROM
+        `eng-reactor-287421.auxiliary_views_v2.msrb_final`
+    WHERE
+        trade_date = DATE_SUB(@date, INTERVAL 1 DAY)
+        AND msrb_valid_to_date > CURRENT_DATETIME('US/Eastern')
+),
+most_active_seasoned AS (
+    SELECT
+        ARRAY_AGG(STRUCT(cusip, security_description, trade_count) ORDER BY trade_count DESC LIMIT 1)[OFFSET(0)] AS most_active
+    FROM (
+        SELECT
+            cusip,
+            security_description,
+            COUNT(*) AS trade_count
+        FROM
+            trades
+        WHERE
+            years_since_dated_date >= 1  -- Seasoned bonds (1+ years since dated_date)
+        GROUP BY
+            cusip, security_description
+    )
+)
+SELECT
+    most_active.cusip AS most_actively_traded_seasoned_cusip,
+    most_active.security_description AS description,
+    most_active.trade_count AS number_of_trades
+FROM
+    most_active_seasoned;
+"""
+
+def get_clients():
+    """Initialize and return BigQuery and Storage clients, or None if authentication fails."""
+    try:
+        bq_client = bigquery.Client()
+        storage_client = storage.Client()
+        return bq_client, storage_client
+    except Exception as e:
+        print(f"Error initializing Google Cloud clients: {e}")
+        return None, None
+
+def sqltodf(sql, bq_client, job_config=None):
+    """Run BigQuery SQL and return results as DataFrame."""
+    try:
+        bqr = bq_client.query(sql, job_config=job_config).result()
+        return bqr.to_dataframe()
+    except Exception as e:
+        print(f"Error executing BigQuery SQL: {e}")
+        return pd.DataFrame()
+
+def last_business_day():
+    today = datetime.now(eastern).date()
+    last_business_date = today - (BUSINESS_DAY * 1)
+    print(f"Last business day: {last_business_date}")
+    return last_business_date.date()
+
+def get_stats_filename(date):
+    """Generate filename for stats based on date."""
+    return f"{STATS_PREFIX}/{date.strftime('%Y-%m-%d')}_most_active_seasoned.json"
+
+def check_stats_exists(storage_client, date):
+    """Check if stats for the given date already exist in Cloud Storage."""
+    if storage_client is None:
+        return False
+        
+    bucket = storage_client.bucket(BUCKET_NAME)
+    filename = get_stats_filename(date)
+    blob = bucket.blob(filename)
+    return blob.exists()
+
+def save_stats_to_gcs(storage_client, stats_df, date):
+    """Save stats DataFrame to Cloud Storage as JSON."""
+    if storage_client is None:
+        print("Storage client not available, cannot save stats")
+        return False
+        
+    try:
+        bucket = storage_client.bucket(BUCKET_NAME)
+        filename = get_stats_filename(date)
+        blob = bucket.blob(filename)
+        
+        # Convert DataFrame to JSON
+        json_data = stats_df.to_json(orient='records')
+        
+        # Upload to GCS
+        blob.upload_from_string(json_data, content_type='application/json')
+        print(f"Saved stats to gs://{BUCKET_NAME}/{filename}")
+        return True
+    except Exception as e:
+        print(f"Error saving stats to GCS: {e}")
+        return False
+
+def read_stats_from_gcs(storage_client, date):
+    """Read stats from Cloud Storage."""
+    if storage_client is None:
+        return None
+        
+    try:
+        bucket = storage_client.bucket(BUCKET_NAME)
+        filename = get_stats_filename(date)
+        blob = bucket.blob(filename)
+        
+        if not blob.exists():
+            return None
+        
+        # Download as string and parse JSON
+        json_data = blob.download_as_text()
+        return pd.read_json(io.StringIO(json_data), orient='records')
+    except Exception as e:
+        print(f"Error reading stats from GCS: {e}")
+        return None
+
+def get_most_active_seasoned_cusip():
+    """
+    Get the most actively traded seasoned CUSIP from yesterday.
+    Handles authentication errors and provides fallback data.
+    """
+    # Get yesterday's date
+    yesterday = last_business_day()
+    
+    # Initialize clients
+    bq_client, storage_client = get_clients()
+    
+    # Try to read from GCS first
+    existing_stats = read_stats_from_gcs(storage_client, yesterday)
+    if existing_stats is not None:
+        print(f"Retrieved existing stats for {yesterday} from Cloud Storage")
+        return existing_stats
+    
+    # If not found, run the query
+    print(f"Calculating stats for {yesterday} from BigQuery")
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("date", "DATE", yesterday + timedelta(days=1)),  # @date is today
+        ]
+    )
+    
+    stats_df = sqltodf(MOST_ACTIVE_SEASONED_QUERY, bq_client, job_config)
+    print(f"Stats DataFrame: {stats_df}")
+    # Save to GCS for future use
+    if not stats_df.empty:
+        save_stats_to_gcs(storage_client, stats_df, yesterday)
+    
+    return stats_df
+
+# Example usage
+# if __name__ == "__main__":
+#     stats = get_most_active_seasoned_cusip()
+#     if not stats.empty:
+#         print(f"Most active seasoned CUSIP yesterday: {stats.iloc[0]['most_actively_traded_seasoned_cusip']}")
+#         print(f"Description: {stats.iloc[0]['description']}")
+#         print(f"Number of trades: {stats.iloc[0]['number_of_trades']}")
+#     else:
+#         print("No data found for yesterday")

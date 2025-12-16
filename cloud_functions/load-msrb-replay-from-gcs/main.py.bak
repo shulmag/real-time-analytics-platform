@@ -1,0 +1,203 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2024-09-20
+Description: Parses the XML file and uploads it to BigQuery. This cloud function is run after copy_msrb_replay_to_GCS.
+'''
+import traceback    # used to print error stack trace
+from datetime import datetime
+from pytz import timezone
+
+from google.cloud import bigquery, storage
+from google.api_core.exceptions import BadRequest
+
+from send_email import send_error_email
+
+
+BQ_CLIENT = bigquery.Client()
+STORAGE_CLIENT = storage.Client()
+
+EASTERN = timezone('US/Eastern')
+
+
+def trade_message_to_full_db_record(trade_message):
+    '''Parse a single trade message into BQ ready data.'''
+    names = [
+        'message_type',
+        'sequence_number',
+        'delete',
+        'rtrs_control_number',
+        'trade_type',
+        'transaction_type',
+        'cusip',
+        'security_description',
+        'dated_date',
+        'coupon',
+        'maturity_date',
+        'when_issued',
+        'assumed_settlement_date',
+        'trade_date',
+        'time_of_trade',
+        'settlement_date',
+        'par_traded',
+        'dollar_price',
+        'yield',
+        'brokers_broker',
+        'is_weighted_average_price',
+        'is_lop_or_takedown',
+        'publish_date',
+        'publish_time',
+        'version',
+        'unable_to_verify_dollar_price',
+        'is_alternative_trading_system',
+        'is_non_transaction_based_compensation',
+        'is_trade_with_a_par_amount_over_5MM',
+    ]
+    parsed_messages = trade_message.split(',')
+    temp_dict = dict([s.split('=', 1) for s in parsed_messages])
+    dict_record = {int(key): temp_dict[key] for key in temp_dict.keys()}
+    dict_record_with_headers = {
+        names[i]: dict_record[i + 1] if i + 1 in dict_record else None
+        for i in range(len(names))
+    }
+    del dict_record_with_headers['delete']
+    return data_type_casting(dict_record_with_headers)
+
+
+def data_type_casting(dict_trade_message):
+    '''Cast each MSRB string into the BQ schema data type.'''
+    # The 'except ValueError:' place null value for every value retuened that does not fit the data type - we lose data that way, but perhaps not useful data. Let's discuss.
+    dict_data_type = {
+        'upload_date': 'date',
+        'message_type': 'string',
+        'sequence_number': 'integer',
+        'rtrs_control_number': 'integer',
+        'trade_type': 'string',
+        'transaction_type': 'string',
+        'cusip': 'string',
+        'security_description': 'string',
+        'dated_date': 'date',
+        'coupon': 'numeric',
+        'maturity_date': 'date',
+        'when_issued': 'boolean',
+        'assumed_settlement_date': 'date',
+        'trade_date': 'date',
+        'time_of_trade': 'time',
+        'settlement_date': 'date',
+        'par_traded': 'numeric',
+        'dollar_price': 'float',
+        'yield': 'float',
+        'brokers_broker': 'string',
+        'is_weighted_average_price': 'boolean',
+        'is_lop_or_takedown': 'boolean',
+        'publish_date': 'date',
+        'publish_time': 'time',
+        'version': 'numeric',
+        'unable_to_verify_dollar_price': 'boolean',
+        'is_alternative_trading_system': 'boolean',
+        'is_non_transaction_based_compensation': 'boolean',
+        'is_trade_with_a_par_amount_over_5MM': 'boolean',
+    }
+
+    for k, v in dict_trade_message.items():
+        try:
+            if dict_data_type[k] == 'date':
+                if v != None:
+                    if len(v) == 8:
+                        dict_trade_message[k] = datetime.strptime(v, '%Y%m%d').strftime('%Y-%m-%d')
+                    elif len(v) == 6:
+                        dict_trade_message[k] = datetime.strptime(v, '%m%d%y').strftime('%Y-%m-%d')
+                    else:
+                        dict_trade_message[k] = None
+            if dict_data_type[k] == 'numeric' or dict_data_type[k] == 'float':
+                if v == 'MM':
+                    dict_trade_message[k] = None
+                    dict_trade_message['is_trade_with_a_par_amount_over_5MM'] = True
+                elif v != '' and v != None:
+                    dict_trade_message[k] = float(v)
+                else:
+                    dict_trade_message[k] = None
+            if dict_data_type[k] == 'string':
+                dict_trade_message[k] = v
+            if dict_data_type[k] == 'integer' and v != None:
+                dict_trade_message[k] = int(v)
+            if dict_data_type[k] == 'boolean':
+                dict_trade_message[k] = v == 'Y'
+            elif dict_data_type[k] == 'time':
+                if v != None:
+                    dict_trade_message[k] = datetime.strftime(datetime.strptime(v, '%H%M%S'), '%H:%M:%S')
+        except Exception:
+            dict_trade_message[k] = None
+
+    dict_trade_message['upload_date'] = datetime.now(EASTERN).strftime('%Y-%m-%d')
+    return dict_trade_message
+
+
+def add_to_bigquery(rows_to_insert: list):
+    if len(rows_to_insert) == 0:
+        print('No rows to insert')
+        return
+
+    table_id = 'eng-reactor-287421.MSRB.msrb_daily_replay_files'
+    trade_messages_schema = [
+        bigquery.SchemaField('upload_date', 'date'),
+        bigquery.SchemaField('message_type', 'string'),
+        bigquery.SchemaField('sequence_number', 'integer'),
+        bigquery.SchemaField('rtrs_control_number', 'integer'),
+        bigquery.SchemaField('trade_type', 'string'),
+        bigquery.SchemaField('transaction_type', 'string'),
+        bigquery.SchemaField('cusip', 'string'),
+        bigquery.SchemaField('security_description', 'string'),
+        bigquery.SchemaField('dated_date', 'date'),
+        bigquery.SchemaField('coupon', 'numeric'),
+        bigquery.SchemaField('maturity_date', 'date'),
+        bigquery.SchemaField('when_issued', 'boolean'),
+        bigquery.SchemaField('assumed_settlement_date', 'date'),
+        bigquery.SchemaField('trade_date', 'date'),
+        bigquery.SchemaField('time_of_trade', 'time'),
+        bigquery.SchemaField('settlement_date', 'date'),
+        bigquery.SchemaField('par_traded', 'numeric'),
+        bigquery.SchemaField('dollar_price', 'float'),
+        bigquery.SchemaField('yield', 'float'),
+        bigquery.SchemaField('brokers_broker', 'string'),
+        bigquery.SchemaField('is_weighted_average_price', 'boolean'),
+        bigquery.SchemaField('is_lop_or_takedown', 'boolean'),
+        bigquery.SchemaField('publish_date', 'date'),
+        bigquery.SchemaField('publish_time', 'time'),
+        bigquery.SchemaField('version', 'numeric'),
+        bigquery.SchemaField('unable_to_verify_dollar_price', 'boolean'),
+        bigquery.SchemaField('is_alternative_trading_system', 'boolean'),
+        bigquery.SchemaField('is_non_transaction_based_compensation', 'boolean'),
+        bigquery.SchemaField('is_trade_with_a_par_amount_over_5MM', 'boolean'),
+    ]
+
+    job_config = bigquery.LoadJobConfig(
+        schema=trade_messages_schema,
+        write_disposition='WRITE_APPEND',
+        max_bad_records=5,
+        allow_jagged_rows=True,
+        ignore_unknown_values=True,
+    )
+
+    load_job = BQ_CLIENT.load_table_from_json(rows_to_insert, table_id, job_config=job_config)    # make an API request
+    try:
+        load_job.result()    # waits for the job to complete
+    except BadRequest as e:
+        send_error_email(f'Failed to update BigQuery table: {table_id} due to {e}', traceback.format_exc())
+        raise e
+    print(f'Added {len(rows_to_insert)} rows to {table_id}')
+
+
+def get_msrb_replay_file(file_name):
+    bucket = STORAGE_CLIENT.bucket('msrb_trade_history')
+    blob = bucket.blob(file_name)
+    file_str = blob.download_as_bytes()
+    return file_str
+
+
+def main(event, context):
+    file_name = event['name']
+    file_str = get_msrb_replay_file(file_name)
+    trade_messages = file_str.splitlines()
+    print(f'Found {len(trade_messages)} trade messages in {file_name}')
+    rows = [trade_message_to_full_db_record(trade_message.decode('utf-8')) for trade_message in trade_messages]
+    add_to_bigquery(rows)

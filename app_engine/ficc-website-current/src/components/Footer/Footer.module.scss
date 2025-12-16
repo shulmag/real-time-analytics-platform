@@ -1,0 +1,49 @@
+@use "../../styles/lib" as *;
+
+
+.root {
+  @include region-buffer;
+  contain: content;
+  content-visibility: auto;
+  padding-block-end: spacing();
+
+  nav,
+  section {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  nav {
+    flex-flow: column wrap;
+
+    @include screen {
+      flex-direction: row;
+      align-items: center;
+    }
+  }
+
+  section {
+    padding-block-start: spacing();
+    margin-block-start: spacing();
+    align-items: center;
+    border-block-start: 1px solid #{color('grey.7')};
+  }
+
+  a {
+
+    @include hover {
+      color: color('accent');
+    }
+  }
+
+  a:not(:first-child) {
+    font-weight: 300;
+    font-size: .9rem;
+    margin-block-start: spacing(3);
+
+    @include screen {
+      margin-block-start: 0;
+      margin-inline-start: 2ch;
+    }
+  }
+}

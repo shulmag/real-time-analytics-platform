@@ -1,0 +1,199 @@
+'''
+Author: Developer Ray
+Date: 2024-04-05
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-18
+Description: General purpose functions used through the server code.
+'''
+import os
+import warnings
+import holidays
+from functools import wraps
+
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+from google.cloud import secretmanager
+
+from modules.auxiliary_variables import HOUR_MIN, HOUR_MIN_SEC, MONTH_DAY_YEAR, YEAR_MONTH_DAY, EASTERN, ONE_DAY, holidays_in_last_year_and_next_year, LOGGING_PRECISION, REFERENCE_DATA_FEATURE_TO_INDEX, PROJECT_ID
+
+
+def cache_output_cusip_trade_datetime(function, verbose=False):
+    '''This function is to be used as a decorator.
+    NOTE: this decorator is inspired by `cache_output(...)` in `ficc/utils/auxiliary_functions::cache_output(...)`'''
+    cache = {}
+    @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def memoizer(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        nonlocal cache
+        cusip, trade_datetime = args[0], args[1]    # assumes that args[0] is the cusip and args[1] is the trade datetime
+        cusip_and_trade_datetime = (cusip, trade_datetime)
+        if cusip_and_trade_datetime not in cache:
+            cache[cusip_and_trade_datetime] = function(*args, **kwargs)
+        else:
+            if verbose: print(f'Found CUSIP {cusip_and_trade_datetime} in cache for {function.__name__}')
+        return cache[cusip_and_trade_datetime]
+    return memoizer
+
+
+def cache_output_cusip_trade_datetime_verbose(function):
+    '''This function is to be used as a decorator. It returns `cache_output_cusip_trade_datetime` with the `verbose` flag set to `True`.'''
+    return cache_output_cusip_trade_datetime(function, True)
+
+
+def access_secret_version(secret_id: str, project_id: str = PROJECT_ID, version_id='latest'):
+    '''Access secret values from https://console.cloud.google.com/security/secret-manager?invt=Abtsng&project=eng-reactor-287421.'''
+    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'
+    response = secretmanager.SecretManagerServiceClient().access_secret_version(request={'name': name})
+    payload = response.payload.data.decode('UTF-8')
+    return payload
+
+
+def round_for_logging(value):
+    '''Used prior to logging so that uploading to BigQuery does not fail with error: `Invalid NUMERIC value`.'''
+    return np.round(value, LOGGING_PRECISION)
+
+
+def datetime_as_string(datetime, separator=' ', precision='sec', display=False):
+    '''Return the datetime as a string for a specified `precision` and `separator`.'''
+    if datetime is None: return None    # this statement is entered when trying to convert a `None` calc_date into a datetime string when creating the `previous_trades` array
+
+    if precision == 'sec':
+        time = HOUR_MIN_SEC
+    elif precision == 'min':
+        time = HOUR_MIN
+    elif precision == 'day':
+        time = ''
+        separator = ''    # no need for a separator between the date and time when there is no time for the precision of `day`
+    else:
+        raise ValueError(f'Precision: {precision} not supported')
+    year_month_day = MONTH_DAY_YEAR if display else YEAR_MONTH_DAY
+    return datetime.strftime(year_month_day + separator + time)
+
+
+def get_current_datetime():
+    return datetime.now(EASTERN)
+
+
+def current_datetime_as_string(separator=' ', precision='sec'):
+    return datetime_as_string(get_current_datetime(), separator, precision)
+
+
+def get_settlement_date(trade_date: str):
+    '''Maturity should be calculated based on a given settlement date, rather than a trade date.
+    This function calculates a settlement date given a trade date in order to calculate maturity.
+    NB: this needs to be converted to datetime in ET.'''
+    trade_date = pd.to_datetime(trade_date, format=YEAR_MONTH_DAY)
+    settlement_date = trade_date + ONE_DAY    # updated from `TWO_DAYS` to `ONE_DAY` due to new SEC rule: https://www.sec.gov/resources-for-investors/investor-alerts-bulletins/new-t1-settlement-cycle-what-investors-need-know-investor-bulletin
+    while settlement_date.weekday() in holidays.WEEKEND or settlement_date in holidays_in_last_year_and_next_year:
+        settlement_date += ONE_DAY
+    return settlement_date
+
+
+def get_outstanding_amount(cusip_df, batch_pricing=False):
+    '''Return the `outstanding_amount` of `cusip_df`. If `outstanding_amount` is missing, then return 
+    `max_amount_outstanding`. If both are missing, then return the missing value.'''
+    outstanding_amount = cusip_df['outstanding_amount']
+    outstanding_amount = outstanding_amount.fillna(cusip_df['max_amount_outstanding'])
+    return outstanding_amount.values[0] if not batch_pricing else outstanding_amount
+
+
+def get_feature_value(single_cusip_data: pd.Series | np.ndarray, feature: str):
+    '''`single_cusip_data` may be a `pd.Series` if the data is coming from point-in-time pricing, or it 
+    may be a `np.array` if it is coming directly from the redis.'''
+    if isinstance(single_cusip_data, np.ndarray): return single_cusip_data[REFERENCE_DATA_FEATURE_TO_INDEX[feature]]
+    if isinstance(single_cusip_data, pd.Series): return single_cusip_data[feature]
+    raise ValueError(f'single_cusip_data is of type: {type(single_cusip_data)} which is neither a `pd.Series` nor a `np.array`')
+
+
+def set_feature_value(single_cusip_data: pd.Series | np.ndarray, feature: str, value):
+    '''`single_cusip_data` may be a `pd.Series` if the data is coming from point-in-time pricing, or it 
+    may be a `np.array` if it is coming directly from the redis.'''
+    if isinstance(single_cusip_data, np.ndarray):
+        single_cusip_data[REFERENCE_DATA_FEATURE_TO_INDEX[feature]] = value
+    elif isinstance(single_cusip_data, pd.Series):
+        single_cusip_data[feature] = value
+    else:
+        raise ValueError(f'single_cusip_data is of type: {type(single_cusip_data)} which is neither a `pd.Series` nor a `np.array`')
+    return single_cusip_data
+
+
+def create_df_chunks(df: pd.DataFrame, num_chunks: int = os.cpu_count()) -> list:
+    '''Return a list of dataframes that were split from the original `df`.
+    NOTE: if desired to use a chunk_size, set the second argument of np.array_split(...) 
+    to `int(np.ceil(len(df) / chunk_size))`.'''
+    return np.array_split(df, num_chunks)    # https://numpy.org/doc/stable/reference/generated/numpy.array_split.html
+
+
+def create_tuple_chunks(tuples_list: list, num_chunks: int = os.cpu_count()) -> list:
+    '''Return a list of lists where each inner list is a chunk of the tuples in `tuples_list` and the 
+    total number of chunks is `num_chunks`.
+
+    >>> create_tuple_chunks([(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')], 2)    # splits evenly into two chunks
+    [[(1, 'a'), (2, 'b')], [(3, 'c'), (4, 'd')]]
+    >>> create_tuple_chunks([(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')], 3)    # non-even split into three chunks, with the last chunk having one element
+    [[(1, 'a'), (2, 'b')], [(3, 'c'), (4, 'd')], [(5, 'e')]]
+    >>> create_tuple_chunks([(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f')], 4)    # splits into four chunks with varying sizes
+    [[(1, 'a'), (2, 'b')], [(3, 'c')], [(4, 'd')], [(5, 'e'), (6, 'f')]]
+    >>> create_tuple_chunks([(1, 'a')], 1)    # single element list with one chunk
+    [[(1, 'a')]]
+    >>> create_tuple_chunks([], 3)    # empty list returns an empty list of chunks
+    []
+    '''
+    chunk_size = len(tuples_list) // num_chunks + (len(tuples_list) % num_chunks > 0)    # calculate chunk size by 1 if it does not evenly divide
+    return [tuples_list[i:i + chunk_size] for i in range(0, len(tuples_list), chunk_size)]
+
+
+def is_none_or_nan(item) -> bool:
+    return item is None or (isinstance(item, float) and np.isnan(item))    # using `np.isnan(...)` because `np.nan` is not equal to itself
+
+
+def is_valid_time_format(time_str: str, time_format: str = '%H:%M:%S') -> bool:
+    '''Check if `time_str` is in a valid time format represented by `time_format`.
+    
+    >>> is_valid_time_format('12:34:56')
+    True
+    >>> is_valid_time_format('25:00:00')
+    False
+    >>> is_valid_time_format('12:34')
+    False
+    >>> is_valid_time_format('12:34', '%H:%M')
+    True
+    >>> is_valid_time_format('2023-11-26 12:34:56', '%Y-%m-%d %H:%M:%S')
+    True
+    >>> is_valid_time_format('2023/11/26 12:34:56', '%Y-%m-%d %H:%M:%S')
+    False
+    >>> is_valid_time_format('00:00:00')
+    True
+    >>> is_valid_time_format('23:59:59')
+    True
+    >>> is_valid_time_format('23:60:00')
+    False
+    '''
+    if not isinstance(time_str, str): return False
+    try:
+        datetime.strptime(time_str, time_format)
+        return True
+    except ValueError:
+        return False
+
+
+def convert_64_bit_columns_to_32_bit(df: pd.DataFrame) -> pd.DataFrame:
+    '''Convert all columns that are `float64` to `float32` and `int64` to `int32`. Very fast
+    operation that significantly reduces space for large dataframes. Decided not to do 16-bit 
+    since `int16` only holds a maximum value of 32767 (whereas `int32` holds a maximum value 
+    greater than 2B) and `float16` only holds 3 decimal digits (whereas `float32` holds 7).
+    NOTE: this modifies the input `df`.
+    NOTE: currently unused because very little change in memory usage (< 5% using `df.memory_usage(deep=True).sum()`) 
+    and causes downstream rounding issues.'''
+    for column in df.select_dtypes(include=['float64', 'int64']):
+        dtype = df[column].dtype
+        if dtype == 'float64':
+            with warnings.catch_warnings():
+                warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+                df[column] = df[column].astype('float32')
+        elif dtype == 'int64':
+            with warnings.catch_warnings():
+                warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+                df[column] = df[column].astype('int32')
+    return df

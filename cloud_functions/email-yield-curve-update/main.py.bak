@@ -1,0 +1,119 @@
+'''
+Author: Developer Lim
+Date: 2023-05-12
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-07
+Description: The `offset` variable in the `get_overnight_change` function is used to get the value in the morning `offset` minutes after the market opens.
+             To run this cloud function locally, uncomment the credentials initialization in `auxiliary_functions.py` and set the appropriate email recipients in `email_functions.py`.
+'''
+import io
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from pandas.tseries.offsets import CustomBusinessDay
+from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday    # used to create a business day defined on the US federal holiday calendar that can be added or subtracted to a datetime
+from pytz import timezone
+
+from FiccYieldCurve import RealTimeYieldCurve
+from time_series_functions import exponential_mean, intraday_open_close, get_overnight_change
+from auxiliary_functions import date_format, plt_curves, plot_intraday_extremes, KEY_MATURITIES
+from email_functions import send_error_email_image
+
+pd.options.mode.chained_assignment = None    # default='warn'
+
+class USHolidayCalendarWithGoodFriday(USFederalHolidayCalendar):
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
+BUSINESS_DAY = CustomBusinessDay(calendar=USHolidayCalendarWithGoodFriday())    # used to skip over holidays when adding or subtracting business days
+
+
+def main(args):
+    current_datetime = datetime.now(tz=timezone('US/Eastern'))
+    print('Current datetime:', current_datetime)
+    one_business_day_before_today = (current_datetime - (BUSINESS_DAY * 1)).strftime(date_format)
+    two_business_days_before_today = (current_datetime - (BUSINESS_DAY * 2)).strftime(date_format)
+    today = current_datetime.strftime(date_format)
+    real_time_yield_curve = RealTimeYieldCurve(start_date=two_business_days_before_today)
+    real_time_yield_curve.initialize_data()
+    yield_curve_df = real_time_yield_curve.get_yield_curves().loc[one_business_day_before_today:]
+    original_cols = yield_curve_df.columns
+
+    after_business_hours = current_datetime.hour >= 16
+    cutoff_idx = -1 if after_business_hours else 0
+    cutoff = yield_curve_df.index[cutoff_idx]
+
+    header_suffix = 'Close' if after_business_hours else 'Open'
+    email_header = f'Ficc Real-time Yield Curve Report for {today} (Market {header_suffix})'
+
+    images = []
+    message = ''
+    rounding_figures = 1
+    
+    if after_business_hours:
+        # calculate and append intraday open-close
+        intraday_open_close_df = yield_curve_df.loc[one_business_day_before_today][KEY_MATURITIES].iloc[[-1], :]
+        intraday_open_close_delta = intraday_open_close(yield_curve_df).iloc[-1]
+        intraday_open_close_df = pd.concat([intraday_open_close_df, 
+                                            yield_curve_df.loc[today][KEY_MATURITIES].iloc[[0,-1], :],
+                                            yield_curve_df.loc[today][KEY_MATURITIES].apply(max, axis=0).to_frame().T,
+                                            yield_curve_df.loc[today][KEY_MATURITIES].apply(min, axis=0).to_frame().T,
+                                            intraday_open_close_delta.to_frame().T],
+                                           ignore_index=True)
+        
+        intraday_open_close_df.index = ['Previous Close', 'Open','Close', 'High', 'Low', 'Close-Open Delta']
+        
+        message += f'''
+        <p><b>Intraday Open, High, Low, Close:</b></p>
+        '''
+        message += f'<p>{np.round(intraday_open_close_df, rounding_figures).to_html(index=True, col_space=55, justify="left")}</p>'
+        
+        
+        # # calculate and append intraday SD
+        # intraday_sd_df = intraday_SD(yield_curve_df).iloc[[-1]]
+        # message += f'''
+        # <p><b>Intraday Standard Deviations:</b></p>
+        # '''
+        # message += f'<p>{np.round(intraday_sd_df, rounding_figures).to_html(index=False, col_space=50, justify="left")}</p>'   
+        
+        # Smoothing
+        lambda_parameter = 0.25
+        window_size = 15
+        weights = np.exp(lambda_parameter * np.arange(-window_size + 1, 1, 1))
+        yield_curve_df_smoothed = yield_curve_df.loc[today][original_cols].rolling(window_size, min_periods=1).apply(exponential_mean, args=(weights,))    # make the data smooth, otherwise, it is too jagged to interpret
+
+        # # calculate and append intraday extremes 
+        # intraday_extremes_df = intraday_largest_move(yield_curve_df).iloc[[-1]]
+        intraday_extremes_fig = plot_intraday_extremes(yield_curve_df_smoothed, today, False)
+        intraday_extremes_buf = io.BytesIO()
+        intraday_extremes_fig.savefig(intraday_extremes_buf, format='png')
+        intraday_extremes_buf.seek(0)
+        images.append(intraday_extremes_buf)
+        # message += f'''
+        # <p><b>Largest Intraday Move from Open to Market High/Low:</b></p>
+        # '''
+        # message += f'<p>{np.round(intraday_extremes_df, rounding_figures).to_html(index=False, col_space=50, justify="left")}</p>'
+        
+        # Add graph 
+        message += '<p><img src="cid:image1", width="850", height="800"></p>'
+        
+        open_close_fig = plt_curves(yield_curve_df.loc[today].iloc[[0,-1],:].drop('date',axis=1), False, return_figure=True)
+        message += f'''
+        <p><b>Real-time Yield Curve Movement Today:</b></p>
+        '''
+        message += '<p><img src="cid:image2", width="850", height="500"></p>'
+    else:
+        offset = 30    # used to get the value in the morning `offset` minutes after the market opens
+        open_close_df, overnight_deltas = get_overnight_change(yield_curve_df, one_business_day_before_today, today, offset=offset)
+        open_close_fig = plt_curves(open_close_df, False, return_figure=True)
+        message += f'''
+        <p><b>Real-time Yield Curve Movement (Overnight with a {offset} minute delay after market open):</b></p>
+        '''
+        message += f'<p>{np.round(overnight_deltas, rounding_figures).to_html(index=True, col_space=50, justify="left")}</p>'
+        message += '<p><img src="cid:image1", width="800", height="500"</p>'
+
+    open_close_buf = io.BytesIO()
+    open_close_fig.savefig(open_close_buf, format='png')
+    open_close_buf.seek(0)
+    images.append(open_close_buf)
+
+    send_error_email_image(email_header, message, images, cutoff)
+    return 'Success'

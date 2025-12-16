@@ -1,0 +1,27 @@
+'''
+'''
+import numpy as np
+
+from modules.ficc.utils.auxiliary_functions import sqltodf, cache_output
+from modules.ficc.utils.nelson_siegel_model import get_duration
+
+
+def get_treasury_rate(client, treasury_rate_df=None):
+    query = '''SELECT * FROM `eng-reactor-287421.treasury_yield.daily_yield_rate` order by Date desc'''
+    treasury_rate_df = sqltodf(query, client)
+    treasury_rate_df.set_index('Date', drop=True, inplace=True)
+    treasury_rate_df = treasury_rate_df[~treasury_rate_df.index.duplicated(keep='first')]
+    return treasury_rate_df
+
+
+@cache_output
+def current_treasury_rate(trade, current_datetime, treasury_rate_df):
+    '''`current_datetime` is used solely for caching.'''
+    treasury_maturities = np.array([1, 2, 3, 5, 7, 10, 20, 30])
+    duration = get_duration(trade)
+    maturity = min(treasury_maturities, key=lambda year: abs(year - duration))
+    maturity = 'year_' + str(maturity)
+    # t_rate = treasury_rate_df.iloc[treasury_rate_df.index.get_loc(trade['trade_date'], method='backfill')][maturity]
+    treasury_rate_df_idx = treasury_rate_df.index.get_indexer([trade['trade_date'].date()], method='backfill')[0]    # use `.get_indexer(...)` instead of `.get_loc(...)` to get rid of `FutureWarning: Passing method to Index.get_loc is deprecated and will raise in a future version.`; use `.date()` to get rid of `FutureWarning: Comparison of Timestamp with datetime.date is deprecated in order to match the standard library behavior`
+    t_rate = treasury_rate_df.iloc[treasury_rate_df_idx][maturity]
+    return t_rate

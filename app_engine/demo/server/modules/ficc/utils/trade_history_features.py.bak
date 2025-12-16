@@ -1,0 +1,128 @@
+'''
+Author: Developer Ray
+Date: 2024-02-28
+Last Editor: Developer Ray
+Last Edit Date: 2025-03-03
+'''
+import numpy as np
+
+from modules.ficc.utils.auxiliary_functions import cache_output
+
+
+TTYPE_DICT = {(0, 0): 'D', 
+              (0, 1): 'S', 
+              (1, 0): 'P'}
+
+VARIANTS = ['max_qty', 'min_ago', 'D_min_ago', 'P_min_ago', 'S_min_ago']
+YS_VARIANTS = ['max_ys', 'min_ys'] + VARIANTS
+DP_VARIANTS = ['max_dp', 'min_dp'] + VARIANTS
+
+FEATURES = ['_ttypes', '_ago', '_qdiff']
+YS_FEATURES = ['_ys'] + FEATURES
+DP_FEATURES = ['_dp'] + FEATURES
+
+
+def _get_trade_history_derived_features(features, variants) -> list:
+    return [prefix + suffix for prefix in variants for suffix in features]
+
+
+def get_trade_history_derived_features_for_ys_model() -> list:
+    '''This function is used to create a list of features derived from the trade history for any model that predicts yield spread.'''
+    return _get_trade_history_derived_features(YS_FEATURES, YS_VARIANTS)
+
+
+def get_trade_history_derived_features_for_dp_model() -> list:
+    '''This function is used to create a list of features derived from the trade history for any model that predicts dollar price.'''
+    return _get_trade_history_derived_features(DP_FEATURES, DP_VARIANTS)
+
+
+def extract_feature_from_trade(row, name, trade, use_treasury_spread: bool) -> list:    # `name` is used for debugging
+    '''Assumes that the treasury spread is at index 1, so if `use_treasury_spread` is `True`, then increment all indices greater 
+    than or equal to 1, by 1.'''
+    treasury_spread_increment = 1 if use_treasury_spread else 0
+    yield_spread_or_dollar_price = trade[0]
+    ttypes = TTYPE_DICT[(trade[2 + treasury_spread_increment], trade[3 + treasury_spread_increment])] + row.trade_type
+    seconds_ago = trade[4 + treasury_spread_increment]
+    quantity_diff = np.log10(1 + np.abs(10**trade[1 + treasury_spread_increment] - 10**row.quantity))
+    return [yield_spread_or_dollar_price, ttypes, seconds_ago, quantity_diff]
+
+
+@cache_output
+def create_trade_history_dict(row, current_datetime, ys_or_dp: str) -> dict:
+    '''Return dictionary containing cumulative properities of the trade history. `current_datetime` is used 
+    solely for caching. Assumes that the treasury spread is at index 1, so if `ys_or_dp` equals 'ys', then 
+    increment all indices greater than or equal to 1, by 1.'''
+    assert ys_or_dp in ('ys', 'dp'), f'`ys_or_dp` must be either "ys" or "dp" but is: "{ys_or_dp}"'
+    treasury_spread_increment = 1 if ys_or_dp == 'ys' else 0
+    ys_or_dp_idx = 0
+    quantity_idx = 1 + treasury_spread_increment
+    seconds_ago_idx = 4 + treasury_spread_increment
+
+    trade_history = row.trade_history if ys_or_dp == 'ys' else row.trade_history_dollar_price
+    most_recent_trade = trade_history[0]    # trade history is ordered newest to oldest
+    
+    # initialize all features with the most recent trade
+    D_min_ago_t, P_min_ago_t, S_min_ago_t = most_recent_trade, most_recent_trade, most_recent_trade
+    D_min_ago, P_min_ago, S_min_ago = 9, 9, 9
+
+    max_ys_or_dp_t, min_ys_or_dp_t = most_recent_trade, most_recent_trade
+    max_ys_or_dp, min_ys_or_dp = most_recent_trade[ys_or_dp_idx], most_recent_trade[ys_or_dp_idx]
+
+    max_qty_t = most_recent_trade
+    max_qty = most_recent_trade[quantity_idx]
+    min_ago_t = most_recent_trade
+    min_ago = most_recent_trade[seconds_ago_idx]
+    
+    for trade in trade_history:
+        seconds_ago = trade[seconds_ago_idx]
+        if seconds_ago == 0: continue    # check if the trade in the history is from the same block as the current trade
+
+        if trade[ys_or_dp_idx] > max_ys_or_dp:
+            max_ys_or_dp_t = trade
+            max_ys_or_dp = trade[ys_or_dp_idx]
+        elif trade[ys_or_dp_idx] < min_ys_or_dp:
+            min_ys_or_dp_t = trade
+            min_ys_or_dp = trade[ys_or_dp_idx]
+        
+        if trade[quantity_idx] > max_qty:
+            max_qty_t = trade
+            max_qty = trade[quantity_idx]
+        
+        if seconds_ago < min_ago:
+            min_ago_t = trade
+            min_ago = seconds_ago
+        
+        side = TTYPE_DICT[(trade[2 + treasury_spread_increment], trade[3 + treasury_spread_increment])]
+        if side not in ('D', 'P', 'S'):
+            print(f'Side must be "D", "P", or "S", but is instead: {side}. Trade: {trade}')
+            continue
+
+        if side == 'D' and seconds_ago < D_min_ago: 
+            D_min_ago_t = trade
+            D_min_ago = seconds_ago
+        elif side == 'P' and seconds_ago < P_min_ago:
+            P_min_ago_t = trade
+            P_min_ago = seconds_ago
+        elif side == 'S' and seconds_ago < S_min_ago:
+            S_min_ago_t = trade
+            S_min_ago = seconds_ago
+    
+    trade_history_dict = {f'max_{ys_or_dp}': max_ys_or_dp_t,
+                          f'min_{ys_or_dp}': min_ys_or_dp_t,
+                          'max_qty': max_qty_t,
+                          'min_ago': min_ago_t,
+                          'D_min_ago': D_min_ago_t,
+                          'P_min_ago': P_min_ago_t,
+                          'S_min_ago': S_min_ago_t}
+    return trade_history_dict
+
+
+def trade_history_derived_features(row, current_datetime, ys_or_dp: str) -> list:
+    '''`current_datetime` is used solely for caching.'''
+    assert ys_or_dp in ('ys', 'dp'), f'`ys_or_dp` must be either "ys" or "dp" but is: "{ys_or_dp}"'
+    trade_history_dict = create_trade_history_dict(row, current_datetime, ys_or_dp)
+    variants = YS_VARIANTS if ys_or_dp == 'ys' else DP_VARIANTS
+    feature_list = []
+    for variant in variants:
+        feature_list.extend(extract_feature_from_trade(row, variant, trade_history_dict[variant], ys_or_dp == 'ys'))
+    return feature_list

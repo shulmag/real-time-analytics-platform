@@ -1,0 +1,12 @@
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/libsemver-111e28c133331b39.rmeta: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/backport.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/display.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/eval.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/identifier.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/impls.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/parse.rs
+
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/semver-111e28c133331b39.d: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/backport.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/display.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/error.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/eval.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/identifier.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/impls.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/parse.rs
+
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/lib.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/backport.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/display.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/error.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/eval.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/identifier.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/impls.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/semver-1.0.24/src/parse.rs:

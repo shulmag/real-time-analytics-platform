@@ -1,0 +1,605 @@
+/*
+ * @Date: 2025-03-06
+ */
+
+import React, { useState, useRef } from 'react';
+import axios from 'axios';
+
+// Bootstrap & Icon Imports
+import 'bootstrap/dist/css/bootstrap.min.css';
+import 'bootstrap-icons/font/bootstrap-icons.css';
+
+// Component Imports
+import DashboardHeader from './components/DashboardHeader';
+import AboutSection from './components/AboutSection';
+import FiccBanner from './components/FiccBanner';
+import Ticker from "./components/Ticker";
+import BlockchainPrices from './components/BlockchainPrices';
+import FeeConfirmationModal from './components/FeeConfirmationModal';
+import EulaModal from './components/EulaModal';
+import WalletErrorMessage from './components/WalletErrorMessage';
+import MostActiveCusipBadge from './components/MostActiveCusipBadge';
+
+// Stellar / Freighter Imports
+import * as freighter from '@stellar/freighter-api';
+import { isConnected, requestAccess, getAddress } from '@stellar/freighter-api';
+
+// API Configuration
+export const API_BASE_URL = 'https://blockchain-964018767272.us-central1.run.app';
+// export const API_BASE_URL = 'http://localhost:5001';
+
+const API_ENDPOINTS = {
+  GET_PRICE: (cusip) => `${API_BASE_URL}/get_price/${cusip}`,
+  UPDATE_PRICE: `${API_BASE_URL}/get_and_update_price`,
+  PREPARE_PRICE_UPDATE: `${API_BASE_URL}/prepare_price_update`,
+  SUBMIT_TRANSACTION: `${API_BASE_URL}/submit_transaction`
+};
+
+// Available trade type options
+const TRADE_TYPE_OPTIONS = [
+  { key: 'D', text: 'Inter-Dealer' },
+  { key: 'P', text: 'Bid Side' },  // Purchase from Customer
+  { key: 'S', text: 'Offered Side' }, // Sale to Customer
+];
+
+// Add this import at the top with your other CSS imports
+// import './styles/mobile.css';
+import './App.css';
+
+// Add import at the top
+import { formatDateET } from './utils/dateUtils';
+
+function App() {
+  // -------------------------------
+  // State Hooks
+  // -------------------------------
+  const [cusip, setCusip] = useState('13063D7Q5');  // Default CUSIP
+  const [quantity, setQuantity] = useState('100');  // Default quantity of 100
+  const [tradeType, setTradeType] = useState('S');
+  const [apiResult, setApiResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [walletError, setWalletError] = useState(null);
+
+  // Stellar-specific states
+  const [stellarAccount, setStellarAccount] = useState(null);
+  const [estimatedFees, setEstimatedFees] = useState(null);
+  const [showFeeConfirmation, setShowFeeConfirmation] = useState(false);
+  const [transactionXdr, setTransactionXdr] = useState(null);
+  const [priceData, setPriceData] = useState(null);
+
+  // Additional form states for displayed price & yield (if needed in future)
+  const [price, setPrice] = useState('');
+  const [yieldValue, setYieldValue] = useState('');
+
+  const [eulaAccepted, setEulaAccepted] = useState(
+    localStorage.getItem('eulaAccepted') === 'true'
+  );
+
+  // Reference to the AboutSection component
+  const aboutSectionRef = useRef(null);
+
+  // Function to expand the AboutSection
+  const handleHowItWorksClick = () => {
+    if (aboutSectionRef.current) {
+      aboutSectionRef.current.expand();
+    }
+  };
+
+  console.log('Freighter library:', freighter); // Keeps track of Freighter library loading
+
+  
+  function timeoutPromise(ms) {
+    return new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Connection request timed out')), ms);
+    });
+  }
+  
+  /**
+   * Modified wallet connection function with timeout
+   */
+  async function handleConnectWallet() {
+    
+    try {
+      let connected = await isConnected();
+      console.log("Connected status:", connected);
+  
+      if (!connected.isConnected) {
+        console.log("Not connected, requesting access with timeout...");
+        try {
+          // Race between the access request and a 1-second timeout
+          const accessResult = await Promise.race([
+            requestAccess(),
+            timeoutPromise(1000) // 1 second timeout
+          ]);
+          
+          if (accessResult.address == "") {
+            setWalletError("Please log in to Freighter Wallet.");
+          } else {
+            setStellarAccount(accessResult.address);
+          }
+        } catch (accessErr) {
+          console.error("Access request failed:", accessErr);
+          
+          if (accessErr.message === 'Connection request timed out') {
+            setWalletError({
+              type: 'timeout',
+              message: "Wallet connection timed out"
+            });
+          } else {
+            setWalletError(`Wallet connection failed: ${accessErr.message}`);
+          }
+        }
+      } else {
+        console.log("Connected, checking if allowed...");
+        const allowedResult = await freighter.isAllowed();
+        console.log("isAllowed returned:", allowedResult);
+  
+        if (!allowedResult.isAllowed) {
+          console.log("Not allowed, setting allowed...");
+          const setAllowedResult = await freighter.setAllowed();
+          console.log("setAllowed returned:", setAllowedResult);
+        }
+  
+        const addressResult = await getAddress();
+        console.log("getAddress returned:", addressResult);
+        if (addressResult.address == "") {
+          setWalletError("Please log in to Freighter Wallet.");
+        } else {
+          setStellarAccount(addressResult.address);
+        }
+      }
+    } catch (err) {
+      console.error("Connection error:", err);
+      setWalletError(`Wallet connection failed: ${err.message}`);
+    }
+  }
+  
+
+  
+  /**
+   * handleSearchBlockchain
+   * -----------------------
+   * Fetches price data from the blockchain or server for the given CUSIP.
+   * - Uses the GET_PRICE endpoint.
+   * - Stores result in `apiResult`.
+   * - Handles loading and error states.
+   */
+  function handleSearchBlockchain() {
+    setLoading(true);
+    setError(null);
+
+    axios
+      .get(API_ENDPOINTS.GET_PRICE(cusip))
+      .then((response) => {
+        setApiResult(response.data);
+      })
+      .catch((err) => {
+        setError(err.response?.data?.message || 'Error connecting to server');
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  }
+
+  /**
+   * handleGetAndUpdatePrice
+   * ------------------------
+   * Prepares a price update transaction on the blockchain.
+   * - Checks for a connected wallet first.
+   * - Calls the PREPARE_PRICE_UPDATE endpoint with relevant trade data.
+   * - If successful, it shows the fee confirmation modal.
+   */
+  async function handleGetAndUpdatePrice() {
+    if (!stellarAccount) {
+      setError("Please connect your wallet first");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const prepareResponse = await axios.post(API_ENDPOINTS.PREPARE_PRICE_UPDATE, {
+        public_key: stellarAccount,
+        cusip,
+        trade_amount: parseInt(quantity, 10),
+        trade_type: tradeType
+      });
+
+      console.log("Prepare response:", prepareResponse.data); // Full response debug log
+
+      if (prepareResponse.data.status === 'success') {
+        console.log("Fee data:", prepareResponse.data.estimated_fees); // Debug log
+        setEstimatedFees(prepareResponse.data.estimated_fees);
+        setTransactionXdr(prepareResponse.data.transaction_xdr);
+        setPriceData(prepareResponse.data.price_data);
+        setShowFeeConfirmation(true);
+      } else {
+        throw new Error(prepareResponse.data.error || 'Failed to prepare transaction');
+      }
+    } catch (err) {
+      console.error('Error preparing transaction:', err);
+      setError(err.response?.data?.error || err.message || 'Error preparing transaction');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /**
+   * handleTransactionConfirm
+   * ------------------------
+   * Confirms and signs the prepared transaction using Freighter.
+   * - Retrieves network passphrase from Freighter.
+   * - Signs the transaction XDR.
+   * - Submits the signed XDR to the SUBMIT_TRANSACTION endpoint.
+   * - Updates UI with the new price data if successful.
+   */
+  async function handleTransactionConfirm() {
+    setLoading(true);
+    try {
+      console.log("About to sign transaction:", transactionXdr);
+
+      const networkInfo = await freighter.getNetwork();
+      console.log("Current network:", networkInfo);
+
+      const signResult = await freighter.signTransaction(
+        transactionXdr,
+        { networkPassphrase: networkInfo.networkPassphrase }
+      );
+
+      console.log("Sign result:", signResult);
+
+      if (!signResult.signedTxXdr) {
+        throw new Error("Failed to get signed transaction from Freighter");
+      }
+
+      // Submit to network with COMPLETE price data
+      const response = await axios.post(API_ENDPOINTS.SUBMIT_TRANSACTION, {
+        signed_xdr: signResult.signedTxXdr,
+        price_data: {
+          price: priceData.price,
+          yield_value: priceData.yield,  // Map 'yield' to 'yield_value'
+          cusip: cusip,
+          trade_amount: parseInt(quantity, 10),
+          trade_type: tradeType
+        }
+      });
+
+      console.log("Submit response:", response.data);
+
+      if (response.data.status === 'success') {
+        setApiResult({
+          cusip: cusip,
+          history: [
+            {
+              timestamp: Math.floor(Date.now() / 1000),
+              price: priceData.price,
+              trade_amount: parseInt(quantity, 10),
+              trade_type: tradeType,
+              yield_value: priceData.yield,
+              transaction_hash: response.data.transaction_hash
+            }
+          ]
+        });
+        setShowFeeConfirmation(false);
+      } else {
+        throw new Error(response.data.error || 'Transaction failed');
+      }
+    } catch (err) {
+      console.error('Transaction error:', err);
+      setError(`Transaction failed: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleEulaAccept = () => {
+    setEulaAccepted(true);
+    localStorage.setItem('eulaAccepted', 'true');
+  };
+
+  /**
+   * Render
+   * ------
+   * The main UI layout:
+   * - DashboardHeader for wallet connection.
+   * - Form for entering CUSIP, quantity, and trade type.
+   * - Buttons to search and update the price.
+   * - Conditionals showing loading, error messages, or results.
+   * - Fee confirmation modal if needed.
+   * - Ticker and BlockchainPrices components.
+   */
+  return (
+    <div className="min-vh-100 d-flex flex-column">
+      <DashboardHeader 
+        isWalletConnected={!!stellarAccount}
+        onConnectWallet={handleConnectWallet}
+        walletAddress={stellarAccount ? 
+          `${stellarAccount.slice(0, 4)}...${stellarAccount.slice(-4)}` : 
+          ''}
+        onHowItWorksClick={handleHowItWorksClick}
+      />
+
+      <main className="flex-grow-1 py-4">
+        <div className="container px-2 px-sm-3 px-md-4">
+          <div className="row justify-content-center">
+            <div className="col-lg-10">
+              {/* Banner with proper spacing */}
+              <div className="mb-4">
+                <FiccBanner />
+              </div>
+              
+              <AboutSection ref={aboutSectionRef} />
+              
+              {/* Form Card */}
+              <div className="card shadow-sm mb-4">
+                <div className="card-header bg-light">
+                  <h5 className="card-title mb-0">Municipal Bond Price Information</h5>
+                </div>
+                
+                <div className="card-body">
+                  <WalletErrorMessage 
+                    error={walletError} 
+                    isConnected={!!stellarAccount} 
+                  />
+
+                  <div className="row g-3">
+                    {/* CUSIP Input with explanation - full width on mobile */}
+                    <div className="col-12 col-md-6">
+                      <label htmlFor="cusipInput" className="form-label">
+                        CUSIP
+                        <i className="bi bi-info-circle ms-2" title="9-character identifier for the municipal bond"></i>
+                      </label>
+                      <input
+                        id="cusipInput"
+                        type="text"
+                        className="form-control"
+                        style={{ fontSize: '0.9rem' }}
+                        placeholder="Enter 9-character CUSIP"
+                        value={cusip}
+                        onChange={(e) => setCusip(e.target.value)}
+                      />
+                      <div className="form-text">
+                        <small>9-character identifier for municipal bonds</small>
+                        <br />
+                        <a 
+                          href="https://emma.msrb.org/" 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="text-primary"
+                        >
+                          <small>Find your local bonds on EMMA <i className="bi bi-box-arrow-up-right"></i></small>
+                        </a>
+                      </div>
+                    </div>
+
+                    {/* Quantity Input with explanation - full width on mobile */}
+                    <div className="col-12 col-md-6">
+                      <label htmlFor="quantityInput" className="form-label">
+                        Quantity
+                        <i className="bi bi-info-circle ms-2" title="Number of bonds"></i>
+                      </label>
+                      <input
+                        id="quantityInput"
+                        type="number"
+                        className="form-control"
+                        style={{ fontSize: '0.9rem' }}
+                        placeholder="Enter quantity in thousands"
+                        value={quantity}
+                        onChange={(e) => setQuantity(e.target.value)}
+                        min="5"
+                        step="5"
+                        inputMode="numeric"
+                      />
+                      <div className="form-text">
+                        <small>In thousands (e.g., 100 = $100,000). Must be multiples of 5.</small>
+                      </div>
+                    </div>
+
+                    {/* Move MostActiveCusipBadge outside the columns */}
+                    <div className="col-12 mt-2">
+                      <div className="px-0">
+                        <MostActiveCusipBadge 
+                          onSelectCusip={(selectedCusip) => setCusip(selectedCusip)} 
+                          className="mt-2"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Trade Type Selector */}
+                    <div className="col-12">
+                      <label htmlFor="tradeTypeSelect" className="form-label">Trade Type</label>
+                      <select
+                        id="tradeTypeSelect"
+                        className="form-select"
+                        value={tradeType}
+                        onChange={(e) => setTradeType(e.target.value)}
+                      >
+                        {TRADE_TYPE_OPTIONS.map((option) => (
+                          <option key={option.key} value={option.key}>
+                            {option.text}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="col-12 d-grid gap-2">
+                      {/* Get Live Price Button (primary action) */}
+                      <button
+                        className="btn btn-primary btn-lg"
+                        onClick={handleGetAndUpdatePrice}
+                        disabled={loading || !cusip || !quantity || !stellarAccount}
+                      >
+                        {loading ? (
+                          <span
+                            className="spinner-border spinner-border-sm me-2"
+                            role="status"
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <i className="bi bi-graph-up-arrow me-2"></i>
+                        )}
+                        Get Live Price
+                      </button>
+                      
+                      <div className="alert alert-light mb-0">
+                        <i className="bi bi-info-circle me-2"></i>
+                        <small>To view existing prices, use the "Search Blockchain" option in the Latest Blockchain Prices section below.</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Loading Indicator */}
+              {loading && (
+                <div className="text-center my-4">
+                  <div className="spinner-border text-primary" role="status">
+                    <span className="visually-hidden">Loading...</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Error Alert */}
+              {error && (
+                <div className="alert alert-danger" role="alert">
+                  <i className="bi bi-exclamation-triangle me-2"></i>
+                  {error}
+                </div>
+              )}
+
+              {/* Results Table */}
+              {apiResult && (
+                <div className="card shadow-sm mb-4">
+                  <div className="card-header bg-light">
+                    <h5 className="card-title mb-0">
+                      Search Results for {apiResult.cusip}
+                    </h5>
+                  </div>
+                  <div className="card-body">
+                    <div className="table-responsive">
+                      <table className="table table-striped table-hover">
+                        <thead>
+                          <tr>
+                            <th>Timestamp</th>
+                            <th>Price</th>
+                            <th>Amount</th>
+                            <th>Trade Type</th>
+                            <th>Yield</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {/* If the history array is present, we map over it */}
+                          {apiResult.history ? (
+                            apiResult.history.map((item) => (
+                              <tr key={item.transaction_hash || Math.random()}>
+                                <td>
+                                  {formatDateET(item.timestamp)}
+                                </td>
+                                <td>
+                                  $
+                                  {item.price?.toFixed(3) || 'N/A'}
+                                </td>
+                                <td>
+                                  {item.trade_amount?.toLocaleString() || 'N/A'}
+                                </td>
+                                <td>
+                                  {item.trade_type
+                                    ? TRADE_TYPE_OPTIONS.find(
+                                        (opt) => opt.key === item.trade_type
+                                      )?.text || item.trade_type
+                                    : 'N/A'}
+                                </td>
+                                <td>
+                                  {item.yield_value
+                                    ? `${item.yield_value.toFixed(3)}%`
+                                    : 'N/A'}
+                                </td>
+                              </tr>
+                            ))
+                          ) : (
+                            // If no history, display single data row
+                            <tr>
+                              <td>{formatDateET(Date.now() / 1000)}</td>
+                              <td>
+                                {apiResult.stored_data?.price != null
+                                  ? `$${apiResult.stored_data.price.toFixed(3)}`
+                                  : 'N/A'}
+                              </td>
+                              <td>
+                                {apiResult.stored_data?.amount != null
+                                  ? apiResult.stored_data.amount.toLocaleString()
+                                  : 'N/A'}
+                              </td>
+
+                              <td>
+                                {apiResult.stored_data?.trade_type
+                                  ? TRADE_TYPE_OPTIONS.find(
+                                      (opt) => opt.key === apiResult.stored_data.trade_type
+                                    )?.text || apiResult.stored_data.trade_type
+                                  : 'N/A'}
+                              </td>
+                              <td>
+                                {apiResult.stored_data?.yield != null
+                                  ? `${apiResult.stored_data.yield.toFixed(3)}%`
+                                  : 'N/A'}
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+
+              {/* Displays a paged list of blockchain prices */}
+              <BlockchainPrices 
+                initialLimit={10} 
+                onSearchResult={(result) => {
+                  setApiResult(result);
+                  // Optionally scroll to the results section if it exists
+                  setTimeout(() => {
+                    const resultsElement = document.getElementById('search-results');
+                    if (resultsElement) {
+                      resultsElement.scrollIntoView({ behavior: 'smooth' });
+                    }
+                  }, 100);
+                }}
+              />
+
+              {/* Ticker */}
+              <div className="card mt-4 mb-4">
+                <div className="card-body p-0">
+                  <Ticker updateInterval={600000} />
+                </div>
+              </div>
+              
+              {/* Documentation Section - Removed as requested */}
+            </div>
+          </div>
+        </div>
+      </main>
+
+      {/* Fee Confirmation Modal */}
+      <FeeConfirmationModal
+        show={showFeeConfirmation}
+        fees={estimatedFees}
+        priceData={priceData}
+        onConfirm={handleTransactionConfirm}
+        onCancel={() => setShowFeeConfirmation(false)}
+        isLoading={loading}
+      />
+
+      <EulaModal 
+        show={!eulaAccepted} 
+        onAccept={handleEulaAccept} 
+      />
+    </div>
+  );
+}
+
+export default App;

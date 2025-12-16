@@ -1,0 +1,199 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "d634abfc",
+   "metadata": {},
+   "source": [
+    "## Create trade history for issueplus or minus a given number of maturity-years. \n",
+    "Written by Jesse Watson 04-17-2024\n",
+    "\n",
+    "Last updated by Developer 06-18-2025\n",
+    "\n",
+    "This notebook creates views with histories of trades for CUSIPs in the same issue with similar coupons and similar maturties.  The hope is that these trades will help accuracy for illiquid CUSIPs where there is a trade for a similar CUSIP. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "fefb022c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "from google.cloud import bigquery\n",
+    "\n",
+    "\n",
+    "os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/user/base/ficc/creds.json'\n",
+    "bq_client = bigquery.Client()\n",
+    "\n",
+    "project = 'eng-reactor-287421'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "291ed5d3",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def mkview(dataset, name, sql):\n",
+    "    db = f'{project}.{dataset}.'\n",
+    "    print(sql)\n",
+    "    name = db + name\n",
+    "    bq_client.delete_table(name, not_found_ok=True) \n",
+    "    view = bigquery.Table(name)\n",
+    "    view.view_query = sql\n",
+    "    view = bq_client.create_table(view)\n",
+    "    return name"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "107129fd",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def sqltodf(sql, limit=''):\n",
+    "    if limit != '': \n",
+    "        limit = f' ORDER BY RAND() LIMIT {limit}'\n",
+    "    bqr = bq_client.query(sql + limit).result()\n",
+    "    return bqr.to_dataframe()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "56089c0b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trans_with_buckets = mkview('auxiliary_views_v2', 'trans_with_buckets',\n",
+    "  f'''SELECT *, \n",
+    "  CONCAT(CAST(issue_key AS STRING), '_', CAST(maturity_bucket AS STRING), '_', CAST(coupon_bucket AS STRING)) AS issue_mat_coup_key \n",
+    "  from (SELECT \n",
+    "  CAST(TRUNC(DATE_DIFF(maturity_date,trade_date, day)/360) / 5 AS INT64) AS maturity_bucket,\n",
+    "  CAST(TRUNC(DATE_DIFF(calc_date,trade_date, day)/360) / 5 AS INT64) AS calc_date_bucket,\n",
+    "  CASE\n",
+    "    WHEN coupon = 0 THEN -1 --arbitrary value\n",
+    "  ELSE\n",
+    "  CAST( TRUNC(coupon/1) AS int64)\n",
+    "END\n",
+    "  AS coupon_bucket,\n",
+    "  *\n",
+    "    FROM eng-reactor-287421.auxiliary_views_v2.msrb_trans)''')\n",
+    "\n",
+    "print(trans_with_buckets)                             "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "0a34b1c9",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_same_issue_5_yr_mat_bucket_1_coupon = mkview('auxiliary_views_v2', 'trade_history_same_issue_5_yr_mat_bucket_1_coupon',\n",
+    "f'''\n",
+    " SELECT\n",
+    "        latest.rtrs_control_number,\n",
+    "        latest.publish_datetime,\n",
+    "        latest.sequence_number as seq_num,\n",
+    "        ARRAY_AGG(STRUCT (past.msrb_valid_from_date, past.msrb_valid_to_date,past.rtrs_control_number, past.trade_datetime, past.publish_datetime,\n",
+    "                         past.yield, past.dollar_price, past.par_traded, past.trade_type,\n",
+    "                   datetime_diff(latest.trade_datetime,past.trade_datetime, second) as seconds_ago, past.is_non_transaction_based_compensation,\n",
+    "                        past.is_lop_or_takedown, past.brokers_broker, past.is_alternative_trading_system, past.is_weighted_average_price, past.settlement_date,\n",
+    "                        past.calc_date,past.calc_day_cat,past.coupon, past.maturity_date, past.next_call_date, past.par_call_date,past.refund_date, latest.rtrs_control_number as current_rtrs_control_number, latest.par_traded - past.par_traded as par_traded_diff,\n",
+    "      concat(past.trade_type,latest.trade_type) as trade_type_past_latest)\n",
+    "                ORDER BY past.trade_datetime DESC, past.publish_datetime DESC, past.sequence_number   LIMIT 10\n",
+    "              ) AS recent_5_year_mat\n",
+    "    FROM {trans_with_buckets} latest\n",
+    "    LEFT JOIN {trans_with_buckets}  past\n",
+    "        ON\n",
+    "        latest.issue_key = past.issue_key\n",
+    "        AND latest.cusip <> past.cusip \n",
+    "        AND past.msrb_valid_to_date > current_datetime('America/New_York') \n",
+    "        AND (past.transaction_type <> 'C' or past.transaction_type is null) \n",
+    "        --AND latest.trade_datetime > past.trade_datetime #12-20 Jesse and Developer next line instead\n",
+    "        AND latest.trade_datetime > past.publish_datetime\n",
+    "        AND latest.maturity_bucket = past.maturity_bucket\n",
+    "        AND latest.coupon_bucket = past.coupon_bucket\n",
+    "    GROUP BY latest.rtrs_control_number, latest.publish_datetime, latest.sequence_number\n",
+    "''')\n",
+    "\n",
+    "print(trade_history_same_issue_5_yr_mat_bucket_1_coupon)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "7d95e47a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "trade_history_ref_data_same_issue_plus_5_yr_mat_bucket_1_coupon = mkview('auxiliary_views_v2', 'trade_history_ref_data_same_issue_5_yr_mat_bucket_1_coupon',\n",
+    "f'''\n",
+    " SELECT\n",
+    "      thrd.*,\n",
+    "      latest.* EXCEPT (publish_datetime,\n",
+    "        rtrs_control_number, seq_num)\n",
+    "    FROM eng-reactor-287421.primary_views_v2.trade_history_with_reference_data thrd\n",
+    "    LEFT JOIN\n",
+    "      {trade_history_same_issue_5_yr_mat_bucket_1_coupon} latest\n",
+    "    ON\n",
+    "      thrd.rtrs_control_number = latest.rtrs_control_number\n",
+    "      AND thrd.publish_datetime = latest.publish_datetime\n",
+    "      --AND thrd.sequence_number = latest.seq_num\n",
+    "\n",
+    "''')\n",
+    "\n",
+    "print(trade_history_ref_data_same_issue_plus_5_yr_mat_bucket_1_coupon)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "77687a0a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sqltodf(f'''CREATE OR REPLACE TABLE\n",
+    "  auxiliary_views_v2.trade_history_same_issue_5_yr_mat_bucket_1_materialized AS\n",
+    "SELECT\n",
+    "*\n",
+    "FROM\n",
+    "eng-reactor-287421.auxiliary_views_v2.trade_history_ref_data_same_issue_5_yr_mat_bucket_1_coupon''')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f3b5907f-2faa-40d4-be2b-2205a6d4aba8",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.9.6"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

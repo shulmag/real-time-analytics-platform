@@ -1,0 +1,135 @@
+'''
+Author: Developer Ray
+Date: 2023-04-05
+Last Editor: Developer Ray
+Last Edit Date: 2023-01-03
+'''
+import time
+from datetime import timedelta
+import smtplib
+from email.mime.text import MIMEText
+
+
+FAILURE_EMAIL_RECIPIENTS = ['eng@ficc.ai']    # ['ficcteam@ficc.ai']
+SUCCESS_EMAIL_RECIPIENTS = ['eng@ficc.ai']
+
+
+def run_tests(tests_to_run, print_time_per_test=False):
+    tests_run = []
+    if print_time_per_test: time_per_test = []    # stores the time taken to run each test
+    try:
+        start_time = time.time()
+        for test in tests_to_run:
+            tests_run.append(test.__name__)
+            if print_time_per_test: test_start_time = time.time()
+            test()
+            if print_time_per_test: time_per_test.append(round(time.time() - test_start_time, 2))
+        return (timedelta(seconds=time.time() - start_time), tests_run, time_per_test) if print_time_per_test else (timedelta(seconds=time.time() - start_time), tests_run)
+    except AssertionError as e:
+        return timedelta(seconds=time.time() - start_time), f'{tests_run[-1]} failed: {e}'
+    except Exception as e:
+        return timedelta(seconds=time.time() - start_time), f'Error in implementation of {tests_run[-1]}: {e}'
+
+
+def test_individual_pricing_succeeds():
+    from test_individual_pricing_succeeds import test_64971XQM3_all_trade_types, test_assorted_8_digit, test_40064UAW2, test_73358WK60, test_950885SN4, test_914811NS9, test_798755EC4, test_677525WD5, test_452226Y31, test_488386JA2, test_64542PDM4, test_76803EAB4, test_106134AP4, test_83412PEH1, test_671409G87, test_71910EAM1, test_880461ES3, test_93978TN88, test_014464XR7, test_646136TN1, test_798712BK0, test_leading_space, test_trailing_space
+    return run_tests([test_64971XQM3_all_trade_types, test_assorted_8_digit, test_40064UAW2, test_73358WK60, test_950885SN4, test_914811NS9, test_798755EC4, test_677525WD5, test_452226Y31, test_488386JA2, test_64542PDM4, test_76803EAB4, test_106134AP4, test_83412PEH1, test_671409G87, test_71910EAM1, test_880461ES3, test_93978TN88, test_014464XR7, test_646136TN1, test_798712BK0, test_leading_space, test_trailing_space])
+
+
+def test_batch_pricing_succeeds():
+    from test_batch_pricing_succeeds import test_64971XQM3, test_40064UAW2, test_quantity_tradetype_inputs, test_quantity_inputs_order_preserved_random, test_quantity_inputs_order_preserved_645002XL5_13068LGH2_797272QY0, test_assorted, test_assorted_8_digit, test_excel_scientific_notation, test_bonds_with_missing_or_negative_yields_in_history, test_bonds_where_quantity_is_greater_than_outstanding_amount, test_bonds_with_calc_date_within_60_days, test_pac_bonds, test_different_kinds_of_bonds_in_one_batch, test_yield_spread_model_and_dollar_price_model_together, test_empty_csv, test_empty_line_in_csv
+    return run_tests([test_64971XQM3, test_40064UAW2, test_quantity_tradetype_inputs, test_quantity_inputs_order_preserved_random, test_quantity_inputs_order_preserved_645002XL5_13068LGH2_797272QY0, test_assorted, test_assorted_8_digit, test_excel_scientific_notation, test_bonds_with_missing_or_negative_yields_in_history, test_bonds_where_quantity_is_greater_than_outstanding_amount, test_bonds_with_calc_date_within_60_days, test_pac_bonds, test_different_kinds_of_bonds_in_one_batch, test_yield_spread_model_and_dollar_price_model_together, test_empty_csv, test_empty_line_in_csv])
+
+
+def test_individual_pricing_equals_batch_pricing():
+    from test_individual_pricing_equals_batch_pricing import test_64971XQM3_different_trade_types_and_quantities, test_950885SN4, test_914811NS9, test_880461ES3, test_71910EAM1
+    return run_tests([test_64971XQM3_different_trade_types_and_quantities, test_950885SN4, test_914811NS9, test_880461ES3, test_71910EAM1])
+
+
+def test_bid_ask_spreads():
+    from test_bid_ask_spreads import test_cusips_from_jim_perrello, test_64972GWZ3
+    return run_tests([test_cusips_from_jim_perrello, test_64972GWZ3])
+    
+
+def test_similar_bonds_succeeds():
+    from test_similar_bonds_succeeds import test_similar_bonds_64971XQM3, test_rhodeisland_aaminus_education
+    return run_tests([test_similar_bonds_64971XQM3, test_rhodeisland_aaminus_education])
+    
+
+def test_logging():
+    from test_logging import test_logging_individual, test_logging_batch_success_error, test_logging_batch_yield_spread_dollar_price
+    return run_tests([test_logging_individual, test_logging_batch_success_error, test_logging_batch_yield_spread_dollar_price])
+
+
+def test_speed():
+    from test_speed import test_61212WCW3, test_98322QPL5, test_batch_100
+    return run_tests([test_61212WCW3, test_98322QPL5, test_batch_100], print_time_per_test=True)    # outputs the amount of time each test takes
+
+
+def send_email(subject, message, recipients=FAILURE_EMAIL_RECIPIENTS):
+    sender_email = 'notifications@ficc.ai'
+    password = 'ztwbwrzdqsucetbg'
+    smtp_server = 'smtp.gmail.com'
+    port = 587
+    
+    server = smtplib.SMTP(smtp_server, port)
+    server.starttls()
+    server.login(sender_email, password)
+    
+    message = MIMEText(message)
+    message['Subject'] = subject
+    message['From'] = sender_email
+    message['To'] = ', '.join(recipients)
+    
+    try:
+        server.sendmail(sender_email, recipients, message.as_string())
+    except Exception as e:
+        print(e)
+    server.quit()
+
+
+def remove_hours_and_fractional_seconds(time):
+    time = str(time).split('.')[0]    # remove the fractional seconds
+    return time[time.find(':') + 1:]    # remove the hours
+
+
+def main(args, send_success_email=True):    # first argument needs to be `args` for the cloud function to work properly on Google cloud
+    all_error_messages = ''
+    all_success_messages = ''
+
+    def create_print_output(test_objective, time_and_message):
+        output_time_per_test = True if len(time_and_message) == 3 else False
+        if output_time_per_test:
+            time, message, time_per_test = time_and_message
+        else:
+            time, message = time_and_message
+        
+        time = remove_hours_and_fractional_seconds(time)
+        nonlocal all_error_messages, all_success_messages
+        if type(message) == list:
+            if output_time_per_test: message = [test_message + f' took {seconds} seconds' for test_message, seconds in zip(message, time_per_test)]
+            added_message = f'Succeeded to {test_objective} in {time}. The following {len(message)} tests passed:\n' + '\n'.join(message) + '\n\n'
+            all_success_messages += added_message
+        else:
+            added_message = f'Failed to {test_objective} in {time}.\n' + message + '\n\n'
+            all_error_messages += added_message
+        print(added_message)
+
+    print('BEGIN automated testing')
+    start_time = time.time()
+    create_print_output('individually price CUSIPs', test_individual_pricing_succeeds())
+    create_print_output('batch price CUSIPs', test_batch_pricing_succeeds())
+    create_print_output('match individual prices and batch prices', test_individual_pricing_equals_batch_pricing())
+    create_print_output('make sure that bid ask spreads had the correct sign', test_bid_ask_spreads())
+    create_print_output('find similar bonds', test_similar_bonds_succeeds())
+    create_print_output('log activity', test_logging())
+    create_print_output('price quickly', test_speed())
+    time_elapsed = remove_hours_and_fractional_seconds(timedelta(seconds=time.time() - start_time))
+    print('END automated testing')
+    
+    if all_error_messages != '':
+        send_email(f'Product Failed in {time_elapsed}', all_error_messages)
+        return f'Failed in {time_elapsed}\n\n\n{all_error_messages}'
+    elif send_success_email:
+        send_email(f'Product Succeeded in {time_elapsed}', 'All tests passed\n\n\n' + all_success_messages, SUCCESS_EMAIL_RECIPIENTS)
+        return f'Successed in {time_elapsed}\n\n\n{all_success_messages}'

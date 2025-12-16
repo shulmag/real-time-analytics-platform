@@ -1,0 +1,93 @@
+@use '../../styles/lib' as *;
+
+
+.root {
+  contain: strict;
+  block-size: 100vh;
+  text-align: center;
+
+  & > div {
+    block-size: 100%;
+    align-content: center;
+  }
+
+  p {
+    margin-block-start: spacing(3);
+  }
+
+  h1 {
+    font-size: 14vw;
+    line-height: 1.2;
+
+    span {
+      @include underline;
+    }
+  }
+
+  @include screen {
+    text-align: left;
+
+    & > div {
+      align-items: center;
+    }
+
+    h1 {
+      font-size: 4.6vw;
+      line-height: 1.1;
+    }
+
+    p {
+      padding-inline-end: 2ch;
+    }
+  }
+
+  @include screen(lg) {
+
+    h1 {
+      font-size: 4.2rem;
+    }
+
+    p {
+      padding-inline-end: 5ch;
+    }
+  }
+}
+
+
+.content {
+  margin-block-start: spacing(6);
+
+  @include screen {
+    @include col(span 5);
+    margin-block-start: 0;
+  }
+}
+
+
+.image {
+  @include ratio(58.2%);
+  padding-inline-start: 24px;
+  padding-inline-end: 24px;
+  padding-block-start: spacing();
+  position: relative;
+  margin-block-start: spacing(5);
+
+  @include screen {
+    @include col(span 7);
+    padding: 0;
+    margin-block-start: 0;
+    transform-origin: center;
+    transform: translateY(14%) scale(1.15);
+  }
+}
+
+
+.sibling {
+
+  .content {
+
+    @include screen {
+      @include col(span 7);
+    }
+  }
+}

@@ -1,0 +1,31 @@
+'''
+Author: Developer Ray
+Date: 2024-07-17
+Last Editor: Developer Ray
+Last Edit Date: 2024-07-17
+Description: Helper functions.
+'''
+import time
+import logging as python_logging    # to not confuse with google.cloud.logging
+from functools import wraps
+
+from datetime import timedelta
+
+
+def remove_hours_and_fractional_seconds_beyond_3_digits(time):
+    # time = str(time).split('.')[0]    # remove the fractional seconds
+    time = str(time)[:-3]    # total of 6 digits after the decimal, so we keep everything but the last 3
+    return time[time.find(':') + 1:]    # remove the hours
+
+
+def function_timer(function_to_time):
+    '''This function is to be used as a decorator. It will print out the execution time of `function_to_time`.'''
+    @wraps(function_to_time)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        python_logging.info(f'Begin execution of {function_to_time.__name__}')
+        start_time = time.time()
+        result = function_to_time(*args, **kwargs)
+        end_time = time.time()
+        python_logging.info(f'Execution time of {function_to_time.__name__}: {remove_hours_and_fractional_seconds_beyond_3_digits(timedelta(seconds=end_time - start_time))}')
+        return result
+    return wrapper

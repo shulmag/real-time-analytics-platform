@@ -1,0 +1,9 @@
+# Description: Used to build images with Dockerfile and upload to Google Artifact Registry.
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', '$_IMAGE_URI', '-f', '$_DOCKERFILE', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '$_IMAGE_URI']
+images:
+  - '$_IMAGE_URI'

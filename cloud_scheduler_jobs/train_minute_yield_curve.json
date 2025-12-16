@@ -1,0 +1,30 @@
+{
+    "attemptDeadline": "180s",
+    "description": "This triggers the cloud function to train the minute yield curve from 10am to 4pm.  Two schedulers are necessary because of the limitations of Cron formatting. Since the timezone is set to America/New_York, the schedule will automatically adjust to daylight savings time. Update: we discussed only running this function on holidays, but we think ETFs may sometimes trade on holidays and in any case this is not costly to run.",
+    "httpTarget": {
+        "headers": {
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/train-minute-yield-curve",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/train-minute-yield-curve"
+    },
+    "lastAttemptTime": "2025-01-17T20:59:00.755248Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/train_minute_yield_curve",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "100s",
+        "minBackoffDuration": "5s",
+        "retryCount": 2
+    },
+    "schedule": "* 10-15 * * 1-5",
+    "scheduleTime": "2025-01-20T15:00:00.400839Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/New_York",
+    "userUpdateTime": "2024-12-04T21:27:07Z"
+}

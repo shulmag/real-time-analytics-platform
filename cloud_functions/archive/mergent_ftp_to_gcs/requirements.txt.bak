@@ -1,0 +1,5 @@
+pyftpdlib
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-secret-manager
+pytz==2021.3

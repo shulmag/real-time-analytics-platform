@@ -1,0 +1,576 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2025-01-06
+'''
+from google.cloud import bigquery
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+def send_email_and_return_success(subject, error_message):
+    sender_email = 'notifications@ficc.ai'
+    password = 'ztwbwrzdqsucetbg'
+    receiver_emails = [
+        'myles@ficc.ai',
+        'eng@ficc.ai',
+        'gil@ficc.ai',
+        'eng@ficc.ai',
+        'eng@ficc.ai',
+        'stephen@ficc.ai',
+        'jon@ficc.ai', 
+        'molsen@celadonfinancial.com',    # Michael J. Olsen; added 2024-07-01
+        'bjenkins@sperrycapital.com',    # Bryant Jenkins; added 2024-07-01
+        'nmdb66@yahoo.com',    # Neal DeBonte; added 2024-07-01
+        'paulgerard1@yahoo.com',    # Paul Gerard; added 2024-07-01
+        'swang@vaneck.com',    # added 2024-07-01
+		'Paula.Volk@psc.com',    # added 2024-07-08
+		'Bradley.Schumachter@psc.com',    # added 2024-07-08
+		'Jon.Allen@psc.com',    # added 2024-07-08
+		'Mike.Medina@psc.com',    # added 2024-07-08
+		'mark.cantrell@psc.com',    # added 2024-07-08
+        'ajeffries@dlfi.com',    # added 2024-07-18
+        'gtjf1103@optonline.net',    # John Schmutz; added 2024-07-22
+        'TMurray@Brownstone.com',    # added 2024-07-23
+        'sean@bigrockadvisorsllc.com',    # added 2024-07-25
+        'rkeller101@gmail.com',    # added 2024-07-25
+        'jkinsell@hotmail.com',    # Jeff Kinsell; added 2024-07-25
+        'kkollar12@gmail.com',    # added 2024-07-25
+        'Michael.Craft@genworth.com',    # Michael Craft (Genworth); added 2024-07-26
+        'mstanton@buildamerica.com',    # added 2024-07-26
+    ]
+
+    smtp_server = 'smtp.gmail.com'
+    port = 587
+
+    for receiver_email in receiver_emails:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg['Subject'] = subject
+
+        text = MIMEText(error_message)
+        msg.attach(text)
+
+        try:
+            with smtplib.SMTP(smtp_server, port) as server:
+                server.starttls()
+                server.login(sender_email, password)
+                server.sendmail(sender_email, receiver_email, msg.as_string())
+        except Exception as e:
+            print(f'Error sending email to {receiver_email}: {e}')
+    
+    return 'SUCCESS'
+
+
+def main(args):
+    bq_client = bigquery.Client()
+
+    DATA_QUERY = '''SELECT
+                    COUNT(distinct rtrs_control_number) AS trade_count,
+                    round(AVG(par_traded)) average_par_traded,
+                    SUM(par_traded) total_trade_volume,
+                    (SELECT
+                        COUNT(distinct (rtrs_control_number))
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    trade_type = 'D'
+                    and msrb_valid_to_date > current_datetime
+                    AND trade_date = CURRENT_DATE('US/Eastern')) as num_dealer_trades,
+                    (SELECT
+                        COUNT(distinct (rtrs_control_number))
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    trade_type = 'S'
+                    and msrb_valid_to_date > current_datetime
+                    AND trade_date = CURRENT_DATE('US/Eastern')) as num_customer_buy,
+                    (SELECT
+                        COUNT(distinct (rtrs_control_number))
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    trade_type = 'P'
+                    and msrb_valid_to_date > current_datetime
+                    AND trade_date  = CURRENT_DATE('US/Eastern')) as num_customer_sell,
+                    (
+                    SELECT
+                        COUNT(distinct rtrs_control_number)
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    par_traded >= 5000000
+                    and
+                    trade_type = 'P'
+                    and msrb_valid_to_date > current_datetime
+                        AND trade_date  = CURRENT_DATE('US/Eastern')) AS customer_sell_trades_over_5_MM,
+                        (
+                    SELECT
+                        COUNT(distinct rtrs_control_number)
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    par_traded >= 5000000
+                    and
+                    trade_type = 'D'
+                    and msrb_valid_to_date > current_datetime
+                        AND trade_date  = CURRENT_DATE('US/Eastern')) AS dealer_trades_over_5_MM,
+                        (
+                    SELECT
+                        COUNT(distinct rtrs_control_number)
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    par_traded >= 5000000
+                    and
+                    trade_type = 'S'
+                    and msrb_valid_to_date > current_datetime
+                        AND trade_date  = CURRENT_DATE('US/Eastern')) AS customer_buy_trades_over_5_MM,
+                    ( SELECT
+                        COUNT(distinct rtrs_control_number)
+                    FROM
+                        eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    upload_date = CURRENT_DATE('US/Eastern')
+                    and transaction_type <> 'I') as modified_trades,
+                    (SELECT
+                        COUNT(distinct rtrs_control_number)
+                    FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                    upload_date = CURRENT_DATE('US/Eastern')
+                    and transaction_type = 'C') as cancelled_trades,
+                    (SELECT
+                        COUNT(distinct (rtrs_control_number))
+                    FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                    extract(year from trade_date) = extract(year from current_date)) as num_trades_this_year, (SELECT
+                    cusip
+                    FROM
+                    eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    trade_date = CURRENT_DATE('US/Eastern')
+                    AND cusip = (
+                    SELECT
+                        cusip
+                    FROM (
+                        SELECT
+                        DISTINCT cusip,
+                        count (cusip) cnt
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        and date_diff( trade_date,dated_date, year) < 1
+                        GROUP BY
+                        cusip)
+                    ORDER BY
+                        cnt DESC
+                    LIMIT
+                        1)
+                    LIMIT
+                    1) as most_actively_traded_new_issue ,
+                    (SELECT
+                    security_description
+                    FROM
+                    `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                    trade_date = CURRENT_DATE('US/Eastern')
+                    AND cusip = (
+                    SELECT
+                        cusip
+                    FROM (
+                        SELECT
+                        DISTINCT cusip,
+                        count (cusip) cnt
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        and date_diff( trade_date,dated_date, year) < 1
+                        GROUP BY
+                        cusip)
+                    ORDER BY
+                        cnt DESC
+                    LIMIT
+                        1)
+                    LIMIT
+                    1) as description,
+                    (SELECT
+                    cusip
+                    FROM
+                    `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                    trade_date = CURRENT_DATE('US/Eastern')
+                    AND cusip = (
+                    SELECT
+                        cusip
+                    FROM (
+                        SELECT
+                        DISTINCT cusip,
+                        count (cusip) cnt
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        and date_diff( trade_date,dated_date, year) > 1
+                        GROUP BY
+                        cusip)
+                    ORDER BY
+                        cnt DESC
+                    LIMIT
+                        1)
+                    LIMIT
+                    1) as most_actively_traded_seasoned_cusip ,
+                    (SELECT
+                    security_description
+                    FROM
+                    `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                    trade_date = CURRENT_DATE('US/Eastern')
+                    AND cusip = (
+                    SELECT
+                        cusip
+                    FROM (
+                        SELECT
+                        DISTINCT cusip,
+                        count (cusip) cnt
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        and date_diff( trade_date,dated_date, year) > 1
+                        GROUP BY
+                        cusip)
+                    ORDER BY
+                        cnt DESC
+                    LIMIT
+                        1)
+                    LIMIT
+                    1) as description_2,
+
+                    (SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 0) as avg_price_for_zeros_5_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 0)as avg_yield_for_zeros_5_yr,
+
+                    (SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 0) as avg_price_for_zeros_10_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 0)as avg_yield_for_zeros_10_yr,
+
+                    (SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 0) as avg_price_for_zeros_20_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 0)as avg_yield_for_zeros_20_yr,
+
+                    (SELECT
+                        price_3_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 3)) as avg_price_for_3_percent_coupon_5_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 3)as avg_yield_for_3_percent_coupon_5_yr,
+
+                    (SELECT
+                        price_3_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 3)) as avg_price_for_3_percent_coupon_10_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 3)as avg_yield_for_3_percent_coupon_10_yr,
+
+                    (SELECT
+                        price_3_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_3_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 3)) as avg_price_for_3_percent_coupon_20_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 3)as avg_yield_for_3_percent_coupon_20_yr,
+
+                    (SELECT
+                        price_4_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_4_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 4)) as avg_price_for_4_percent_coupon_5_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        and coupon = 4)as avg_yield_for_4_percent_coupon_5_yr,
+
+
+                    (SELECT
+                        price_4_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_4_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 4)) as avg_price_for_4_percent_coupon_10_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        and coupon = 4)as avg_yield_for_4_percent_coupon_10_yr,
+
+                    (SELECT
+                        price_4_coupon
+                    FROM (
+                        SELECT
+                        round (avg (dollar_price),3) as price_4_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 4)) as avg_price_for_4_percent_coupon_20_yr,
+                        (SELECT
+                        round (avg (yield),2) as yield_0_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        where trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        and coupon = 4)as avg_yield_for_4_percent_coupon_20_yr,
+
+                    (SELECT
+                        price_5_coupon
+                    FROM (
+                        SELECT
+                    round (avg (dollar_price),3) AS price_5_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        AND coupon = 5)) AS avg_price_for_5_percent_coupon_5_yr,
+                    (SELECT
+                        round (avg (yield),2) AS yield_0_coupon
+                    FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 3
+                        and DATE_DIFF(maturity_date,current_date,year) < 7
+                        AND coupon = 5)AS avg_yield_for_5_percent_coupon_5_yr,
+
+                    (SELECT
+                        price_5_coupon
+                    FROM (
+                        SELECT
+                    round (avg (dollar_price),3) AS price_5_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        AND coupon = 5)) AS avg_price_for_5_percent_coupon_10_yr,
+                    (SELECT
+                        round (avg (yield),2) AS yield_0_coupon
+                    FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 8
+                        and DATE_DIFF(maturity_date,current_date,year) < 12
+                        AND coupon = 5)AS avg_yield_for_5_percent_coupon_10_yr,
+
+                    (SELECT
+                        price_5_coupon
+                    FROM (
+                        SELECT
+                    round (avg (dollar_price),3) AS price_5_coupon
+                        FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                        WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        AND coupon = 5)) AS avg_price_for_5_percent_coupon_20_yr,
+                    (SELECT
+                        round (avg (yield),2) AS yield_0_coupon
+                    FROM
+                        `eng-reactor-287421.MSRB.msrb_trade_messages`
+                    WHERE
+                        trade_date = CURRENT_DATE('US/Eastern')
+                        AND DATE_DIFF(maturity_date,current_date,year) > 18
+                        and DATE_DIFF(maturity_date,current_date,year) < 22
+                        AND coupon = 5)AS avg_yield_for_5_percent_coupon_20_yr
+                    FROM
+                    eng-reactor-287421.auxiliary_views_v2.msrb_final
+                    WHERE
+                    trade_date  = CURRENT_DATE('US/Eastern')
+                    and msrb_valid_to_date > current_datetime
+                    GROUP BY
+                    trade_date ;
+                    '''
+    df = bq_client.query(DATA_QUERY).result().to_dataframe()
+    if len(df) == 0: return send_email_and_return_success('No trades today', 'No trades today, so no ficc.ai daily market report')
+
+    fields_to_extract = [
+        'most_actively_traded_new_issue',
+        'description',
+        'most_actively_traded_seasoned_cusip',
+        'description_2',
+        'avg_price_for_zeros_5_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_yield_for_zeros_5_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_price_for_zeros_10_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_yield_for_zeros_10_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_price_for_zeros_20_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_yield_for_zeros_20_yr',    # removed from display in the final email output at Jon's request on 2024-07-02
+        'avg_price_for_3_percent_coupon_5_yr',
+        'avg_yield_for_3_percent_coupon_5_yr',
+        'avg_price_for_3_percent_coupon_10_yr',
+        'avg_yield_for_3_percent_coupon_10_yr',
+        'avg_price_for_3_percent_coupon_20_yr',
+        'avg_yield_for_3_percent_coupon_20_yr',
+        'avg_price_for_4_percent_coupon_5_yr',
+        'avg_yield_for_4_percent_coupon_5_yr',
+        'avg_price_for_4_percent_coupon_10_yr',
+        'avg_yield_for_4_percent_coupon_10_yr',
+        'avg_price_for_4_percent_coupon_20_yr',
+        'avg_yield_for_4_percent_coupon_20_yr',
+        'avg_price_for_5_percent_coupon_5_yr',
+        'avg_yield_for_5_percent_coupon_5_yr',
+        'avg_price_for_5_percent_coupon_10_yr',
+        'avg_yield_for_5_percent_coupon_10_yr',
+        'avg_price_for_5_percent_coupon_20_yr',
+        'avg_yield_for_5_percent_coupon_20_yr',
+    ]
+
+    df_dict = df.to_dict()
+    cusip = df_dict['most_actively_traded_new_issue'][0]
+    #del df_dict['most_actively_traded_new_issue']
+    description = df_dict['description'][0]
+    #del df_dict['description']
+    seasoned = df_dict['most_actively_traded_seasoned_cusip'][0]
+    #del df_dict['most_actively_traded_seasoned_cusip']
+    description_2 = df_dict['description_2'][0]
+    #del df_dict['description_2']
+
+    for field in fields_to_extract:
+        if field in df_dict:
+            globals()[field] = df_dict[field][0]    # TODO: refactor this procedure to not use `globals()`
+            del df_dict[field]
+        else:
+            print(f"Warning: Field '{field}' not found in DataFrame.")
+
+    human_readable_field_mapping = {
+        'trade_count': 'Number of trades today',
+        'average_par_traded': 'Average par traded',
+        'total_trade_volume': 'Total volume of trades today',
+        'num_dealer_trades': 'Number of dealer to dealer trades',
+        'num_customer_buy': 'Number of customer bought trades',
+        'num_customer_sell': 'Number of customer sold trades',
+        'customer_sell_trades_over_5_MM': 'Number of customer sold trades above $5MM',
+        'dealer_trades_over_5_MM': 'Number of dealer dealer trades above $5MM',
+        'customer_buy_trades_over_5_MM': 'Number of customer bought trades above $5MM',
+        'modified_trades': 'Number of modified trades',
+        'cancelled_trades': 'Number of cancelled trades',
+        'num_trades_this_year': 'Total number of trades this year',
+    }
+
+    email = []
+    for field, value in df_dict.items():
+        human_readable_field = human_readable_field_mapping[field]
+        prefix = '$' if ('par' in human_readable_field or 'volume' in human_readable_field) else ''
+        email.append(f'{human_readable_field}: {prefix}{round(value[0]):,}')
+    
+    email_str = '\n'.join(email)
+    return send_email_and_return_success(
+        'ficc.ai daily market report',
+        f'The Daily Schoonover:\n\n{email_str}\n' 
+        + f'\nNew issue with most trades today: {cusip}\nDescription: {description} \nSeasoned issue with most trades today: {seasoned}\nDescription: {description_2}'
+        # + f'\nAverage price and yield for 0% coupon bonds with 5 yr maturity: ${avg_price_for_zeros_5_yr}, {avg_yield_for_zeros_5_yr}% \nAverage price and yield for 0% coupon bonds with 10 yr maturity: ${avg_price_for_zeros_10_yr}, {avg_yield_for_zeros_10_yr}% \nAverage price and yield for 0% coupon bonds with 20 yr maturity: ${avg_price_for_zeros_20_yr}, {avg_yield_for_zeros_20_yr}%'    # removed at Jon's request on 2024-07-02
+        + f'\nAverage price and yield for 3% coupon bonds with 5 yr maturity: ${avg_price_for_3_percent_coupon_5_yr}, {avg_yield_for_3_percent_coupon_5_yr}% \nAverage price and yield for 3% coupon bonds with 10 yr maturity: ${avg_price_for_3_percent_coupon_10_yr}, {avg_yield_for_3_percent_coupon_10_yr}% \nAverage price and yield for 3% coupon bonds with 20 yr maturity: ${avg_price_for_3_percent_coupon_20_yr}, {avg_yield_for_3_percent_coupon_20_yr}%'
+        + f'\nAverage price and yield for 4% coupon bonds with 5 yr maturity: ${avg_price_for_4_percent_coupon_5_yr}, {avg_yield_for_4_percent_coupon_5_yr}% \nAverage price and yield for 4% coupon bonds with 10 yr maturity: ${avg_price_for_4_percent_coupon_10_yr}, {avg_yield_for_4_percent_coupon_10_yr}% \nAverage price and yield for 4% coupon bonds with 20 yr maturity: ${avg_price_for_4_percent_coupon_20_yr}, {avg_yield_for_4_percent_coupon_20_yr}%'
+        + f'\nAverage price and yield for 5% coupon bonds with 5 yr maturity: ${avg_price_for_5_percent_coupon_5_yr}, {avg_yield_for_5_percent_coupon_5_yr}% \nAverage price and yield for 5% coupon bonds with 10 yr maturity: ${avg_price_for_5_percent_coupon_10_yr}, {avg_yield_for_5_percent_coupon_10_yr}% \nAverage price and yield for 5% coupon bonds with 20 yr maturity: ${avg_price_for_5_percent_coupon_20_yr}, {avg_yield_for_5_percent_coupon_20_yr}%'
+    )

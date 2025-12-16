@@ -1,0 +1,210 @@
+# 2025-09-04
+# Last Edited by Developer 
+# 2025-10-02
+
+import os
+import pandas as pd
+import json 
+import requests
+
+from google.cloud import bigquery
+from google.cloud import storage
+from datetime import datetime
+from pytz import timezone
+from io import StringIO
+
+
+EMAIL    = 'benchmark_aaa@ficc.ai'
+PASSWORD = 'benchmark2025'
+
+TESTING = False
+
+if TESTING: 
+    #os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/jessewatson/base/ficc/creds.json'
+    pass
+bq_client = bigquery.Client()
+
+
+PROJECT_ID = 'eng-reactor-287421'
+DATASET_NAME = f'aaa_benchmark'
+
+CUSIP_CACHE_BUCKET = os.getenv("CUSIP_CACHE_BUCKET", "aaa-benchmark-cache")  # set your bucket
+CUSIP_CACHE_TZ = os.getenv("CUSIP_CACHE_TZ", "US/Eastern")
+
+
+def _cusip_cache_key(lower_bound: float, upper_bound: float) -> str:
+    """Return a daily cache key like: cusips/4-5/2025-09-05.csv (Eastern date)."""
+    d = datetime.now(timezone(CUSIP_CACHE_TZ)).date().isoformat()
+    # keep bounds tidy in path
+    lb = str(lower_bound).rstrip('0').rstrip('.') if isinstance(lower_bound, float) else str(lower_bound)
+    ub = str(upper_bound).rstrip('0').rstrip('.') if isinstance(upper_bound, float) else str(upper_bound)
+    return f"cusips/{lb}-{ub}/{d}.csv"
+
+
+def _load_cached_cusips(storage_client: storage.Client, bucket_name: str, key: str) -> pd.DataFrame | None:
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(key)
+    if not blob.exists():
+        return None
+    data = blob.download_as_text()
+    return pd.read_csv(StringIO(data), dtype={"cusip": str})  # <-- keep leading zeros
+
+
+def _save_cached_cusips(df: pd.DataFrame, storage_client: storage.Client, bucket_name: str, key: str) -> None:
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(key)
+    csv = df.to_csv(index=False)
+    # Idempotent create: only create if object doesn't exist (precondition)
+    try:
+        blob.upload_from_string(csv, content_type="text/csv", if_generation_match=0)
+    except Exception as e:
+        raise RuntimeError(f"[cache] Upload FAILED to gs://{bucket_name}/{key}: {e}") from e
+
+def upload_data_to_bigquery(df: pd.DataFrame, table: str):
+
+    schema = [bigquery.SchemaField('datetime', 'DATETIME'),
+              bigquery.SchemaField('mean_ytw', 'FLOAT')]
+
+    client = bigquery.Client(project=PROJECT_ID, location='US')
+    job_config = bigquery.LoadJobConfig(schema=schema, write_disposition='WRITE_APPEND')
+    
+    try:
+        job = client.load_table_from_dataframe(df, table, job_config=job_config)
+        job.result() 
+        print(f'Successfully uploaded the following DataFrame to {table}:\n{df}')
+    except Exception as e:
+        print(f'Failed to upload the following DataFrame to {table}:\n{df}')
+        raise e
+
+def retrieve_index_cusips(lower_bound, upper_bound):
+    """
+    Returns AAA muni CUSIPs for the maturity range. Uses a daily GCS cache first.
+    """
+    storage_client = storage.Client(project=PROJECT_ID)
+    cache_key = _cusip_cache_key(lower_bound, upper_bound)
+
+    # 1) Try cache
+    cached = _load_cached_cusips(storage_client, CUSIP_CACHE_BUCKET, cache_key)
+    if cached is not None and not cached.empty:
+        print(f"[cache] Loaded {len(cached)} CUSIPs from gs://{CUSIP_CACHE_BUCKET}/{cache_key}")
+        return cached
+
+    # 2) Fall back to BigQuery
+    sql = f"""
+    SELECT DISTINCT cusip
+    FROM `reference_data_v2.reference_data_flat`
+    WHERE sp_long = 'AAA'
+      AND coupon = 5
+      AND is_general_obligation
+      AND is_callable IS FALSE
+      AND federal_tax_status = 2
+      AND maturity_amount > 1000000
+      AND (capital_type IN (1,2,3,4,5,6) OR capital_type IS NULL)
+      AND is_escrowed_or_pre_refunded IS FALSE
+      AND is_called IS FALSE
+      AND ref_valid_to_date > CURRENT_TIMESTAMP()
+      AND DATE_DIFF(maturity_date, CURRENT_DATE("America/New_York"), DAY) / 365.25 
+            BETWEEN {lower_bound} AND {upper_bound}
+      AND (use_of_proceeds NOT IN (1,2,3,4,5,6,7,8) OR use_of_proceeds IS NULL)
+    """
+    bqr = bq_client.query(sql).result()
+    df = bqr.to_dataframe()
+
+    # 3) Save to cache (even if empty—optional; you can skip saving empties)
+    if not df.empty:
+        df["cusip"] = df["cusip"].astype(str)  # <-- ensure string in cache
+        _save_cached_cusips(df, storage_client, CUSIP_CACHE_BUCKET, cache_key)
+        print(f"[cache] Wrote {len(df)} CUSIPs to gs://{CUSIP_CACHE_BUCKET}/{cache_key}")
+    else:
+        print("[cache] Query returned no rows; not writing cache.")
+
+    return df
+
+def ficc_prices(cusips_quantities_tradetypes):
+    base_url = 'https://api.ficc.ai/api/batchpricing'
+    cusip_list = [row['CUSIP'] for row in cusips_quantities_tradetypes]
+    quantity_list = [row['Quantity'] for row in cusips_quantities_tradetypes]
+    trade_type_list = [row['Trade Type'] for row in cusips_quantities_tradetypes]
+ 
+    payload =  {'username': EMAIL,
+                'password': PASSWORD,
+                'cusipList': cusip_list,
+                'quantityList': quantity_list,
+                'tradeTypeList': trade_type_list}
+
+    resp = requests.post(base_url, data=payload, timeout=300)
+
+    if resp.status_code != 200:
+        print(f"[ficc_prices] Error from pricing API: {resp.status_code}")
+        return pd.DataFrame()
+
+    raw = resp.json()
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+
+    df = pd.DataFrame(raw)
+    if "error_message" in df:
+        df = df[df["error_message"].isna()].copy()
+    return df
+
+def build_payload(df, quantity=1000, trade_type="S"):
+    return [
+        {"CUSIP": row.cusip, "Quantity": quantity, "Trade Type": trade_type}
+        for row in df.itertuples(index=False)
+    ]
+
+def avg_index_ytw(lower_bound: float, upper_bound: float,trade_type):
+    """
+    Retrieve AAA muni CUSIPs in a maturity range, send them to ficc.ai for pricing,
+    and return the average yield-to-worst.
+    """
+    cusip_df = retrieve_index_cusips(lower_bound, upper_bound)
+
+    if cusip_df.empty:
+        return None   # no CUSIPs in range
+
+    payload = build_payload(cusip_df, trade_type=trade_type)
+
+    prices = ficc_prices(payload)
+
+    if prices.empty or "ytw" not in prices.columns:
+        return None
+        
+    return prices["ytw"].mean()
+
+def run_and_upload(tenor: str, lower: float, upper: float, trade_type, datetime_tz_naive_implicit_et: datetime = None):
+
+    ytw = avg_index_ytw(lower, upper, trade_type)
+    if ytw is None:
+        print(f"No valid YTW data for {tenor}.")
+        return
+
+    df_to_upload = pd.DataFrame({
+        "mean_ytw": [ytw],
+        "datetime": [datetime_tz_naive_implicit_et]
+    })
+    if trade_type == "S":
+        full_table = f"{PROJECT_ID}.{DATASET_NAME}.{tenor}"
+    else:
+        full_table = f"{PROJECT_ID}.{DATASET_NAME}.{tenor}_{trade_type}"   
+
+    if not TESTING:
+        upload_data_to_bigquery(df_to_upload, table=full_table)
+        print(f"SUCCESS: uploaded {tenor}")
+    else:
+        print(f"[TEST MODE] Would have uploaded to {full_table}:\n{df_to_upload}")
+
+
+def main(request=None):
+
+    eastern_now = datetime.now(timezone('US/Eastern')).replace(second=0, microsecond=0)
+    datetime_tz_naive_implicit_et = eastern_now.replace(tzinfo=None)
+
+    run_and_upload("five_year", 4.5, 5.5, "S",datetime_tz_naive_implicit_et)
+    run_and_upload("five_year", 4.5, 5.5, "P",datetime_tz_naive_implicit_et)
+
+    run_and_upload("ten_year", 9.5, 10.5, "S",datetime_tz_naive_implicit_et)
+    run_and_upload("ten_year", 9.5, 10.5, "P",datetime_tz_naive_implicit_et)
+
+    return "Done"
+

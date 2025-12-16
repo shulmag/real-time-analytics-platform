@@ -1,0 +1,468 @@
+"""
+Create by Gil, 1/17/25
+Last Editor: Gil
+Last Edit Date: 2025-03-14
+Helper functions that manage Soroban operations: build → simulate → prepare → sign → send.
+Converted from class-based to functional style while maintaining exact same behavior.
+
+Now with read-only calls done via single 'simulate' only (no 'send').
+"""
+
+BASE_FEE = 10000
+# Separate URLs for Soroban RPC and Horizon API
+SOROBAN_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
+HORIZON_URL = "https://horizon.stellar.org"  # For standard Horizon API calls
+
+from typing import Dict, Any
+from stellar_sdk import (
+    SorobanServer, 
+    Keypair, 
+    Network,
+    scval,
+    Server,
+    TransactionBuilder,
+    xdr as stellar_xdr  # For parsing SCVal from XDR
+)
+
+def init_soroban_server(rpc_url: str) -> dict:
+    """Initialize SorobanServer and return it in a context dict."""
+    soroban_server = SorobanServer(rpc_url)
+    print(f"[SorobanService] Initialized SorobanServer with URL: {rpc_url}")
+    return {
+        "soroban_server": soroban_server
+    }
+
+def check_connection(context: dict) -> bool:
+    """Verify connectivity by fetching the latest ledger."""
+    try:
+        latest_ledger = context["soroban_server"].get_latest_ledger()
+        print(f"[SorobanService] Latest ledger: {latest_ledger}")
+        return True
+    except Exception as e:
+        print(f"[SorobanService] Connection check failed: {e}")
+        return False
+
+def build_invoke_transaction(context: dict, source_account, contract_id, function_name, params, base_fee=300000):
+    """
+    Build an unprepared transaction to invoke a Soroban contract function.
+    Used in write operations (like add_price).
+    """
+    try:
+        tb = context["soroban_server"].build_transaction_builder(
+            source_account=source_account,
+            base_fee=base_fee
+        )
+        tb.set_timeout(300)
+        tb.append_invoke_contract_function_op(
+            contract_id=contract_id,
+            function_name=function_name,
+            parameters=params
+        )
+        transaction = tb.build()
+        print(f"[SorobanService] Built transaction: {transaction.to_xdr()}")
+        return transaction
+    except Exception as e:
+        print(f"[SorobanService] Error building transaction: {e}")
+        raise
+
+def simulate(context: dict, transaction):
+    """Simulate the transaction with Soroban to retrieve footprints or return data."""
+    try:
+        xdr = transaction.to_xdr()
+        response = context["soroban_server"].simulate_transaction(xdr)
+        
+        print("[simulate] Full simulation response:", response.__dict__)
+        if response.error:
+            print("[simulate] Simulation returned error:", response.error)
+        
+        return response
+    except Exception as e:
+        print(f"[SorobanService] Simulation failed: {e}")
+        raise
+
+def prepare(context: dict, transaction, simulation):
+    """Merge simulation results into the transaction for write ops."""
+    try:
+        prepared_transaction = context["soroban_server"].prepare_transaction(transaction, simulation)
+        print(f"[SorobanService] Prepared transaction: {prepared_transaction}")
+        return prepared_transaction
+    except Exception as e:
+        print(f"[SorobanService] Preparation failed: {e}")
+        raise
+
+def sign(transaction, secret_key: str):
+    """Sign the prepared transaction using the secret key."""
+    try:
+        keypair = Keypair.from_secret(secret_key)
+        transaction.sign(keypair)
+        return transaction
+    except Exception as e:
+        print(f"[SorobanService] Signing failed: {e}")
+        raise
+
+def send(context: dict, transaction):
+    """Submit the signed transaction to the Soroban network."""
+    try:
+        send_result = context["soroban_server"].send_transaction(transaction)
+        print(f"[SorobanService] Transaction sent. Result: {send_result}")
+        return send_result
+    except Exception as e:
+        print(f"[SorobanService] Sending failed: {e}")
+        raise
+
+# -----------------------------------------------------------------------------
+# Write operation (mutates contract state) → full pipeline
+# -----------------------------------------------------------------------------
+def add_price(
+    context: dict,
+    contract_id: str,
+    public_key: str,
+    secret_key: str,
+    cusip: str,
+    price: float,
+    yield_value: float,
+    trade_amount: int,
+    trade_type: str
+) -> Dict[str, Any]:
+    """
+    Add a new price entry for a CUSIP to the blockchain (writes state).
+    Uses the full pipeline: build → simulate → prepare → sign → send.
+    Potentially used by older endpoints like /get_and_update_price (if re-enabled).
+    """
+    try:
+        # Use Horizon URL for account info
+        server = Server(HORIZON_URL)
+        source_account = server.load_account(public_key)
+
+        # Convert inputs to contract format
+        params = [
+            scval.to_address(public_key),  # caller
+            scval.to_string(cusip),
+            scval.to_int128(int(price * 1000)),        # Convert to millicents
+            scval.to_int128(int(yield_value * 1000)),  # Convert to millibps
+            scval.to_int128(trade_amount),
+            scval.to_string(trade_type)
+        ]
+
+        transaction = (
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=BASE_FEE
+            )
+            .set_timeout(300)
+            .append_invoke_contract_function_op(
+                contract_id=contract_id,
+                function_name="add_price",
+                parameters=params
+            )
+            .build()
+        )
+
+        print(f"[add_price] Simulating transaction for CUSIP {cusip}")
+        simulation_result = simulate(context, transaction)
+        
+        prepared_transaction = prepare(context, transaction, simulation_result)
+        signed_transaction = sign(prepared_transaction, secret_key)
+        response = send(context, signed_transaction)
+        
+        if response.status == "SUCCESS":
+            return {
+                "status": "success",
+                "cusip": cusip,
+                "price": price,
+                "yield_value": yield_value,
+                "trade_amount": trade_amount,
+                "trade_type": trade_type,
+                "transaction_hash": response.hash
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Transaction failed with status: {response.status}",
+                "hash": response.hash
+            }
+
+    except Exception as e:
+        print(f"[add_price] Error adding price for CUSIP {cusip}: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+# -----------------------------------------------------------------------------
+# Read operations (do NOT mutate contract state) → simulation-only
+# -----------------------------------------------------------------------------
+
+def get_price_history(
+    context: dict,
+    contract_id: str,
+    cusip: str,
+    public_key: str
+) -> Dict[str, Any]:
+    """
+    READ ONLY: For a contract function that returns all historical price data.
+    We'll do a single simulation and parse the results.
+
+    NOTE: This matches what your server expects for /get_price/<cusip>.
+          We return `str(sc_val)` so that `parse_price_history_xdr`
+          in your Flask route can parse it successfully.
+    """
+    try:
+        # Use Horizon URL for account info
+        server = Server(HORIZON_URL)
+        source_account = server.load_account(public_key)
+
+        transaction = (
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=BASE_FEE
+            )
+            .set_timeout(300)
+            .append_invoke_contract_function_op(
+                contract_id=contract_id,
+                function_name="get_cusip_prices",
+                parameters=[scval.to_string(cusip)]
+            )
+            .build()
+        )
+
+        print(f"[get_cusip_prices] Simulating transaction for CUSIP {cusip}")
+        simulation_result = simulate(context, transaction)
+        if simulation_result.error:
+            return {"status": "error", "message": simulation_result.error}
+
+        # Parse the returned data from simulation_result
+        raw_xdr = simulation_result.results[0].xdr
+        # Convert it from XDR to SCVal
+        sc_val = stellar_xdr.SCVal.from_xdr(raw_xdr)
+        
+        # Return string form of SCVal — the old approach that your parse_price_history_xdr expects
+        return {
+            "status": "success",
+            "cusip": cusip,
+            "history": str(sc_val)
+        }
+
+    except Exception as e:
+        print(f"[get_price_history] Error fetching history for CUSIP {cusip}: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def get_all_latest_prices(
+    context: dict,
+    contract_id: str,
+    public_key: str,
+    limit: int = 10  # Default to 10 to avoid budget issues
+) -> Dict[str, Any]:
+    """
+    READ ONLY: Fetch latest prices for all tracked CUSIPs.
+    Used by /latest_prices and /ticker endpoints in your server.
+    """
+    try:
+        # Use Horizon URL for account info
+        server = Server(HORIZON_URL)
+        source_account = server.load_account(public_key)
+
+        # Convert limit to scval format
+        params = [scval.to_uint32(limit)] if limit is not None else [scval.to_void()]
+
+        # Build transaction
+        transaction = (
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=BASE_FEE
+            )
+            .set_timeout(300)
+            .append_invoke_contract_function_op(
+                contract_id=contract_id,
+                function_name="get_all_latest_prices",
+                parameters=params
+            )
+            .build()
+        )
+
+        print(f"[get_all_latest_prices] Simulating transaction with limit={limit}")
+        simulation_result = simulate(context, transaction)
+        
+        if simulation_result.error:
+            if "ExceededLimit" in simulation_result.error:
+                # If we hit budget limits, try with fewer items
+                print("Budget exceeded, retrying with smaller limit")
+                if limit > 2:
+                    return get_all_latest_prices(context, contract_id, public_key, limit=2)
+                else:
+                    return {"status": "error", "message": "Contract execution exceeded budget even with minimum limit"}
+            return {"status": "error", "message": simulation_result.error}
+        
+        # Raw XDR from the simulation
+        raw_xdr = simulation_result.results[0].xdr
+
+        return {
+            "status": "success",
+            "prices": raw_xdr
+        }
+
+    except Exception as e:
+        print(f"[get_all_latest_prices] Error: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def simulate_add_price(
+    context: dict,
+    contract_id: str,
+    public_key: str,
+    cusip: str,
+    price: float,
+    yield_value: float,
+    trade_amount: int,
+    trade_type: str
+) -> Dict[str, Any]:
+    """
+    Used by /prepare_price_update to get approximate fees before 
+    building the final transaction that the front end will sign.
+    """
+    try:
+        # Use Horizon URL for account info
+        server = Server(HORIZON_URL)
+        source_account = server.load_account(public_key)
+
+        # Convert parameters to Soroban Contract values
+        params = [
+            scval.to_address(public_key),
+            scval.to_string(cusip),
+            scval.to_int128(int(price * 1000)),
+            scval.to_int128(int(yield_value * 1000)),
+            scval.to_int128(trade_amount),
+            scval.to_string(trade_type)
+        ]
+
+        # Build transaction
+        transaction = (
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=100000  # 0.01 XLM in stroops
+            )
+            .set_timeout(300)
+            .append_invoke_contract_function_op(
+                contract_id=contract_id,
+                function_name="add_price",
+                parameters=params
+            )
+            .build()
+        )
+
+        # Simulate and get fees
+        simulation_result = simulate(context, transaction)
+        
+        # Extract all fee components
+        base_fee = BASE_FEE  # 0.01 XLM in stroops
+        resource_fee = int(simulation_result.min_resource_fee)
+        instructions_fee = (
+            int(simulation_result.instructions_fee) 
+            if hasattr(simulation_result, 'instructions_fee') else 0
+        )
+        read_bytes_fee = (
+            int(simulation_result.read_bytes_fee) 
+            if hasattr(simulation_result, 'read_bytes_fee') else 0
+        )
+        write_bytes_fee = (
+            int(simulation_result.write_bytes_fee) 
+            if hasattr(simulation_result, 'write_bytes_fee') else 0
+        )
+        transaction_size_fee = (
+            int(simulation_result.transaction_size_fee) 
+            if hasattr(simulation_result, 'transaction_size_fee') else 0
+        )
+        
+        total_fee = sum([
+            base_fee,
+            resource_fee,
+            instructions_fee,
+            read_bytes_fee,
+            write_bytes_fee,
+            transaction_size_fee
+        ])
+        print(f"\nTotal fee (stroops): {total_fee}")
+        print(f"Total fee (XLM): {total_fee / 10000000}")
+        
+        return {
+            "base_fee": base_fee,
+            "resource_fee": resource_fee,
+            "instructions_fee": instructions_fee,
+            "read_bytes_fee": read_bytes_fee,
+            "write_bytes_fee": write_bytes_fee,
+            "transaction_size_fee": transaction_size_fee,
+            "total_fee": total_fee
+        }
+
+    except Exception as e:
+        print(f"[simulate_add_price] Error: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise
+    
+def prepare_transaction_xdr(
+    context: dict,
+    contract_id: str,
+    public_key: str,
+    cusip: str,
+    price: float,
+    yield_value: float,
+    trade_amount: int,
+    trade_type: str,
+    fee: int
+) -> str:
+    """
+    Prepare and return the XDR string for a transaction that will be signed by the frontend.
+    Used by /prepare_price_update.
+    """
+    try:
+        # Use Horizon URL for account info
+        server = Server(HORIZON_URL)
+        source_account = server.load_account(public_key)
+
+        params = [
+            scval.to_address(public_key),  # caller
+            scval.to_string(cusip),
+            scval.to_int128(int(price * 1000)),       # Convert to millicents
+            scval.to_int128(int(yield_value * 1000)), # Convert to millibps
+            scval.to_int128(trade_amount),
+            scval.to_string(trade_type)
+        ]
+
+        # Build transaction with the final fee from simulation
+        transaction = (
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=Network.PUBLIC_NETWORK_PASSPHRASE,
+                base_fee=fee
+            )
+            .set_timeout(300)
+            .append_invoke_contract_function_op(
+                contract_id=contract_id,
+                function_name="add_price",
+                parameters=params
+            )
+            .build()
+        )
+
+        # First simulate to get footprint
+        simulation_result = simulate(context, transaction)
+        
+        # Then prepare with simulation results
+        prepared_tx = prepare(context, transaction, simulation_result)
+        
+        # Return the XDR representation
+        return prepared_tx.to_xdr()
+
+    except Exception as e:
+        print(f"[prepare_transaction_xdr] Error: {str(e)}")
+        raise

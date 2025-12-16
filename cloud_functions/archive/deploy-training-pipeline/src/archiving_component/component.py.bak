@@ -1,0 +1,113 @@
+'''
+ # @ Author: Developer
+ # @ Create date: 2024-04-18
+ # @ Modified by: Developer
+ # @ Modified date: 2024-06-10
+ '''
+from kfp.dsl import Model, Dataset
+from kfp import dsl
+
+
+PROJECT_ID = 'eng-reactor-287421'
+
+
+@dsl.component(base_image=f'gcr.io/{PROJECT_ID}/data-processing-base:test', \
+               target_image=f'gcr.io/{PROJECT_ID}/archiving-component:v1')
+def archiving_component(data_artifact: Dataset, 
+                        model_artifact: Model,
+                        destination_bucket_name: str = 'ficc-pipelines-test',
+                        destination_prefix: str = '') -> bool:
+    '''Kubeflow component that moves data and model artifacts to the automated_training folder  
+
+    Args:
+        data_artifact (Dataset): Dataset object containing path and metadata for successfully processed data file
+        model_artifact (Model): Model object containing path and metadata for successfully trained model
+
+    Returns:    
+        bool: Success or failure
+    '''
+    from google.cloud import storage
+    from datetime import datetime 
+    from pytz import timezone
+    import json
+    import os
+
+
+    def move_file(storage_client, source_bucket_name, destination_bucket_name, source_blob_name, destination_blob_name, delete_original_file: bool):
+        # Get the source and destination buckets
+        source_bucket = storage_client.bucket(source_bucket_name)
+        destination_bucket = storage_client.bucket(destination_bucket_name)
+
+        # Get the source blob
+        source_blob = source_bucket.blob(source_blob_name)
+
+        # Copy the source blob to the destination bucket
+        new_blob = source_bucket.copy_blob(source_blob, destination_bucket, destination_blob_name)
+        print(f'File copied successfully from {source_bucket_name}/{source_blob_name} to {destination_bucket_name}/{destination_blob_name}')
+
+        # Delete the original blob
+        if delete_original_file:
+            source_blob.delete()
+            print(f'Successfully removed {source_bucket_name}/{source_blob_name}')
+
+
+    def list_files(bucket, prefix):
+        '''Return a list of files with prefix `prefix` inside the Google Cloud Bucket called `bucket`.'''
+        blobs = bucket.list_blobs(prefix=prefix)
+        return [blob.name for blob in blobs if not blob.name.endswith('/')]
+    
+
+    def transfer(storage_client, uri, destination_bucket_name, destination_prefix: str = '', delete_original_file: bool = False):
+        _, _, source_bucket_name, source_blob_name = uri.split('/', 3)
+        print(f'Source bucket: {source_bucket_name}\nSource blob: {source_blob_name}')
+        source_bucket = storage_client.bucket(source_bucket_name)
+        target_files = list_files(source_bucket, source_blob_name)        
+
+        for source_blob_name in target_files:
+            # If not file name given, then reuse the same file name    
+            destination_blob_name = source_blob_name.split('/Output/')[-1]
+            # We do this for the keras model files to get the file path without model/, since that is already specified in the prefix
+            destination_blob_name = destination_blob_name.split('model/')[-1]
+            if destination_prefix: 
+                destination_blob_name = destination_prefix + '/' + destination_blob_name
+            print(f'Destination file name: {destination_blob_name}')
+            move_file(storage_client, source_bucket_name, destination_bucket_name, source_blob_name, destination_blob_name, delete_original_file)
+
+
+    STORAGE_CLIENT = storage.Client()
+    data_uri = data_artifact.metadata['file_path']
+    model_uri = model_artifact.metadata['model_path']
+    YEAR_MONTH_DAY = datetime.now(tz=timezone('US/Eastern')).strftime('%Y-%m-%d')
+
+    # archive data to destination bucket
+    transfer(STORAGE_CLIENT, 
+             data_uri, 
+             destination_bucket_name, 
+             destination_prefix=destination_prefix,
+             delete_original_file=False)
+    
+    # archive model to destination bucket
+    if model_artifact.metadata['deploy_decision'] is True:
+        model_destination_prefix = f'{destination_prefix}/model-{YEAR_MONTH_DAY}' if destination_prefix else f'model-{YEAR_MONTH_DAY}'
+        transfer(STORAGE_CLIENT, 
+                model_uri, 
+                destination_bucket_name, 
+                destination_prefix = model_destination_prefix,
+                delete_original_file = False)
+        
+    else:
+        model_destination_prefix = f'{destination_prefix}/inaccurate/model-{YEAR_MONTH_DAY}' if destination_prefix else f'inaccurate/model-{YEAR_MONTH_DAY}'
+        transfer(STORAGE_CLIENT, 
+                model_uri, 
+                destination_bucket_name, 
+                destination_prefix = model_destination_prefix,
+                delete_original_file = False)
+
+    model_metadata_blob_path = os.path.join(model_destination_prefix, 'model_metadata.json')
+    model_metadata = model_artifact.metadata
+    print(f'Model metadata path: {model_metadata_blob_path}\nModel metadata: {model_metadata}')
+    destination_bucket = STORAGE_CLIENT.bucket(destination_bucket_name)
+    blob = destination_bucket.blob(model_metadata_blob_path)
+    json_string = json.dumps(model_artifact.metadata)
+    blob.upload_from_string(json_string)
+    return True

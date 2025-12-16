@@ -1,0 +1,82 @@
+/*
+ * @Author: Gil Shulman
+ * @Date: 2025-03-06
+ * @Last Modified by: Gil Shulman
+ * @Last Modified time: 2025-03-24
+ */
+
+import React from 'react';
+
+const DashboardHeader = ({
+  isWalletConnected = false,
+  onConnectWallet = () => {},
+  walletAddress = "",
+  onHowItWorksClick = () => {} // New prop for handling the click
+}) => {
+  return (
+    <header className="bg-white border-bottom">
+      <div className="container py-2 py-md-3">
+        <div className="d-flex justify-content-between align-items-center">
+          <div className="d-flex align-items-center">
+            {/* FICC.ai Logo/Brand */}
+            <a 
+              href="https://ficc.ai" 
+              className="me-3 text-decoration-none"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <span style={{ 
+                fontWeight: 'bold', 
+                fontSize: '1.25rem', 
+                letterSpacing: '-0.5px'
+              }}>
+                <span style={{ color: '#191919' }}>ficc</span>
+                <span style={{ color: '#0d6efd' }}>.ai</span>
+              </span>
+            </a>
+            
+            <div className="border-start h-75 mx-3 d-none d-sm-block"></div>
+            
+            {/* Responsive titles */}
+            <h1 className="h4 mb-0 d-none d-sm-block">Municipal Bond Oracle</h1>
+            <h1 className="h5 mb-0 d-block d-sm-none">Muni Oracle</h1>
+            <span className="text-muted ms-3 d-none d-md-inline">
+              AI Bond Pricing via Stellar Blockchain
+            </span>
+          </div>
+
+          <div className="d-flex align-items-center">
+            <a 
+              href="#about-section" 
+              className="btn btn-link text-decoration-none me-3 d-none d-md-block"
+              onClick={(e) => {
+                e.preventDefault();
+                onHowItWorksClick(); // Call the custom handler
+                document.getElementById('about-section').scrollIntoView({ behavior: 'smooth' });
+              }}
+            >
+              <i className="bi bi-question-circle me-1"></i>
+              How It Works
+            </a>
+
+            <button
+              className={`btn ${isWalletConnected ? 'btn-outline-primary' : 'btn-primary'}`}
+              onClick={onConnectWallet}
+            >
+              <i className="bi bi-wallet2 me-2"></i>
+              {isWalletConnected ? (
+                <span className="font-monospace text-truncate" style={{ maxWidth: '120px' }}>
+                  {walletAddress}
+                </span>
+              ) : (
+                <span className="d-none d-sm-inline">Connect Wallet</span>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+};
+
+export default DashboardHeader;

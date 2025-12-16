@@ -1,0 +1,487 @@
+'''
+'''
+
+from functools import partial
+
+import math
+import csv
+import pandas as pd
+from google.cloud import storage
+
+from auxiliary_variables import DIRECTORY, FEATURES_FOR_OUTPUT_CSV, NUMERICAL_ERROR, QUANTITY, TRADE_TYPE, TRADE_TYPE_CODE_TO_TEXT, QUANTITY_LOWER_BOUND, QUANTITY_UPPER_BOUND
+from auxiliary_functions import run_multiple_times_before_failing, get_filename_from_cusip_list, response_from_batch_pricing, check_that_batch_pricing_gives_price_for_all_cusips, check_that_batch_pricing_gives_error_for_all_cusips, check_that_batch_pricing_gives_output_for_all_cusips, check_that_batch_pricing_gives_price_and_dollar_price_used_for_all_cusips, check_that_batch_pricing_gives_price_but_maybe_not_yield_for_all_cusips, get_spreadsheet_as_list, run_tests_with_and_without_file, load_cusips_from_gcs
+from auxiliary_functions import handle_nan
+
+price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+run_tests_with_and_without_file_batch_pricing = partial(run_tests_with_and_without_file, check_if_content_is_equal=True, columns_to_ignore=set([price_idx]))    # ignore price column because this may fluctuate a bit due to minor fluctuations in the yield
+
+
+@run_multiple_times_before_failing
+def test_64971XQM3():
+    '''Tests that batch pricing returns a price in a correctly formatted csv for 64971XQM3.'''
+    cusip = '64971XQM3'
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip), cusip, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip, post_request_made_with_file=make_post_request_with_file)
+    
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_not_outstanding():
+    '''Tests that batch pricing returns an error message in a correctly formatted csv for CUSIPs that 
+    are not outstanding.'''
+    cusip_list = ['40064UAW2']
+
+    def testing_function_with_cusip(cusip: str, make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip), cusip, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_output_for_all_cusips(request_obj, cusip, error_code='not_outstanding', post_request_made_with_file=make_post_request_with_file)
+    
+    for cusip in cusip_list:
+        run_tests_with_and_without_file_batch_pricing(lambda make_post_request_with_file: testing_function_with_cusip(cusip, make_post_request_with_file))
+
+
+@run_multiple_times_before_failing
+def test_lowercase_tradetype_inputs():
+    '''Tests that lowercase inputs for trade type are accepted.'''
+    cusip_list = ['64971XQM3'] * 3    # CUSIP chosen arbitrarily amongst CUSIPs that we give a price for
+    quantity_list = [500, 500, 500]    # chosen arbitrarily
+    trade_type_list = ['p', 'd', 's']
+
+    price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+    ytw_idx = FEATURES_FOR_OUTPUT_CSV.index('ytw')
+
+    request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list, trade_type_list)
+    content = get_spreadsheet_as_list(request_obj)
+
+    previous_price = ''
+    for idx, row in enumerate(content):    # makes sure that each price is not the value used for numerical error and that it is different than the previous price
+        row_price = handle_nan(row[price_idx])
+        assert row_price != NUMERICAL_ERROR and row_price != previous_price, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the predicted price {row_price} should not be equal to {NUMERICAL_ERROR} or the price {previous_price} which is the predicted price for CUSIP {cusip_list[idx - 1]} and quantity {quantity_list[idx - 1]}'
+        previous_price = row_price
+
+        row_ytw = handle_nan(row[ytw_idx])
+        ## Not testing the final condition below, since the test is misleading; the ytw values were different but not when rounded to 3 decimal places
+        assert row_ytw != NUMERICAL_ERROR, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the predicted ytw {row_ytw} should not be equal to {NUMERICAL_ERROR}'    # and row_ytw != previous_ytw
+        # previous_ytw = row_ytw
+
+
+@run_multiple_times_before_failing
+def test_decimal_quantity_inputs():
+    '''Tests that lowercase inputs for trade type are accepted.'''
+    cusip_list = ['64971XQM3'] * 3    # CUSIP chosen arbitrarily amongst CUSIPs that we give a price for
+    quantity_list = [123.123, 123.12, 123.1]    # chosen arbitrarily
+    quantity_list_rounded = [round(quantity) for quantity in quantity_list]
+    trade_type_list = ['P', 'P', 'P']
+    
+    quantity_idx = FEATURES_FOR_OUTPUT_CSV.index('quantity')
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list, trade_type_list, create_file=make_post_request_with_file)
+        content = get_spreadsheet_as_list(request_obj, spreadsheet_returned_as_json_string=not make_post_request_with_file)
+
+        for idx, row in enumerate(content):
+            quantity_in_spreadsheet = int(row[quantity_idx])
+            quantity_rounded_passed_in = quantity_list_rounded[idx] * 1000
+            assert quantity_in_spreadsheet == quantity_rounded_passed_in, f'For row {idx}, the quantity in the spreadsheet {quantity_in_spreadsheet} should equal the rounded version of the quantity passed in {quantity_rounded_passed_in}'    # checks that the quantity corresponding to the CUSIP is correct; multiplies by 1000 since the quantity values passed into batch pricing are in thousands
+        return content
+    
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_quantity_tradetype_inputs():
+    '''Tests that quantity and trade type can be inputted into batch pricing.'''
+    cusip_list = ['64971XQM3'] * 5    # CUSIP chosen arbitrarily amongst CUSIPs that we give a price for
+    quantity_list = [500, 500, 500, 100, 1000]    # chosen arbitrarily
+    trade_type_list = ['P', 'D', 'S', 'S', 'S']    # chosen arbitrarily
+
+    price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+    ytw_idx = FEATURES_FOR_OUTPUT_CSV.index('ytw')
+
+    request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list, trade_type_list)
+    content = get_spreadsheet_as_list(request_obj)
+
+    previous_price = ''
+    # previous_ytw = ''
+    for idx, row in enumerate(content):    # makes sure that each price is not the value used for numerical error and that it is different than the previous price
+        row_price = handle_nan(row[price_idx])
+        assert float(row_price) != NUMERICAL_ERROR and row_price != previous_price, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the predicted price {row_price} should not be equal to {NUMERICAL_ERROR} or the price {previous_price} which is the predicted price for CUSIP {cusip_list[idx - 1]} and quantity {quantity_list[idx - 1]}'
+        previous_price = row_price
+
+        row_ytw = handle_nan(row[ytw_idx])
+        ## Not testing the final condition below, since the test is misleading; the ytw values were different but not when rounded to 3 decimal places
+        assert row_ytw != NUMERICAL_ERROR, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the predicted ytw {row_ytw} should not be equal to {NUMERICAL_ERROR}'    # and row_ytw != previous_ytw
+        # previous_ytw = row_ytw
+
+
+def _test_quantity_inputs_order_preserved(cusip_list, quantity_list=None, make_post_request_with_file: bool = True):
+    '''Tests that the order of quantities are preserved in batch pricing for CUSIPs from `cusip_list` 
+    and corresponding quantities from `quantity_list`. If `quantity_list` is `None`, then we populate 
+    the quantities with `QUANTITY` from `modules.test.auxiliary_variables`.
+    NOTE: this currently only works under the condition that every CUSIP in `cusip_list` is unique.'''
+    if quantity_list is None: quantity_list = [QUANTITY] * len(cusip_list)
+    assert len(cusip_list) == len(quantity_list), f'`cusip_list` and `quantity_list` must have the same number of items, but `cusip_list` has {len(cusip_list)} items and `quantity_list` has {len(quantity_list)} items'
+    assert len(set(cusip_list)) == len(cusip_list), f'`cusip_list` must contain unique items'
+
+    cusip_idx = FEATURES_FOR_OUTPUT_CSV.index('cusip')
+    quantity_idx = FEATURES_FOR_OUTPUT_CSV.index('quantity')
+
+    request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list, create_file=make_post_request_with_file)
+    content = get_spreadsheet_as_list(request_obj, spreadsheet_returned_as_json_string=not make_post_request_with_file)
+
+    for idx, quantity in enumerate(quantity_list):
+        if quantity < QUANTITY_LOWER_BOUND:
+            quantity_list[idx] = QUANTITY_LOWER_BOUND
+        elif quantity > QUANTITY_UPPER_BOUND:
+            quantity_list[idx] = QUANTITY_UPPER_BOUND
+    cusip_quantity_map = dict(zip(cusip_list, quantity_list))
+
+    for row in content:
+        row_cusip = row[cusip_idx]
+        quantity_in_spreadsheet = int(row[quantity_idx])
+        quantity_passed_in = cusip_quantity_map[row_cusip] * 1000
+        assert quantity_in_spreadsheet == quantity_passed_in, f'For {row_cusip}, the quantity in the spreadsheet {quantity_in_spreadsheet} should equal the quantity passed in {quantity_passed_in}'    # checks that the quantity corresponding to the CUSIP is correct; multiplies by 1000 since the quantity values passed into batch pricing are in thousands
+    return content
+
+
+@run_multiple_times_before_failing
+def test_quantity_inputs_order_preserved_random():
+    '''Tests that the order of quantities are preserved in batch pricing for an arbitrary set 
+    of CUSIPs and quantities.'''
+    cusip_list = ['13063DU89', '664766CX8', '64971XQM3', '64987BPD4', '160429B88']    # chosen to have one CUSIP that is outstanding and one CUSIP that we do not support
+    quantity_list = [1, 100, 500, 1000, 50000]    # chosen arbitrarily
+    run_tests_with_and_without_file_batch_pricing(lambda make_post_request_with_file: _test_quantity_inputs_order_preserved(cusip_list, quantity_list, make_post_request_with_file=make_post_request_with_file))
+
+
+@run_multiple_times_before_failing
+def test_quantity_inputs_order_preserved_645002XL5_13068LGH2_797272QY0():
+    '''Tests that the order of quantities are preserved in batch pricing for a list that 
+    failed for us when introducing both sides pricing to correct for inversions.'''
+    cusip_list = ['645002XL5', '13068LGH2', '797272QY0']
+    run_tests_with_and_without_file_batch_pricing(lambda make_post_request_with_file: _test_quantity_inputs_order_preserved(cusip_list, make_post_request_with_file=make_post_request_with_file))
+
+
+@run_multiple_times_before_failing
+def test_default_quantity_and_trade_type_are_maintained():
+    '''Tests that the default quantity and / or trade type is carried over in the batch pricing 
+    API call and not replaced with the system default. E.g., if the user passes in 'P' as the default 
+    trade type, then test that this value does not get replaced with 'S' in the batch pricing API call.'''
+    cusip = '64971XQM3'
+    quantity = 250    # original default quantity is `QUANTITY`
+    assert quantity != QUANTITY, f'The quantity passed in {quantity} should not equal the default quantity {QUANTITY}'
+    trade_type = 'D'    # original default trade type is `TRADE_TYPE`
+    assert trade_type != TRADE_TYPE, f'The trade type passed in {trade_type} should not equal the default trade type {TRADE_TYPE}'
+
+    inverse_trade_type_code_to_text = {value: key for key, value in TRADE_TYPE_CODE_TO_TEXT.items()}
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip), cusip, quantity=quantity, trade_type=trade_type, create_file=make_post_request_with_file)
+        content = get_spreadsheet_as_list(request_obj, spreadsheet_returned_as_json_string=not make_post_request_with_file)
+
+        cusip_idx = FEATURES_FOR_OUTPUT_CSV.index('cusip')
+        quantity_idx = FEATURES_FOR_OUTPUT_CSV.index('quantity')
+        trade_type_idx = FEATURES_FOR_OUTPUT_CSV.index('trade_type')
+
+        assert len(content) == 1, f'The number of rows in the spreadsheet should be 1, but was {len(content)}'
+        row = content[0]
+        row_cusip = row[cusip_idx]
+        assert row_cusip == cusip, f'The CUSIP in the spreadsheet {row_cusip} should equal the CUSIP passed in {cusip}'
+        row_quantity = int(row[quantity_idx])
+        assert row_quantity == quantity * 1000, f'The quantity in the spreadsheet {row_quantity} should equal the quantity passed in {quantity * 1000}'
+        row_trade_type = row[trade_type_idx]
+        assert inverse_trade_type_code_to_text[row_trade_type] == trade_type, f'The trade type in the spreadsheet {inverse_trade_type_code_to_text[row_trade_type]} should equal the trade type passed in {trade_type}'
+        
+        return content
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_assorted():
+    '''Tests assorted list of CUSIPs that have failed in the past for various reasons.'''
+    successful_cusip_list = ['64971XQM3',
+                             '6461367J4',
+                             '13063DU89',
+                             '160429B88',
+                             '13063DLJ5',
+                             '54466HJM9',
+                             '650036CJ3', 
+                             '047851DC1']    # `next_coupon_payment_date` is missing because it is a new issue and so the `first_coupon_date` is in the future and should be the `next_coupon_payment_date` which the server now accounts for in `exclusions.py::missing_important_dates_or_dates_are_out_of_bounds(...)`
+    # failed_cusip_list = []
+
+    def testing_function(make_post_request_with_file: bool):
+        successful_request_obj = response_from_batch_pricing(get_filename_from_cusip_list(successful_cusip_list), successful_cusip_list, create_file=make_post_request_with_file)
+        successful_content = check_that_batch_pricing_gives_price_for_all_cusips(successful_request_obj, successful_cusip_list, post_request_made_with_file=make_post_request_with_file)
+
+        # failed_request_obj = response_from_batch_pricing(get_filename_from_cusip_list(failed_cusip_list), failed_cusip_list, create_file=make_post_request_with_file)
+        # failed_content = check_that_batch_pricing_gives_error_for_all_cusips(failed_request_obj, failed_cusip_list, post_request_made_with_file=make_post_request_with_file)
+
+        return successful_content    # + failed_content
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_assorted_8_digit():
+    '''Tests assorted list of 8 digit CUSIPs to make sure that filling in the check 
+    digit is working correctly.'''
+    cusip_list = ['64971XQM', 
+                  '6461367J', 
+                  '13063DU8', 
+                  '160429B8', 
+                  '13063DLJ', 
+                  '54466HJM', 
+                  '650036CJ', 
+                  '40064UAW']    # cannot be priced since it is no longer outstanding
+    cusip_list_with_check_digit = ['64971XQM3', 
+                                   '6461367J4', 
+                                   '13063DU89', 
+                                   '160429B88', 
+                                   '13063DLJ5', 
+                                   '54466HJM9', 
+                                   '650036CJ3', 
+                                   '40064UAW2']
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        content = check_that_batch_pricing_gives_output_for_all_cusips(request_obj, cusip_list_with_check_digit, post_request_made_with_file=make_post_request_with_file)
+
+        cusip_idx = FEATURES_FOR_OUTPUT_CSV.index('cusip')
+        for idx, row in enumerate(content):
+            row_cusip = row[cusip_idx]
+            cusip_with_check_digit = cusip_list_with_check_digit[idx]
+            assert row_cusip == cusip_with_check_digit, f'For 8 digit CUSIP {cusip_list[idx]}, the CUSIP with the check digit should be {cusip_with_check_digit}, but the value in the spreadsheet was {row_cusip}'
+        return content
+    
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_excel_scientific_notation():
+    '''Tests that certain CUSIPs converted to scientific notation automatically by Excel 
+    are able to be priced.'''
+    cusip_list = ['1073356000000', '1A73356000000']
+    quantity_list = [250, 250]
+
+    price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+    ytw_idx = FEATURES_FOR_OUTPUT_CSV.index('ytw')
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list=quantity_list, create_file=make_post_request_with_file)    # reduced the quantity from 500 to 250 since 1073356E6 has an outstanding amount of 325k, so the amount priced in the hypothetical trade must be less than 325
+        content = get_spreadsheet_as_list(request_obj, spreadsheet_returned_as_json_string=not make_post_request_with_file)
+
+        for idx, row in enumerate(content):    # makes sure that each price is not the value used for numerical error and that it is different than the previous price
+            comparison_func = (lambda a, b: (a == b, '')) if idx != 0 else (lambda a, b: (a != b, 'not '))    # specify whether the `comparison_func` function should be equals or not equals based on which CUSIP (identified by idx) is being investigated; the second argument is for the print statement
+            row_price = handle_nan(row[price_idx])
+
+            comparison, comparison_string = comparison_func(row_price, NUMERICAL_ERROR)
+            assert comparison, f'For CUSIP {cusip_list[idx]}, the predicted price {row_price} should {comparison_string}be equal to {NUMERICAL_ERROR}'
+
+            row_ytw = handle_nan(row[ytw_idx])
+
+            comparison = comparison_func(row_ytw, NUMERICAL_ERROR)
+            assert comparison, f'For CUSIP {cusip_list[idx]}, the predicted ytw {row_ytw} should {comparison_string}be equal to {NUMERICAL_ERROR}'
+    
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_bonds_with_missing_or_negative_yields_in_history():
+    '''Tests that bonds with negative yields in the history are priced using the dollar price model.'''
+    cusip_list = ['71910EAM1']
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_and_dollar_price_used_for_all_cusips(request_obj, cusip_list, reason_for_dollar_price_model='missing_or_negative_yields', post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_bonds_where_quantity_is_greater_than_outstanding_amount():
+    '''Tests that bonds where the quantity of the hypothetical trade is larger than the outstanding amount.'''
+    cusip_list = ['014464XR7']
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list=[5000], create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_error_for_all_cusips(request_obj, cusip_list, check_quantity_equals_default=False, post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_bonds_with_maturity_date_within_60_days():
+    '''Tests that bonds with a maturity date within 60 days return a dollar price but no yield. load_cusips_from_gcs loads a list of cusips from a csv file saved in gcs bucket. More detailed description available in auxiliary_function.py '''
+
+    cusip_list = load_cusips_from_gcs("short_maturity")
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_and_dollar_price_used_for_all_cusips(request_obj, cusip_list, reason_for_dollar_price_model='maturing_soon', post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_pac_bonds():
+    '''Tests that the PAC bonds are priced using the yield spread model. Previously, these were priced with 
+    the dollar price model. In the current reference data, there is no indicator to select the PAC bonds.'''
+    cusip_list = ['647201CH3', 
+                  '19648GBU5', 
+                  '9174368L4', 
+                  '83756C5V3', 
+                  '93978TF46']
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip_list, post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_different_kinds_of_bonds_in_one_batch():
+    '''Tests CUSIPs with each of the following conditions in a single batch: (1) no error, (2) not 
+    outstanding, (3) uses dollar price model because of missing or negative yields, (4) maturity 
+    date is within 60 days, (5) quantity attempting to be priced is greater than outstanding amount.'''
+    mature_cusip = load_cusips_from_gcs("short_maturity")
+    cusip_list = ['64971XQM3', 
+                  '40064UAW2', 
+                  '71910EAM1', 
+                  mature_cusip[0], 
+                  '014464XR7']
+    quantity_list = [500] * (len(cusip_list) - 1) + [5000]    # the last quantity is made larger to trigger the error of 'quantity attempting to be priced is greater than outstanding amount'
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, quantity_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_output_for_all_cusips(request_obj, cusip_list, check_quantity_equals_default=False, post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_yield_spread_model_and_dollar_price_model_together():
+    '''Tests that batch pricing a list where one CUSIP uses the yield spread model and one 
+    CUSIP uses the dollar price model is successful.'''
+    cusip_list = ['052398GZ1',    # defaulted bond so uses the dollar price model
+                  '64971XQM3']
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_but_maybe_not_yield_for_all_cusips(request_obj, cusip_list, post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_caching():
+    '''Tests that the caching mechanism used in `finance.py::get_data_from_redis(...)` activated by 
+    setting `USE_CACHE_FOR_GET_DATA_FOR_SINGLE_CUSIP` to `True` works as expected. This test will price 
+    a batch of CUSIPs where some of the CUSIPs are duplicates, and make sure that the CUSIPs that are 
+    the same, are given the same price by batch pricing. Additionally, the duplicate CUSIPs should not 
+    be in consecutive spots in the list to ensure that the caching is not silently failing by just 
+    returning the data for the previous CUSIP.'''
+    cusip_list = ['64971XQM3', 
+                  '6461367J4', 
+                  '64971XQM3', 
+                  '64971XQM3', 
+                  '6461367J4', 
+                  '54466HJM9', 
+                  '64971XQM3']
+    
+    price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+    ytw_idx = FEATURES_FOR_OUTPUT_CSV.index('ytw')
+    
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip_list, True, post_request_made_with_file=make_post_request_with_file)
+        content = get_spreadsheet_as_list(request_obj, spreadsheet_returned_as_json_string=not make_post_request_with_file)
+
+        cusip_to_price_ytw_pair = {}    # dictionary with the following mapping: cusip -> (price, ytw)
+        for idx, row in enumerate(content):    # makes sure that each price is not the value used for numerical error and that it is different than the previous price
+
+            cusip = cusip_list[idx]
+            row_price = handle_nan(row[price_idx])
+            row_ytw = handle_nan(row[ytw_idx])
+            if cusip not in cusip_to_price_ytw_pair: cusip_to_price_ytw_pair[cusip] = (row_price, row_ytw)
+            cusip_price, cusip_ytw = cusip_to_price_ytw_pair[cusip]
+            assert row_price != NUMERICAL_ERROR and row_price == cusip_price, f'For CUSIP {cusip} and quantity {QUANTITY}, the predicted price {row_price} should not equal {NUMERICAL_ERROR} but should equal the price for a previous instance of this CUSIP in the output {cusip_price}'
+            assert row_ytw != NUMERICAL_ERROR and row_ytw == cusip_ytw, f'For CUSIP {cusip} and quantity {QUANTITY}, the predicted ytw {row_ytw} should not equal {NUMERICAL_ERROR} but should equal the ytw for a previous instance of this CUSIP in the output {cusip_ytw}'
+        return content
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)
+
+
+@run_multiple_times_before_failing
+def test_empty_csv():
+    '''Tests that an empty csv does not cause a batch pricing error.'''
+    filename = f'{DIRECTORY}/empty.csv'
+    with open(filename, 'w') as _: pass    # creating an empty CSV file: https://www.tutorialspoint.com/How-to-create-an-empty-file-using-Python
+    request_obj = response_from_batch_pricing(filename)
+    assert request_obj.ok, 'The response from batch pricing for an empty CSV was not successful'    # successful response; checks whether the status_code is less than 400
+
+
+@run_multiple_times_before_failing
+def test_empty_line_in_csv():
+    '''Tests that an empty line in a csv does not cause a batch pricing error.'''
+    cusip_list = ['64971XQM3', 
+                  '6461367J4', 
+                  '13063DU89']
+    filename = f'{DIRECTORY}/{"_".join(cusip_list)}_with_empty_line.csv'
+    # insert an empty string after the first item and before the list item (arbitrarily chosen positions)
+    cusip_list_with_empty_lines = cusip_list.copy()
+    cusip_list_with_empty_lines.insert(1, '')
+    cusip_list_with_empty_lines.insert(-1, '')
+    pd.DataFrame(cusip_list_with_empty_lines).to_csv(filename, header=None, index=None)
+    request_obj = response_from_batch_pricing(filename)
+    assert request_obj.ok, 'The response from batch pricing for a CSV with empty lines was not successful'    # successful response; checks whether the status_code is less than 400
+    check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip_list)
+
+
+@run_multiple_times_before_failing
+def test_missing_cusips_in_csv():
+    csv_lines = [['64971XQM3', 500, 'P'], 
+                 ['','','P'],    # missing CUSIP and quantity
+                 ['', '', ''],    # missing CUSIP, quantity, and trade type
+                 ['6461367J4', 100, 'S'], 
+                 ['', 1500, ''],    # missing CUSIP and trade type
+                 ['', 50, 'P']]    # missing CUSIP
+    cusip_list = [line[0] for line in csv_lines if line[0] != '']
+    filename = f'{DIRECTORY}/missing_cusips.csv'
+    with open(filename, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerows(csv_lines)
+    request_obj = response_from_batch_pricing(filename)
+    assert request_obj.ok, 'The response from batch pricing for a CSV with empty CUSIPs was not successful'    # successful response; checks whether the status_code is less than 400
+    check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip_list, check_quantity_equals_default=False)
+
+
+@run_multiple_times_before_failing
+def test_only_missing_cusips_in_csv():
+    csv_lines = [['','','P'],    # missing CUSIP and quantity
+                 ['', '', ''],    # missing CUSIP, quantity, and trade type
+                 ['', 1500, ''],    # missing CUSIP and trade type
+                 ['', 50, 'P']]    # missing CUSIP
+    filename = f'{DIRECTORY}/only_missing_cusips.csv'
+    with open(filename, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerows(csv_lines)
+    request_obj = response_from_batch_pricing(filename)
+    assert request_obj.ok, 'The response from batch pricing for a CSV with empty CUSIPs was not successful'    # successful response; checks whether the status_code is less than 400
+
+
+@run_multiple_times_before_failing
+def test_large_batch():
+    '''Tests that a large batch of CUSIPs does not cause a batch pricing error. The key here is to 
+    set the number of CUSIPs to be more than twice as large as `LARGE_BATCH_SIZE` since this would 
+    mean that the asynchronous call handling will be activated (the first call is non-asynchronous 
+    with just the first batch and the later calls are made asynchronously).'''
+    cusip_list = ['64971XQM3'] * (2000 * 2 + 1)    # 2000 is `LARGE_BATCH_SIZE` inside app_engine/demo/server/modules/batch_pricing.py, and this gives us 3 batches
+
+    def testing_function(make_post_request_with_file: bool):
+        request_obj = response_from_batch_pricing(get_filename_from_cusip_list(cusip_list), cusip_list, create_file=make_post_request_with_file)
+        return check_that_batch_pricing_gives_price_for_all_cusips(request_obj, cusip_list, post_request_made_with_file=make_post_request_with_file)
+
+    run_tests_with_and_without_file_batch_pricing(testing_function)

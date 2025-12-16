@@ -1,0 +1,26 @@
+steps:
+  - name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud functions deploy train-minute-yield-curve \
+          --gen2 \
+          --runtime python310 \
+          --region us-central1 \
+          --source cloud_functions/train-minute-yield-curve \
+          --entry-point main \
+          --trigger-http \
+          --service-account 964018767272-compute@developer.gserviceaccount.com \
+          --memory 2Gi \
+          --cpu 1 \
+          --timeout 540s \
+          --min-instances 1 \
+          --max-instances 100 \
+          --concurrency 2 \
+          --set-env-vars LOG_EXECUTION_ID=true \
+          --vpc-connector yield-curve-connector \
+          --egress-settings private-ranges-only \
+          --ingress-settings all
+options:
+  logging: CLOUD_LOGGING_ONLY

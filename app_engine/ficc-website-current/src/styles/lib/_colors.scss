@@ -1,0 +1,39 @@
+@mixin light {
+  --white: #fff;
+  --black: #111;
+  --primary: #5a5a91;
+  --secondary: #35646e;
+  --accent: #43e4ff;
+  --warning: #d6ad5c;
+  --info: #e1e1ff;
+  --success: #2ac78a;
+  --error: #eb0045;
+  --text-primary: #fff;
+  --text-secondary: #e1e1ff;
+  --text-contrast: #303030;
+  --surface-primary-1: #454545;
+  --surface-primary-2: #303030;
+  --surface-secondary-1: #fff;
+  --surface-secondary-2: #eaeaea;
+  --surface-accent-1: #43e4ff;
+  --grey-1: #f6f6f6;
+  --grey-2: #ededed;
+  --grey-3: #cfcfcf;
+  --grey-4: #bcbcbc;
+  --grey-5: #999;
+  --grey-6: #747474;
+  --grey-7: #606060;
+  --grey-8: #414141;
+  --grey-9: #1f1f1f;
+  --gradient-start: #cdf4fd;
+  --gradient-end: #76e1fb;
+}
+
+@mixin dark {
+  --text-primary: #303030;
+  --text-contrast: #fff;
+  --surface-secondary-1: #454545;
+  --surface-secondary-2: #303030;
+  --surface-primary-1: #fff;
+  --surface-primary-2: #eaeaea;
+}

@@ -1,0 +1,339 @@
+'''
+Description: Calls the MSRB API and stores the trades in cloud storage. A previous version of this cloud function was deployed as `get_msrb_trade_messages` 
+             which used cloud functions v2. This was causing frequent hanging request issues which were leading to timeout errors, so this was downgraded to cloud functions 
+             v1. To revert back to cloud functions v2, the key steps are (1) import `functions_framework` (and put functions-framework==3.* in the requirements.txt), and 
+             (2) put the decorator @functions_framework.http on the `hello_http(...)` method.
+'''
+# import functions_framework
+
+from urllib.error import URLError    # used in `get_msrb_trade_messages(...)` to raise an error when MSRB API is failing
+from functools import wraps
+import time
+from datetime import timedelta, datetime
+
+import json
+import urllib3
+import requests
+
+from pytz import timezone
+
+import pandas as pd
+import pickle
+
+from google.cloud import bigquery, secretmanager, storage
+from send_email import send_error_email
+
+
+# # TODO: comment the below line out when not running the function locally
+# import os
+# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/home/user/ficc/mitas_creds.json'
+
+bqclient = bigquery.Client()
+
+eastern = timezone('US/Eastern')
+
+YEAR_MONTH_DAY = '%Y-%m-%d'
+HOUR_MIN_SEC = '%H:%M:%S'
+
+PROJECT_ID = 'eng-reactor-287421'
+
+MSRB_INTRADAY_FILES_BUCKET_NAME = 'msrb_intraday_real_time_trade_files'
+ALL_TRADE_MESSAGES_FILENAME = 'all_trade_messages'
+MSRB_TRADE_MESSAGES_TABLE_NAME = 'MSRB.msrb_trade_messages'
+
+
+def function_timer(function_to_time):
+    '''This function is to be used as a decorator. It will print out the execution time of `function_to_time`.'''
+    @wraps(function_to_time)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        print(f'BEGIN {function_to_time.__name__}')
+        start_time = time.time()
+        result = function_to_time(*args, **kwargs)
+        end_time = time.time()
+        print(f'END {function_to_time.__name__}. Execution time: {timedelta(seconds=end_time - start_time)}')
+        return result
+    return wrapper
+
+
+def run_multiple_times_before_failing(function):
+    '''This function is to be used as a decorator. It will run `function` over and over again until it does not 
+    raise an Exception for a maximum of `max_runs` (specified below) times. It solves the following problem: GCP 
+    limits how quickly files can be downloaded from buckets and raises an `SSLError` or a `KeyError` when the 
+    buckets are accessed too quickly in succession.'''
+    @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+    def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+        max_runs = 50    # NOTE: max_runs = 1 is the same functionality as not having this decorator
+        while max_runs > 0:
+            try:
+                return function(*args, **kwargs)
+            except (KeyError, urllib3.exceptions.SSLError, requests.exceptions.SSLError) as e:    # catches KeyError: 'email', KeyError: 'expires_in', urllib3.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad, requests.exceptions.SSLError: [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac 
+                max_runs -= 1
+                if max_runs == 0: raise e
+                time.sleep(1)    # have a one second delay to prevent overloading the server
+    return wrapper
+
+
+def _get_credentials(secret_id, version_id, project_id=PROJECT_ID):
+    '''Directly taken from `access_secret_version(...)` from cloud function `update_msrb_real_time_trade_messages`.'''
+    client = secretmanager.SecretManagerServiceClient()    # create the Secret Manager client
+    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'    # build the resource name of the secret version
+    response = client.access_secret_version(request={'name': name})
+    payload = response.payload.data.decode('UTF-8')
+    return payload
+
+
+def get_latest_username():
+    '''Get the latest username from SecretManagerServiceClient.'''
+    return _get_credentials('msrb_username', 'latest')
+
+
+def get_latest_password():
+    '''Get the latest password from SecretManagerServiceClient.'''
+    return _get_credentials('msrb_password', 'latest')
+
+
+def _get_blob_and_google_cloud_filename(file_name, current_date, bucket_name):
+    client = storage.Client()
+    bucket = client.get_bucket(bucket_name)
+    google_cloud_filename = f'{current_date}/{file_name}'    # creates a folder `current_date` and stores `file_name` inside of this; if desired to not create the folder, change this to `file_name`
+    return bucket.blob(google_cloud_filename), google_cloud_filename
+
+
+def upload_to_storage(file_name, file_text, current_timestamp, bucket_name=MSRB_INTRADAY_FILES_BUCKET_NAME):
+    '''Uploads a file with name `file_name` contained in folder with name `current_date` to a bucket 
+    `bucket_name` containing `file_text`.'''
+    current_date = current_timestamp[:10]    # assumes that the first 10 characters of `timestamp` contain the year, month, and day (e.g., 2024-01-01 is 10 characters)
+    blob, google_cloud_filename = _get_blob_and_google_cloud_filename(file_name, current_date, bucket_name)
+    blob.upload_from_string(file_text)
+    print(f'File from {file_name} uploaded to Google cloud storage: {bucket_name}/{google_cloud_filename}')
+
+
+def upload_dataframe_as_pickle_file_to_storage(file_name, df, current_timestamp, bucket_name=MSRB_INTRADAY_FILES_BUCKET_NAME):
+    '''Upload `df` as a pickle file to Google Cloud Storage with name `file_name` contained in folder with 
+    name `current_date` to a bucket `bucket_name`.'''
+    current_date = current_timestamp[:10]    # assumes that the first 10 characters of `timestamp` contain the year, month, and day (e.g., 2024-01-01 is 10 characters)
+    google_cloud_filename_with_bucket = f'gs://{bucket_name}/{current_date}/{file_name}.pkl'
+    df.to_pickle(f'{google_cloud_filename_with_bucket}')
+    print(f'Successfully uploaded {len(df)} trades (all trades so far for {current_date}) to {google_cloud_filename_with_bucket}')
+
+
+@function_timer
+def upload_msrb_json_to_bigquery(rows_as_json):
+    '''Upload `df` to `eng-reactor-287421.MSRB.msrb_trade_messages` table.'''
+    table_id = f'{PROJECT_ID}.{MSRB_TRADE_MESSAGES_TABLE_NAME}'    # in the first iteration of this function a filename addendum of '_from_get_msrb_trade_messages' was added to `table_id`
+    errors = bqclient.insert_rows_json(table_id, rows_as_json)
+    if errors != []: send_error_email('msrb_api.py bq_client.insert_rows_json(table_id, rows_to_insert) Error', str(errors))
+
+
+DATA_TYPE_DICT = {'upload_date': 'date', 
+                  'message_type': 'string', 
+                  'sequence_number': 'integer', 
+                  'rtrs_control_number': 'integer', 
+                  'trade_type': 'string', 
+                  'transaction_type': 'string', 
+                  'cusip': 'string', 
+                  'security_description': 'string', 
+                  'dated_date': 'date', 
+                  'coupon': 'numeric', 
+                  'maturity_date': 'date', 
+                  'when_issued': 'boolean', 
+                  'assumed_settlement_date': 'date', 
+                  'trade_date': 'date', 
+                  'time_of_trade': 'time', 
+                  'settlement_date': 'date', 
+                  'par_traded': 'numeric', 
+                  'dollar_price': 'float', 
+                  'yield': 'float', 
+                  'brokers_broker': 'string', 
+                  'is_weighted_average_price': 'boolean', 
+                  'is_lop_or_takedown': 'boolean', 
+                  'publish_date': 'date', 
+                  'publish_time': 'time', 
+                  'version': 'numeric', 
+                  'unable_to_verify_dollar_price': 'boolean', 
+                  'is_alternative_trading_system': 'boolean', 
+                  'is_non_transaction_based_compensation': 'boolean', 
+                  'is_trade_with_a_par_amount_over_5MM': 'boolean'}
+
+
+def data_typecasting(trade_message_dict):
+    '''Fill in the appropriate values into the original `trade_message_dict` by performing typecasting.'''
+    for field, value in trade_message_dict.items():
+        new_value = None
+        try:
+            if DATA_TYPE_DICT[field] == 'boolean':    # if the value is `None`, we want to have the boolean value be False, otherwise keep it `None` to be null in the table
+                new_value = value == 'Y'
+            elif value is None:
+                continue
+            elif DATA_TYPE_DICT[field] == 'date':
+                if len(value) in (6, 8):
+                    if len(value) == 8: datetime_format = '%Y%m%d'
+                    elif len(value) == 6: datetime_format = '%m%d%y'
+                    new_value = datetime.strptime(value, datetime_format).strftime(YEAR_MONTH_DAY)
+            elif DATA_TYPE_DICT[field] in ('numeric', 'float'):
+                if value == 'MM+':
+                    trade_message_dict['is_trade_with_a_par_amount_over_5MM'] = 'Y'
+                elif value != '':
+                    new_value = float(value)
+            elif DATA_TYPE_DICT[field] == 'string':
+                new_value = value   
+            elif DATA_TYPE_DICT[field] == 'integer':
+                new_value = int(value) 
+            elif DATA_TYPE_DICT[field] == 'time':
+                new_value = datetime.strftime(datetime.strptime(value, '%H%M%S'), HOUR_MIN_SEC)
+        except Exception as e:    # NOTE: 'except Exception' places null value for every value returned that does not fit the data type - we lose data that way, but perhaps not useful data
+            print(f'field: {field}, value: {value}; does not match schema. Error: {e}')
+        trade_message_dict[field] = new_value
+
+    trade_message_dict['upload_date'] = datetime.now(eastern).strftime(YEAR_MONTH_DAY)
+    return trade_message_dict
+
+
+def trade_message_to_database_record(trade_message): 
+    fields = ['message_type', 
+              'sequence_number', 
+              'delete', 
+              'rtrs_control_number', 
+              'trade_type', 
+              'transaction_type', 
+              'cusip', 
+              'security_description', 
+              'dated_date', 
+              'coupon', 
+              'maturity_date', 
+              'when_issued', 
+              'assumed_settlement_date', 
+              'trade_date', 
+              'time_of_trade', 
+              'settlement_date', 
+              'par_traded', 
+              'dollar_price', 
+              'yield', 
+              'brokers_broker', 
+              'is_weighted_average_price', 
+              'is_lop_or_takedown', 
+              'publish_date', 
+              'publish_time', 
+              'version', 
+              'unable_to_verify_dollar_price', 
+              'is_alternative_trading_system', 
+              'is_non_transaction_based_compensation', 
+              'is_trade_with_a_par_amount_over_5MM']
+    trade_message_parsed = trade_message.split(',')
+    temp_dict = dict([s.split('=', 1) for s in trade_message_parsed])
+    dict_record = {int(key): value for key, value in temp_dict.items()}
+    dict_record_with_headers = ({field: dict_record[idx + 1] if idx + 1 in dict_record else None for idx, field in enumerate(fields)})
+    del dict_record_with_headers['delete']
+    return data_typecasting(dict_record_with_headers)
+
+
+def convert_date_object_to_date_type(trade_dict):
+    '''Convert each date object to date type.'''
+    for field, data_type in DATA_TYPE_DICT.items():
+        date = trade_dict[field]
+        if data_type == 'date' and date is not None: trade_dict[field] = datetime.strptime(date, YEAR_MONTH_DAY).date()
+    return trade_dict
+
+
+def get_google_cloud_filename(timestamp, file_format:str):
+    accepted_file_formats = ('json', 'pkl')
+    assert file_format in accepted_file_formats, f'Invalid file_format of {file_format}. Needs to be one of {accepted_file_formats}'
+    filename_wo_extension = f'real_time_msrb_file_{timestamp}'    # in the first iteration of this function a filename addendum of '_from_get_msrb_trade_messages' was added to `filename_wo_extension`
+    return f'{filename_wo_extension}.{file_format}'
+
+
+@function_timer
+def get_msrb_trade_messages(beginning_sequence_number, timestamp):
+    '''If this function has errors, refer to https://docs.google.com/document/d/1RPeXWpOehtTcR98B3l5LgR2f6MxxpRKQRDOpYhGroPU/edit?usp=sharing.'''
+    base_url = 'https://rtrsprodsubscription.msrb.org'    # if not TESTING else 'https://rtrsbetasubscription.msrb.org'    # the testing URL is so that we can query MSRB as frequently as possible; it may not have all of the trade messages but can still be used for testing
+    url = f'{base_url}/rtrssubscriptionwebservice/api/Subscription.GetNext?beginSequence={beginning_sequence_number}'
+    headers = {'credentials': get_latest_username() + ',' + get_latest_password(),
+               'accept': 'application/json'}
+    response = requests.request('GET', url, headers=headers)
+    if not response.ok:
+        raise URLError(f'Getting MSRB trade messages using URL {url} failed with status code: {response.status_code}, so we do not proceed further')
+        # return None   # used if we want to make progress even in the presence of MSRB API errors
+    response = json.loads(response.text)
+    trade_messages = response.get('Subscription')
+    if trade_messages is None:
+        raise RuntimeError('response.get("Subscription") returns `None` so we do not proceed further; raising an error so that we can figure out why this is occurring')
+    num_messages = trade_messages.get('RecordCount')
+    print(f'{num_messages} messages from MSRB from and including sequence number: {beginning_sequence_number}')
+    if num_messages > 0:
+        trade_messages = trade_messages.get('Records')
+        upload_to_storage(get_google_cloud_filename(timestamp, 'json'), json.dumps(trade_messages), timestamp)
+        rows = [trade_message_to_database_record(message['Message']) for message in trade_messages]
+        if rows != []:
+            upload_msrb_json_to_bigquery(rows)    # NOTE: this cannot be done asynchronously since the function below mutates `rows`
+            rows = [convert_date_object_to_date_type(row) for row in rows]
+            return pd.DataFrame(rows)
+        else:
+            send_error_email('msrb_api.py trade_message_to_full_db_record Error', str(trade_messages))
+    else:
+        print(f'No new trade messages since sequence number: {beginning_sequence_number}')
+    return None
+
+
+@function_timer
+def get_latest_sequence_number(trade_messages_sorted_by_sequence_number:pd.DataFrame):
+    '''TODO: make sure that we get some straggler trades from the night before. Check what the max date was of the last entry, and then 
+    check from that point on if there are any trades with a sequence number larger than the latest trade from that day (use publish datetime). 
+    Strategy: find the most recent date and the most recent sequence number'''
+    latest_sequence_number = -1 if trade_messages_sorted_by_sequence_number is None else trade_messages_sorted_by_sequence_number.iloc[-1]['sequence_number']    # select the -1 index since `trade_messages_sorted_by_sequence_number` is sorted in ascending order by sequence number from calling `.sort_index()` in `update_all_trade_messages(...)`
+    print('latest_sequence_number:', latest_sequence_number)
+    return latest_sequence_number
+
+
+@run_multiple_times_before_failing
+def download_pickle_file(file_name, current_date, bucket_name=MSRB_INTRADAY_FILES_BUCKET_NAME):
+    '''This function is used to download the data from the GCP storage bucket.
+    It is assumed that we will be downloading a pickle file.'''
+    blob, google_cloud_filename = _get_blob_and_google_cloud_filename(f'{file_name}.pkl', current_date, bucket_name)
+    if not blob.exists(): return None    # this `if` statement is entered if the file does not exist
+    pickle_in = blob.download_as_string()
+    data = pickle.loads(pickle_in)
+    print(f'Pickle file {file_name} downloaded from {bucket_name}/{google_cloud_filename}')
+    return data
+
+
+@function_timer
+def get_all_trade_messages(timestamp):
+    '''Each day has its own dataframe pickle file with all trades, so we retrieve it for the 
+    day from the specified timestamp.'''
+    timestamp_wo_hour_min_sec = timestamp[:10]    # assumes that the first 10 characters of `timestamp` contain the year, month, and day (e.g., 2024-01-01 is 10 characters)
+    return download_pickle_file(ALL_TRADE_MESSAGES_FILENAME, timestamp_wo_hour_min_sec)
+
+
+@function_timer
+def update_all_trade_messages(new_trade_messages, old_trade_messages, timestamp):
+    '''Concatenate `new_trade_messages` to the current dataframe of all the trade messages 
+    for today stored in Google Cloud Storage and re-upload it to Google Cloud Storage.'''
+    new_trade_messages = new_trade_messages.set_index('sequence_number', drop=False)    # `drop=False` prevents removing the column from the dataframe that is being used as the index
+    new_trade_messages = new_trade_messages.sort_index()    # new trades are now in sorted order by `sequence_number` ascending
+
+    num_rows_to_display_for_sanity_check = 5
+    print(f'First and last {num_rows_to_display_for_sanity_check} lines of the new trades are below:')
+    print(new_trade_messages.head(num_rows_to_display_for_sanity_check).to_markdown())
+    print(new_trade_messages.tail(num_rows_to_display_for_sanity_check).to_markdown())
+
+    all_trade_messages = pd.concat([old_trade_messages, new_trade_messages]) if old_trade_messages is not None else new_trade_messages    # preserves the ascending order of the `sequence_number` index
+    all_trade_messages = all_trade_messages.drop_duplicates(keep='first', ignore_index=False)    # prevents duplicate trades being stored in all trades, if there are duplicate trades coming in due to re-running the function after upstream failures; the `keep` argument can be either `first` or `last`, but leaving it empty will result in all duplicates to be dropped; `ignore_index=False` (default functionality) will NOT re-label the index as 0, 1, ..., n-1
+    upload_dataframe_as_pickle_file_to_storage(ALL_TRADE_MESSAGES_FILENAME, all_trade_messages, timestamp)
+
+
+# @functions_framework.http
+def hello_http(request):
+    '''The @functions_framework.http decorator is only needed if this cloud function is deployed as version 2.
+    Step 1: Get MSRB data. Step 2: Process MSRB data. Step 3: Get reference data from reference_data_redis. 
+    NOTE: updating the reference data redis is done in this cloud function: `update-new-pipeline-ice-data`'''
+    current_timestamp = datetime.now(eastern).strftime(f'{YEAR_MONTH_DAY}_{HOUR_MIN_SEC}')
+    trade_messages_up_to_latest_sequence_number = get_all_trade_messages(current_timestamp)
+    latest_sequence_number = get_latest_sequence_number(trade_messages_up_to_latest_sequence_number)
+    # TODO: this could be a place where we could try to find trades that happened when we don't expect them to
+    # if we run this cloud function once at the end of the day of every day, then we will always get all 
+    # of the trades that day. hard case: trade occurs on sunday
+    # if TESTING: latest_sequence_number = 0    # TODO: remove after testing; testing API from https://rtrsbetasubscription.msrb.org does not provide any values when `latest_sequence_number` is large
+    trade_messages_after_latest_sequence_number = get_msrb_trade_messages(latest_sequence_number + 1, current_timestamp)
+    if trade_messages_after_latest_sequence_number is not None:
+        update_all_trade_messages(trade_messages_after_latest_sequence_number, trade_messages_up_to_latest_sequence_number, current_timestamp)
+    return 'SUCCESS'

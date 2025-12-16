@@ -1,0 +1,29 @@
+{
+    "attemptDeadline": "60s",
+    "description": "Remove the Firebase tokens cache file so that it does not become stale, i.e., make sure that the cache file does not contain cached tokens for users that have not used the product in a long time. Since the timezone is set to America/Los_Angeles, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "headers": {
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/remove_firebase_tokens_cache",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/remove_firebase_tokens_cache"
+    },
+    "lastAttemptTime": "2025-01-12T06:30:00.588886Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/remove_firebase_tokens_cache",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "0s",
+        "minBackoffDuration": "5s"
+    },
+    "schedule": "30 22 * * 6",
+    "scheduleTime": "2025-01-19T06:30:00.566576Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/Los_Angeles",
+    "userUpdateTime": "2024-11-05T01:18:13Z"
+}

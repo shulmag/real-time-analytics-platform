@@ -1,0 +1,9 @@
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-secret-manager==2.0.0
+pandas
+numpy
+tqdm
+matplotlib
+scipy
+pyarrow>=0.4

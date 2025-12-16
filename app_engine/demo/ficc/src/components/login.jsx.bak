@@ -1,0 +1,111 @@
+/*
+ * @Author: Gil Shulman 
+ * @Date: 2021-09-29 13:05:46 
+ * @Last Modified by: Developer
+ * @Last Modified time: 2022-09-19
+ */
+import React, { useRef } from 'react'
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+// import firebase from 'firebase/compat/app'
+import { getAuth, signInWithEmailAndPassword } from 'firebase/auth'
+import Form from 'react-bootstrap/Form'
+import Container from 'react-bootstrap/Container'
+import Row from 'react-bootstrap/Row'
+import Col from 'react-bootstrap/Col'
+import Card from 'react-bootstrap/Card'
+// import { OwnID } from '@ownid/react'
+
+
+function LoginForm(props) {
+    const nav = useNavigate()
+
+    const emailIdField = useRef(null)
+    const passwordField = useRef(null)
+    const submitField = useRef(null)
+
+    const [state, setState] = useState({
+        email: '',
+        password: ''
+    })
+
+    function handleChange(e) {
+        const {id, value} = e.target
+        setState(prevState => ({
+            ...prevState,
+            [id]: value
+        }))
+    }
+
+    function handleSubmitClick(event) {
+        event.preventDefault()
+        if (state.email.length && state.password.length) {
+            const auth = getAuth()
+        
+            signInWithEmailAndPassword(auth, state.email, state.password)
+                .then((userCredential) => {
+                    redirectToDemo()
+                })
+                .catch((error) => {
+                    // var errorCode = error.code
+                    // var errorMessage = error.message
+                    alert('Invalid login credentials')
+                })
+        }
+    }
+
+    function redirectToDemo() {
+        nav('/pricing')
+    }
+
+    return (
+        <Container className='d-flex justify-content-center align-items-center'>
+            <Row className='h-100 p-3 mx-auto'>
+                <Col className='h-100 p-3 mx-auto'>
+                    <Card className='' style={{width: '18rem'}}>
+                        <Card.Body>
+                            <Form>
+                                <Form.Group>
+                                    <Form.Label htmlFor='exampleInputEmail1'>Email Address</Form.Label>
+                                    <Form.Control type='email'
+                                                  className='form-control'
+                                                  ref={emailIdField}
+                                                  id='email'
+                                                  aria-describedby='emailHelp'
+                                                  placeholder='name@example.com'
+                                                  value={state.email}
+                                                  onChange={handleChange}
+                                    />
+
+                                    <Form.Label className='mt-2' htmlFor='exampleInputPassword1'>Password</Form.Label>
+                                    <Form.Control type='password'
+                                                  className='form-control'
+                                                  ref={passwordField}
+                                                  id='password'
+                                                  placeholder='Password'
+                                                  value={state.password}
+                                                  onChange={handleChange}
+                                    />
+                                    {/* <OwnID type='login'
+                                        passwordField={passwordField}
+                                        loginIdField={emailIdField}
+                                        onError={(error) => console.error(error)}
+                                        onLogin={redirectToDemo}
+                                        options={{ variant: 'button-fingerprint', infoTooltip: true }} /> */}
+                                    <button type='submit' id='submit' ref={submitField} className='btn btn-primary mt-2'
+                                            onClick={handleSubmitClick}>Login
+                                    </button>
+                                </Form.Group>
+                            </Form>
+                            <div className='alert alert-success mt-2'
+                                 style={{display: state.successMessage ? 'block' : 'none'}} role='alert'>
+                                {state.successMessage}
+                            </div>
+                        </Card.Body>
+                    </Card>
+                </Col></Row>
+        </Container>
+    )
+}
+
+export default (LoginForm)

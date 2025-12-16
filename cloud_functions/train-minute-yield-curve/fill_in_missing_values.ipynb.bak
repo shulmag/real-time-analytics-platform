@@ -1,0 +1,408 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fill in missing values for real-time yield curve\n",
+    "Author: Developer Ray  \n",
+    "Date: 2024-12-05  \n",
+    "Last Editor: Developer Ray  \n",
+    "Last Edit Date: 2025-01-13  \n",
+    "\n",
+    "The core idea is to use the data from Alpha Vantage, which stores historical quotes for the bond ETFs that we use to create our real-time yield curve. This data is then used with the code from the `train-minute-yield-curve` cloud function to fill in the missing timestamps in both the yield curve redis and BigQuery. It is important to fill in missing data so that the product is able to price quickly, since the real-time yield curve is used to get yield curve values for trades in the trade history during processing. Heavily inspired by previous notebook written by Isaac Lim to fix this same issue.\n",
+    "\n",
+    "This notebook was tested on Python 3.10 but should run on any newer version. To run this notebook, use the `requirements_jupyter.txt` found in the `train-minute-yield-curve` cloud function directory. Then, perform the following updates to the notebook:\n",
+    "1. Change `TARGET_DATE` to be the date with missing values for the real-time yield curve that will be filled in with this notebook\n",
+    "2. Put the location of the GCP credentials in `os.environ['GOOGLE_APPLICATION_CREDENTIALS']`\n",
+    "3. Set `UPLOAD_TO_BIGQUERY_AND_REDIS` to `True` to upload to BigQuery or Redis; by default, it is set to `False` to not write which is desirable during testing\n",
+    "4. (Optional) if testing frequently, consider setting the `save_data` optional argument in `load_pickled_query_results_if_exists(...)` to `True` to cache the results of the API call"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import time\n",
+    "import requests\n",
+    "import pickle\n",
+    "from datetime import datetime, timedelta\n",
+    "\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "from tqdm.notebook import tqdm\n",
+    "\n",
+    "import auxiliary_variables\n",
+    "auxiliary_variables.TESTING = True    # this allows print statements to be used throughout the files; since auxiliary_variables.TESTING has already been updated, subsequent imports will reflect this change, since Python modules are cached after the first import, so the change remains effective\n",
+    "\n",
+    "from auxiliary_variables import PROJECT_ID, DATASET_NAME, ALPHA, DAILY_ETF_WEIGHTS_TABLES, ETFs\n",
+    "from auxiliary_functions import previous_business_day\n",
+    "from bigquery_utils import load_daily_etf_prices_bq, load_maturity_bq, load_index_yields_bq, get_scalar_df, load_shape_parameter\n",
+    "from yieldcurve import get_maturity_dict, get_NL_inputs, scale_X, run_NL_ridge, get_coefficient_df, load_scaler_daily_bq, get_scaler_params\n",
+    "from main import YIELD_CURVE_REDIS_CLIENT, get_schema_minute_yield, load_etf_models_bq, get_prediction_for_sp_maturity_table, upload_data_to_bigquery, upload_data_to_redis"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "UPLOAD_TO_BIGQUERY_AND_REDIS = False"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "TARGET_DATE = '2025-01-13'    # date with missing values for the real-time yield curve\n",
+    "TARGET_YEAR_MONTH = pd.to_datetime(TARGET_DATE).strftime('%Y-%m')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "YEAR_MONTH_DAY = '%Y-%m-%d'\n",
+    "HOUR_MIN = '%H:%M'\n",
+    "YEAR_MONTH_DAY_HOUR_MIN = f'{YEAR_MONTH_DAY}:{HOUR_MIN}'\n",
+    "YEAR_MONTH_DAY_HOUR_MIN_SEC = f'{YEAR_MONTH_DAY} %H:%M:%S'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ALPHA_VANTAGE_KEY = 'EZR0IHAAL6MFWX4B'    # TODO: where did we get this from?"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_pickled_query_results_if_exists(file_name: str, url: str, api_call_function: callable, save_data: bool = False) -> pd.DataFrame:\n",
+    "    file_name = f'files/{file_name}'\n",
+    "    if os.path.exists(file_name):\n",
+    "        print(f'Found {file_name} so will try to load the pickle file')\n",
+    "        with open(file_name, 'rb') as f:\n",
+    "            saved_url, df = pickle.load(f)\n",
+    "        \n",
+    "        if saved_url == url:\n",
+    "            print(f'Saved URL matched the desired URL so will load the dataframe')\n",
+    "            return df\n",
+    "        else:\n",
+    "            print(f'Saved URL: {saved_url} does not match desired URL: {url}, so will make API call')\n",
+    "    \n",
+    "    df = api_call_function(url)\n",
+    "    if save_data:\n",
+    "        print(f'Saving the URL and dataframe in the pickle file: {file_name}')\n",
+    "        with open(file_name, 'wb') as f:\n",
+    "            pickle.dump((url, df), f)\n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_latest_etf_minute_prices_from_alpha_vantage(etf: str, year_month: str, wait: bool = False) -> pd.DataFrame:\n",
+    "    '''`wait` is a boolean that determines whether we wait to avoid hitting the upper limit of the API calls.'''\n",
+    "    url = f'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={etf}&interval=1min&extended_hours=false&adjusted=false&month={year_month}&outputsize=full&apikey={ALPHA_VANTAGE_KEY}'\n",
+    "    print(f'Getting data for {etf} on {year_month} using: {url}')\n",
+    "\n",
+    "    def api_call_function(url: str) -> pd.DataFrame:\n",
+    "        num_seconds_to_wait_between_api_calls = 15\n",
+    "        if wait:\n",
+    "            print(f'... waiting {num_seconds_to_wait_between_api_calls} seconds to not hit the upper limit of API calls ...')\n",
+    "            time.sleep(num_seconds_to_wait_between_api_calls)\n",
+    "        r = requests.get(url)\n",
+    "        data = r.json()\n",
+    "        df = pd.DataFrame(data['Time Series (1min)']).T    # 'Time Series (1min)' is the name of the time series data\n",
+    "\n",
+    "        for col in df:\n",
+    "            df[col] = df[col].astype(float)\n",
+    "\n",
+    "        # rename columns to match the column names that are used downstream\n",
+    "        df.index.rename('Date', inplace=True)\n",
+    "        df = df.rename({'1. open': 'Open',\n",
+    "                        '2. high': 'High',\n",
+    "                        '3. low': 'Low',\n",
+    "                        '4. close': 'Close',\n",
+    "                        '5. volume': 'Volume'},\n",
+    "                        axis=1)\n",
+    "        df.columns = df.columns + '_' + etf\n",
+    "        df.index = pd.to_datetime(df.index)\n",
+    "        return df\n",
+    "    \n",
+    "    pickle_file_name = f'{etf}_{year_month}.pkl'\n",
+    "    return load_pickled_query_results_if_exists(pickle_file_name, url, api_call_function)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_latest_etf_minute_prices_for_all_etfs(year_month: str) -> dict:\n",
+    "    return {etf: get_latest_etf_minute_prices_from_alpha_vantage(etf, year_month, wait=(idx != 0)) for idx, etf in enumerate(ETFs)}    # do not wait on the first call because no other calls have been made yet\n",
+    "\n",
+    "\n",
+    "def get_close_prices_for_date(date: str, etf_to_dataframe: dict, open_time: str = '09:30', close_time: str = '15:59') -> pd.DataFrame:\n",
+    "    '''The default values for `open_time` and `close_time` are the market open and market close times respectively.'''\n",
+    "    combined_df = pd.concat([df.filter(regex='Close', axis=1) for _, df in etf_to_dataframe.items()], axis=1)    # get close prices for each ETF and merge into one dataframe\n",
+    "    combined_df.columns = combined_df.columns.str.replace('Close_', '', regex=False)    # remove the 'Close_' prefix from each column name\n",
+    "    \n",
+    "    get_open = lambda date: datetime.strptime(f'{date} {open_time}:00', YEAR_MONTH_DAY_HOUR_MIN_SEC)\n",
+    "    get_close = lambda date: datetime.strptime(f'{date} {close_time}:00', YEAR_MONTH_DAY_HOUR_MIN_SEC)\n",
+    "    complete_index = pd.date_range(start=get_open(date), end=get_close(date), freq='min')\n",
+    "    \n",
+    "    combined_df = combined_df.loc[date].reindex(complete_index).ffill()    # forward fill because Alpha Vantage prices have some gaps\n",
+    "    return combined_df\n",
+    "\n",
+    "\n",
+    "def is_valid_date_format(date_string: str):\n",
+    "    '''\n",
+    "    >>> is_valid_date_format('2025-01-13')\n",
+    "    True\n",
+    "    >>> is_valid_date_format('13-01-2025')\n",
+    "    False\n",
+    "    >>> is_valid_date_format('2025/01/13')\n",
+    "    False\n",
+    "    '''\n",
+    "    try:\n",
+    "        # Try to parse the string using the YYYY-MM-DD format\n",
+    "        datetime.strptime(date_string, YEAR_MONTH_DAY)\n",
+    "        return True\n",
+    "    except ValueError:\n",
+    "        # If parsing fails, the format is incorrect\n",
+    "        return False"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "etf_to_dataframe = get_latest_etf_minute_prices_for_all_etfs(TARGET_YEAR_MONTH)\n",
+    "combined_df_with_etf_quotes = get_close_prices_for_date(TARGET_DATE, etf_to_dataframe)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "combined_df_with_etf_quotes"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "The below cell requires the `matplotlib` package."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_change_in_etf_throughout_day(combined_df_with_etf_quotes: pd.DataFrame) -> None:\n",
+    "    for etf_idx, etf in enumerate(combined_df_with_etf_quotes.columns):\n",
+    "        plt.figure(figsize=(4, 3))\n",
+    "        combined_df_with_etf_quotes.iloc[:, etf_idx].plot()\n",
+    "        plt.title(etf)\n",
+    "        plt.xlabel('time')\n",
+    "        plt.ylabel('Value')\n",
+    "        plt.grid(True)\n",
+    "        plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plot_change_in_etf_throughout_day(combined_df_with_etf_quotes)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Set credentials below to access BigQuery."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/home/user/ficc/mitas_creds.json'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Load BigQuery data. Taken almost directly from `cloud_functions/train-minute-yield-curve/main.py::main(...)`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "etf_data = load_daily_etf_prices_bq()\n",
+    "maturity_df = load_maturity_bq()\n",
+    "scaler_daily_parameters = load_scaler_daily_bq()\n",
+    "index_data = load_index_yields_bq()\n",
+    "etf_model_data = load_etf_models_bq()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Get scalar and maturity data most recent to `TARGET_DATE`. Taken almost directly from `cloud_functions/train-minute-yield-curve/main.py::main(...)`. Only put in values that are missing."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_timestamps_with_missing_yield_curve_values(date: str) -> list[str]:\n",
+    "    '''The returned list will have strings of the form: HH:MM.'''\n",
+    "    assert is_valid_date_format(date), f'{date} is not a valid YYYY-MM-DD format'\n",
+    "    market_end_time = datetime.strptime('15:59', HOUR_MIN)\n",
+    "\n",
+    "    timestamps = []\n",
+    "    current_time = datetime.strptime('09:30', HOUR_MIN)    # initialize with market start time\n",
+    "    while current_time <= market_end_time:\n",
+    "        timestamps.append(current_time.strftime(HOUR_MIN))\n",
+    "        current_time += timedelta(minutes=1)\n",
+    "\n",
+    "    timestamps = [f'{date}:{timestamp}' for timestamp in timestamps]    # put `date` before the timestamp and seconds after timestamp to be a valid redis key\n",
+    "    yield_curve_values = YIELD_CURVE_REDIS_CLIENT.mget(timestamps)\n",
+    "    return [timestamp for (timestamp, yield_curve_value) in zip(timestamps, yield_curve_values) if yield_curve_value is None]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "timestamps_with_missing_yield_curve_values = get_timestamps_with_missing_yield_curve_values(TARGET_DATE)\n",
+    "print(timestamps_with_missing_yield_curve_values)\n",
+    "timestamps_with_missing_yield_curve_values = set(timestamps_with_missing_yield_curve_values)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "day_before_target_date = previous_business_day(TARGET_DATE, return_as_string=True)\n",
+    "exponential_mean, exponential_std, laguerre_mean, laguerre_std = get_scaler_params(day_before_target_date, scaler_daily_parameters)\n",
+    "maturity_dict = get_maturity_dict(maturity_df, day_before_target_date)\n",
+    "\n",
+    "prev_close_data = [etf_data[fund][f'Close_{fund}'].loc[day_before_target_date:] for fund in ETFs]\n",
+    "prev_close_data = pd.concat(prev_close_data, axis=1)\n",
+    "\n",
+    "yield_curve_coefficients_for_each_timestamp = []\n",
+    "tau = load_shape_parameter(day_before_target_date)\n",
+    "scalar_df = get_scalar_df(day_before_target_date)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for timestamp_to_the_minute, quote_data in tqdm(combined_df_with_etf_quotes.iterrows(), total=len(combined_df_with_etf_quotes)):\n",
+    "    intraday_change = ((quote_data.values - prev_close_data) / prev_close_data) * 100 * 100    # first 100 is for percent, and second 100 is for basis points\n",
+    "    \n",
+    "    predicted_ytw = pd.DataFrame()\n",
+    "    for daily_etf_weights_table_name in DAILY_ETF_WEIGHTS_TABLES:\n",
+    "        predicted_ytw[daily_etf_weights_table_name] = get_prediction_for_sp_maturity_table(daily_etf_weights_table_name, \n",
+    "                                                                                           timestamp_to_the_minute, \n",
+    "                                                                                           day_before_target_date, \n",
+    "                                                                                           intraday_change, \n",
+    "                                                                                           etf_model_data[daily_etf_weights_table_name], \n",
+    "                                                                                           index_data[daily_etf_weights_table_name], \n",
+    "                                                                                           verbose=False)\n",
+    "\n",
+    "    yield_curve_df = predicted_ytw.T.rename({0: 'ytw'}, axis=1)\n",
+    "    yield_curve_df['Weighted_Maturity'] = yield_curve_df.index.map(maturity_dict).astype(float)\n",
+    "    X, y = get_NL_inputs(yield_curve_df, tau)\n",
+    "    X = scale_X(X, exponential_mean, exponential_std, laguerre_mean, laguerre_std)\n",
+    "    ridge_model = run_NL_ridge(X, y, scale=False, alpha=ALPHA)\n",
+    "    coefficient_df = get_coefficient_df(ridge_model, timestamp_to_the_minute)\n",
+    "    yield_curve_coefficients_for_each_timestamp.append(coefficient_df)\n",
+    "    \n",
+    "    if timestamp_to_the_minute.strftime(YEAR_MONTH_DAY_HOUR_MIN) in timestamps_with_missing_yield_curve_values:    # only perform upload if the timestamp is missing\n",
+    "        if UPLOAD_TO_BIGQUERY_AND_REDIS:\n",
+    "            print(f'{timestamp_to_the_minute} uploaded to BigQuery and Redis since `UPLOAD_TO_BIGQUERY_AND_REDIS` is set to `True`')\n",
+    "            upload_data_to_bigquery(coefficient_df, f'{PROJECT_ID}.{DATASET_NAME}.nelson_siegel_coef_minute', get_schema_minute_yield())\n",
+    "            upload_data_to_redis(timestamp_to_the_minute, coefficient_df, scalar_df, tau)\n",
+    "        else:\n",
+    "            print(f'{timestamp_to_the_minute} is missing and would be uploaded to BigQuery and Redis if `UPLOAD_TO_BIGQUERY_AND_REDIS` were set to `True`')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pd.concat(yield_curve_coefficients_for_each_timestamp)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.13"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}

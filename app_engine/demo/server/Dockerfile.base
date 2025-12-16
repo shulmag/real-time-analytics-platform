@@ -1,0 +1,32 @@
+# Last Editor: Developer Ray
+# Last Edit Date: 2025-03-04
+# Description: Base Dockerfile.
+
+# Use a lightweight Python base image with a specific version, minimizing image size and startup time
+FROM python:3.10-slim AS base
+
+# Set environment variables for Python and Cloud Run; 8080 is the default port for Cloud Run
+# `PYTHONUNBUFFERED=1` ensures logs appear immediately
+# `PYTHONDONTWRITEBYTECODE=1` prevents writing .pyc files; in containerized environments (like Docker or Google Cloud Run), the filesystem is typically ephemeral and read-only, and so writing .pyc files serves no purpose and may even cause errors if Python tries to write them to a read-only filesystem
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    APP_HOME=/app
+
+# Set the working directory
+WORKDIR $APP_HOME
+
+# Install system dependencies for building Python packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy only the requirements file first (improves caching)
+COPY requirements.txt .
+
+# Install Python dependencies with no cache for a smaller image
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Ensure the container runs as a non-root user for security
+RUN adduser --disabled-password --gecos '' appuser && \
+    chown -R appuser $APP_HOME
+USER appuser

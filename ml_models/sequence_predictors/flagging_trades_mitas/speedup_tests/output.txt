@@ -1,0 +1,12 @@
+INFO: Pandarallel will run on 10 workers.
+INFO: Pandarallel will use standard multiprocessing data transfer (pipe) to transfer data between the main process and workers.
+START: Reading from processed file at /Users/mitas/ficc/ficc/ml_models/sequence_predictors/data/processed_data_ficc_ycl_2021-12-31-23-59.pkl
+END: Reading from processed file at /Users/mitas/ficc/ficc/ml_models/sequence_predictors/data/processed_data_ficc_ycl_2021-12-31-23-59.pkl
+Elapsed time: 11.793183088302612 seconds
+is_same_day flag matches
+Elapsed time: 5.924104928970337 seconds
+ntbc_precursor flag matches
+Elapsed time: 8.741798162460327 seconds
+is_replica flag matches
+Elapsed time: 2.8427059650421143 seconds
+is_bookkeeping flag matches

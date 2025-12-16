@@ -1,0 +1,28 @@
+runtime: python37
+service: new-server
+instance_class: F4_1G
+
+inbound_services:
+- warmup
+
+vpc_access_connector:
+  name: "projects/eng-reactor-287421/locations/us-central1/connectors/redis-connector"
+  egress_setting: all-traffic
+
+handlers:
+  # This handler routes all requests not caught above to your main app. It is
+  # required when static routes are defined, but can be omitted (along with
+  # the entire handlers section) when there are no static files defined.
+- url: /.*
+  script: auto
+
+liveness_check:
+  timeout_sec: 300
+
+automatic_scaling:
+    min_instances: 1
+    min_idle_instances: 1
+    max_instances: 100
+    min_pending_latency: 30ms
+    max_pending_latency: automatic
+    max_concurrent_requests: 50

@@ -1,0 +1,18 @@
+'''
+ # @ Author: Developer Shayaan
+ # @ Create Time: 2021-12-20 10:45:07
+ # @ Modified by: Developer
+ # @ Modified time: 2023-08-02
+ # @ Description: This file implements the function that calculates
+ #  the number of days in the interest payment period
+ '''
+
+from modules.ficc.utils.auxiliary_variables import COUPON_FREQUENCY_TYPE, LARGE_NUMBER
+
+# This is used to debug, please comment before deploying
+# from utils.auxiliary_variables import COUPON_FREQUENCY_TYPE, LARGE_NUMBER
+
+
+def days_in_interest_payment(trade):
+    frequency = COUPON_FREQUENCY_TYPE[trade['interest_payment_frequency']]
+    return 360 / frequency if frequency != 0 else LARGE_NUMBER

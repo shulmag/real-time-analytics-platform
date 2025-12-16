@@ -1,0 +1,34 @@
+'''
+Author: Developer Ray
+Date: 2025-03-21
+Last Editor: Developer Ray
+Last Edit Date: 2025-03-21
+'''
+import subprocess    # allows you to spawn new processes, connect to their input/output/error pipes, and obtain their return codes; used to execute shell commands, scripts, and external programs from within a Python script
+
+from auxiliary_variables import failure_event
+
+
+def handle_failure(message):
+    '''Mark the failure event and exit all threads.'''
+    print(f"{message}")
+    failure_event.set()    # Signals all threads to stop
+    exit(1)    # Exit the script immediately
+
+
+def run_shell_command(command, check=True) -> bool:
+    '''Safely run a shell command. Returns a boolean value indicating whether the run was successful.'''
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=check)
+        print(result.stdout)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"{type(e)}: {e}")
+        print("Command:", e.cmd)    # Shows the command that failed
+        print("Exit Code:", e.returncode)    # Shows the error code
+        print("Error Message (stderr):", e.stderr)    # Captured stderr
+        print("Standard Output (stdout):", e.stdout)    # Captured stdout (if any)
+        return False
+    except Exception as e:
+        print(f"{type(e)}: {e}")
+        return False

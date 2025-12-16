@@ -1,0 +1,208 @@
+# Author: Developer
+# Date:   2021-08-23
+# Last Modified by:   Developer
+# Last Modified time: 2021-08-24
+
+import numpy as np
+import pandas as pd
+import os
+from google.cloud import bigquery
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
+
+project_id = "eng-reactor-287421"
+sp_maturity_dataset = 'spBondIndexMaturities'
+sp_index_dataset = 'spBondIndex'
+
+# Specifying table names in bigquery
+sp_maturity_tables = [
+    'sp_7_12_year_national_amt_free_index',
+    'sp_high_quality_index',
+    'sp_high_quality_intermediate_managed_amt_free_index',
+    'sp_high_quality_short_intermediate_index',
+    'sp_high_quality_short_index',
+]
+
+sp_index_tables = [
+    'sp_7_12_year_national_amt_free_municipal_bond_index_yield',
+    'sp_muni_high_quality_index_yield',
+    'sp_high_quality_intermediate_managed_amt_free_municipal_bond_index_yield',
+    'sp_high_quality_short_intermediate_municipal_bond_index_yield',
+    'sp_high_quality_short_municipal_bond_index_yield',
+]
+
+name_dict = dict(zip(sp_index_tables, sp_maturity_tables))
+
+
+###Functions to transform maturities into the components in the nelson-siegel model
+def decay_transformation(t: np.array, L: float):
+    '''
+    This function takes a numpy array of maturities (or a single float) and a shape parameter. It returns the exponential function
+    calculated from those values. This is the first feature of the nelson-siegel model.
+
+    Parameters:
+    t:np.array
+    L:float
+    '''
+    return L * (1 - np.exp(-t / L)) / t
+
+
+def laguerre_transformation(t: np.array, L: float):
+    '''
+    This function takes a numpy array of maturities (or a single float) and a shape parameter. It returns the laguerre function
+    calculated from those values. This is the second feature of the nelson-siegel model.
+
+    Parameters:
+    t:np.array
+    L:float
+    '''
+    return (L * (1 - np.exp(-t / L)) / t) - np.exp(-t / L)
+
+
+###Functions to load data from bigquery
+def load_maturity_bq():
+    '''
+    This function loads the maturity data from the specified bigquery tables in the global sp_maturity_tables list and concatenates them
+    into a single dataframe.
+    '''
+
+    client = bigquery.Client()
+    maturity_data = []
+
+    for table in sp_maturity_tables:
+        query = '''
+                SELECT DISTINCT * FROM {}.{} ORDER BY effectivedate DESC LIMIT 1 
+
+                '''.format(
+            sp_maturity_dataset, table
+        )
+
+        df = pd.read_gbq(query, project_id=project_id, dialect='standard')
+
+        assert list(df.columns) == [
+            'effectivedate',
+            'weightedAverageMaturity',
+            'weightedAverageDuration',
+        ]
+
+        df['effectivedate'] = pd.to_datetime(df['effectivedate'], format='%Y-%m-%d')
+        df.set_index('effectivedate', inplace=True, drop=True)
+        df = df[['weightedAverageMaturity']]
+        maturity_data.append(df)
+
+    df = pd.concat(maturity_data, axis=1)
+    df.columns = sp_maturity_tables
+
+    return df
+
+
+def load_index_yields_bq():
+    '''
+    This function loads the index yield data from the specified bigquery tables in the global sp_index_tables list and concatenates them
+    into a single dataframe.
+    '''
+
+    client = bigquery.Client()
+    index_data = []  # {}
+
+    for table in sp_index_tables:
+        query = '''
+                SELECT DISTINCT * FROM {}.{} ORDER BY date DESC LIMIT 1 
+
+                '''.format(
+            sp_index_dataset, table
+        )
+
+        df = pd.read_gbq(query, project_id=project_id, dialect='standard')
+
+        assert list(df.columns) == ['date', 'ytw']
+
+        df['date'] = pd.to_datetime(df['date'], format='%Y-%m-%d')
+        df['ytw'] = df['ytw'] / 0.01  # convert to basis points
+        df = df.drop_duplicates('date')
+        df.set_index('date', inplace=True, drop=True)
+        index_data.append(df)
+
+    df = pd.concat(index_data, axis=1)
+    df.columns = sp_maturity_tables
+
+    return df
+
+
+###Functions to preprocess data and fit model
+def get_maturity_dict(maturity_data: pd.DataFrame, date: str):
+    '''
+    This function takes as input the dataframe returned by the load_maturity_bq function, retrieves the row corresponding to the date of
+    interesting and converts that row into a dictionary, with key-value pairs corresponding to S&P index names and their maturities.
+
+    Parameters:
+    maturity_data:pd.DataFrame
+    date:str
+    '''
+
+    temp_df = maturity_data.loc[date]
+    maturity_dict = dict(zip(temp_df.index, temp_df.values))
+    assert len(maturity_dict) != 0, "No data for given date found!"
+    return maturity_dict
+
+
+def get_yield_curve_df(index_data: pd.DataFrame, date: str, maturity_dict: dict):
+    '''
+    This function takes as input the dataframe returned by the load_index_yields_bq and retrieves the yields corresponding to the specified
+    date. It then uses a dictionary of maturities for each index to map the right maturity to each index. The output is a dataframe with a
+    column for maturity and a column for ytw, indexed by index names.
+
+    Parameters:
+    index_data:pd.DataFrame
+    date:str
+    maturity_dict:dict
+    '''
+
+    yield_curve_df = pd.DataFrame(index_data.loc[date])
+    yield_curve_df.columns = ['ytw']
+    yield_curve_df['Weighted_Maturity'] = yield_curve_df.index.map(maturity_dict)
+    return yield_curve_df
+
+
+def get_NL_inputs(yield_curve_df: pd.DataFrame, L: float):
+    '''
+    This function takes the output of the get_yield_curve_df function alongside a shape parameter to generate the features of the nelson
+    siegel yield curve. It then creates the exponential feature and the laguerre feature using the decay_transformation and
+    laguerre_transformation corresponding to the given shape parameter, and returns the features (X1,X2) and the labels (ytw).
+
+    Parameters:
+    yield_curve_df:pd.DataFrame
+    L:float
+    '''
+    temp_df = yield_curve_df.copy()
+    temp_df['X1'] = decay_transformation(temp_df['Weighted_Maturity'], L)
+    temp_df['X2'] = laguerre_transformation(temp_df['Weighted_Maturity'], L)
+
+    X = temp_df[['X1', 'X2']]
+    y = temp_df['ytw']
+
+    return X, y
+
+
+def run_NL_ridge(X: pd.DataFrame, y: pd.Series, alpha=0.001, scale=True):
+    '''
+    This function takes the X and Y values and runs a ridge regression to estimate the nelson-siegel yield curve model. If the sklearn
+    StandardScaler is used, then the scaler object is returned alongside the model object so that the scaler parameters can be saved as
+    well.
+
+    Parameters:
+    X: pd.DataFrame/np.array
+    y: pd.Series/np.array
+    alpha:float
+    scale:bool
+    '''
+
+    if scale:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+        ridge = Ridge(alpha=alpha, random_state=1).fit(X, y)
+        return scaler, ridge
+    else:
+        ridge = Ridge(alpha=alpha, random_state=1).fit(X, y)
+        return ridge

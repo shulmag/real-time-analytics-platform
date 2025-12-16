@@ -1,0 +1,244 @@
+/* General table styling */
+.ficc-table {
+    border-radius: 8px;
+    overflow: hidden;
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    margin-bottom: 1.5rem;
+    background-color: white;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    border: 1px solid #e2e8f0;
+  }
+  
+  .ficc-table thead th {
+    background-color: #f7fafc;
+    color: #4a5568;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.025em;
+    padding: 12px 16px;
+    border-bottom: 2px solid #e2e8f0;
+    vertical-align: middle;
+  }
+  
+  .ficc-table tbody tr {
+    transition: background-color 0.2s;
+  }
+  
+  .ficc-table tbody tr:hover {
+    background-color: #f7fafc;
+  }
+  
+  .ficc-table tbody td {
+    padding: 12px 16px;
+    border-top: 1px solid #e2e8f0;
+    color: #2d3748;
+    font-size: 0.9rem;
+    vertical-align: middle;
+  }
+  
+  /* Results table with highlight */
+  .ficc-results-table {
+    margin-top: 1rem;
+    margin-bottom: 2rem;
+  }
+  
+  .ficc-results-table thead th {
+    background-color: #ebf4ff;
+    color: #2c5282;
+    font-weight: 600;
+  }
+  
+  .ficc-results-table .highlight {
+    background-color: #ebf8ff;
+    color: #2b6cb0;
+    font-weight: 600;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+  }
+  
+  /* Section headings */
+  .ficc-section-heading {
+    color: #2d3748;
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-top: 2rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  
+  /* Card styling */
+  .ficc-card {
+    border-radius: 8px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    background-color: white;
+    margin-bottom: 1.5rem;
+  }
+  
+  .ficc-card-header {
+    background-color: #f7fafc;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid #e2e8f0;
+    font-weight: 600;
+    color: #2d3748;
+    border-radius: 8px 8px 0 0;
+  }
+  
+  .ficc-card-body {
+    padding: 1.5rem;
+  }
+  
+  /* Table subcomponents */
+  .ficc-nested-table {
+    margin: 0.5rem 0 0.5rem 1rem;
+    width: calc(100% - 2rem);
+    box-shadow: none;
+    border: 1px solid #e2e8f0;
+  }
+  
+  .ficc-nested-table thead th {
+    background-color: #edf2f7;
+    font-size: 0.8rem;
+    padding: 8px 12px;
+  }
+  
+  .ficc-nested-table tbody td {
+    padding: 8px 12px;
+    font-size: 0.85rem;
+  }
+  
+  /* Compliance rating colors */
+  .rating-great {
+    color: #22543d;
+    background-color: #c6f6d5;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  
+  .rating-good {
+    color: #2c5282;
+    background-color: #bee3f8;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  
+  .rating-fair {
+    color: #744210;
+    background-color: #fefcbf;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  
+  .rating-poor {
+    color: #822727;
+    background-color: #fed7d7;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  
+  /* Pagination styling */
+  .ficc-pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-top: 1rem;
+    margin-bottom: 1rem;
+  }
+  
+  .ficc-pagination button {
+    margin: 0 0.25rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid #e2e8f0;
+    background-color: white;
+    color: #4a5568;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+  }
+  
+  .ficc-pagination button:hover:not(:disabled) {
+    background-color: #f7fafc;
+    color: #3182ce;
+    border-color: #cbd5e0;
+  }
+  
+  .ficc-pagination button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  
+  .ficc-pagination .page-info {
+    margin: 0 0.75rem;
+    font-size: 0.85rem;
+    color: #4a5568;
+  }
+  
+  .ficc-pagination select {
+    padding: 0.4rem 0.75rem;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    color: #4a5568;
+    background-color: white;
+  }
+  
+  /* Form improvements */
+  .ficc-form-group {
+    margin-bottom: 1rem;
+  }
+  
+  .ficc-form-label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #4a5568;
+    margin-bottom: 0.5rem;
+  }
+  
+  .ficc-form-control {
+    border-radius: 8px;
+    padding: 10px 16px;
+    border: 1px solid #e2e8f0;
+    transition: border-color 0.2s;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  
+  .ficc-form-control:focus {
+    border-color: #4299e1;
+    box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.15);
+  }
+  
+  /* Button styling */
+  .ficc-btn {
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-weight: 600;
+    transition: all 0.2s;
+  }
+  
+  .ficc-btn-primary {
+    background-color: #3182ce;
+    border: none;
+    color: white;
+  }
+  
+  .ficc-btn-primary:hover {
+    background-color: #2c5282;
+  }
+  
+  .ficc-btn-secondary {
+    background-color: #edf2f7;
+    border: 1px solid #e2e8f0;
+    color: #4a5568;
+  }
+  
+  .ficc-btn-secondary:hover {
+    background-color: #e2e8f0;
+  }

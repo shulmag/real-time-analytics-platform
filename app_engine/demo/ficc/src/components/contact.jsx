@@ -1,0 +1,126 @@
+/*
+ * @Date: 2023-01-04 
+ */
+
+import React from 'react'
+import { useState } from 'react'
+
+import { createCustomer } from '../services/priceService' 
+
+import Form from 'react-bootstrap/Form'
+import Container from 'react-bootstrap/Container'
+import Row from 'react-bootstrap/Row'
+import Col from 'react-bootstrap/Col'
+import Card from 'react-bootstrap/Card'
+import Alert from 'react-bootstrap/Alert'
+
+
+function ContactUs(props) {
+    const [isAdded, setIsAdded] = useState(false)
+
+    const [state, setState] = useState({
+        company: '',
+        name: '',
+        email: '', 
+        message: ''
+    })
+
+    function handleChange(e) {
+        const {id, value} = e.target
+        setState(prevState => ({
+            ...prevState,
+            [id]: value
+        }))
+    }
+
+    async function add_prospect() {
+        let response = ''
+        response = await createCustomer(state.company, state.name, state.email, state.message)
+        return response.data[0]['f0_']
+    }
+
+    function handleSubmitClick(event) {
+        event.preventDefault()
+        if (state.email.length && state.name.length) {    
+            let res = add_prospect()
+            if (res) {
+                setIsAdded(true)
+            }
+        }
+    }
+
+    // can change appearance with https://react-bootstrap.netlify.app/docs/forms/form-control/
+    return (
+        
+        <Container className='d-flex justify-content-center align-items-center'>
+            {isAdded? <Alert className='mt-5' key='success' variant='success'>Thank you for your interest. We will be in touch shortly.</Alert> :
+            <Row className='h-100 p-3 mx-auto'>
+                <Col className='h-100 p-3 mx-auto'>
+                    <Card className='' style={{width: '36rem'}}>
+                        <Card.Body>
+                            <Card.Title>Contact Us</Card.Title>
+                            <Card.Text>Fill out the form below, and we'll get back to you very soon!</Card.Text>
+                            <Form>
+                                <Form.Group>
+                                    <Form.Label className='mt-2' htmlFor='name'><strong>Name</strong></Form.Label>
+                                    <Form.Control type='text'
+                                                  required
+                                                  className='form-control'
+                                                  minLength='4'
+                                                  maxLength='30'
+                                                  id='name'
+                                                  placeholder='Your name'
+                                                  value={state.name}
+                                                  onChange={handleChange}
+                                    />
+
+                                    <Form.Label className='mt-2' htmlFor='email'><strong>Email</strong></Form.Label>
+                                    <Form.Control type='email'
+                                                  required
+                                                  className='form-control'
+                                                  id='email'
+                                                  placeholder='name@example.com'
+                                                  value={state.email}
+                                                  onChange={handleChange}
+                                    />
+
+                                    <Form.Label className='mt-2' htmlFor='company'><strong>Company</strong></Form.Label>
+                                    <Form.Control type='text'
+                                                  className='form-control'
+                                                  minLength='2'
+                                                  maxLength='30'
+                                                  id='company'
+                                                  placeholder='Company name'
+                                                  aria-describedby='Company name'
+                                                  value={state.company}
+                                                  pattern='[a-zA-Z]{1,}'
+                                                  onChange={handleChange}
+                                    />
+
+                                    <Form.Label className='mt-2' htmlFor='email'><strong>Message</strong></Form.Label>
+                                    <Form.Control type='text'
+                                                  className='form-control'
+                                                  id='message'
+                                                  as='textarea'
+                                                  placeholder='Type your message...'
+                                                  value={state.message}
+                                                  onChange={handleChange}
+                                    />
+
+                                    <button type='submit' id='submit' className='btn btn-primary mt-2'
+                                            onClick={handleSubmitClick}>Submit
+                                    </button>
+                                </Form.Group>
+                            </Form>
+                            <div className='alert alert-success mt-2'
+                                 style={{display: state.successMessage ? 'block' : 'none'}} role='alert'>
+                                {state.successMessage}
+                            </div>
+                        </Card.Body>
+                    </Card>
+                </Col></Row>}
+        </Container>
+    )
+}
+
+export default (ContactUs)

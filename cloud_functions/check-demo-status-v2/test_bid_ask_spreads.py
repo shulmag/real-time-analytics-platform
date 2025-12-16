@@ -1,0 +1,51 @@
+'''
+'''
+from auxiliary_variables import FEATURES_FOR_OUTPUT_CSV
+from auxiliary_functions import run_multiple_times_before_failing, get_filename_from_cusip_list, response_from_batch_pricing, get_spreadsheet_as_list, handle_nan
+import math
+import pandas as pd
+
+
+def _sell_price_larger_than_purchase_price(cusip_list, quantity_list):
+    '''Tests that each CUSIP in `cusip_list` for each quantity in `quantity_list` has a sell price 
+    larger than the purchase price.'''
+    filename = get_filename_from_cusip_list(cusip_list[:3])    # longer than 3 CUSIPs gives an unnecessarily long filename
+    num_prices_to_get = len(cusip_list) * len(quantity_list)
+    cusip_list = [cusip for cusip in cusip_list for _ in range(len(quantity_list))]    # https://stackoverflow.com/questions/1198777/double-iteration-in-list-comprehension
+    quantity_list = quantity_list * (num_prices_to_get // len(quantity_list))
+
+    price_idx = FEATURES_FOR_OUTPUT_CSV.index('price')
+    ytw_idx = FEATURES_FOR_OUTPUT_CSV.index('ytw')
+
+    request_obj = response_from_batch_pricing(filename, cusip_list, quantity_list, trade_type='S')
+    customer_buy_content = get_spreadsheet_as_list(request_obj)
+    request_obj = response_from_batch_pricing(filename, cusip_list, quantity_list, trade_type='P')
+    customer_sell_content = get_spreadsheet_as_list(request_obj)
+
+    for idx, (customer_buy_row, customer_sell_row) in enumerate(zip(customer_buy_content, customer_sell_content)):
+
+        buy_price = handle_nan(customer_buy_row[price_idx])
+        sell_price = handle_nan(customer_sell_row[price_idx])
+        buy_yield = handle_nan(customer_buy_row[ytw_idx])
+        sell_yield = handle_nan(customer_sell_row[ytw_idx])
+
+        assert (buy_price == None and  sell_price == None) or (buy_price >= sell_price, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the customer buy price {buy_price} should be greater than or equal to the customer sell price {sell_price}')
+
+        assert (buy_yield == None and  sell_yield == None) or (buy_yield <= sell_yield, f'For CUSIP {cusip_list[idx]} and quantity {quantity_list[idx]}, the customer buy yield {buy_yield} should be less than or equal to the customer sell yield {sell_yield}')
+
+
+@run_multiple_times_before_failing
+def test_cusips_from_jim_perrello():
+    '''Tests that the CUSIPs 574193VL9 and 156756TBF0, do not have negative bid ask spreads. These CUSIPs 
+    where provided by Jim Perrello in an email with subject: broken model?! on May 25, 2023.'''
+    cusip_list = ['574193VL9', '156756TBF0']
+    quantity_list = [25, 100, 500, 1000]    # chosen from Jim Perrello's email
+    _sell_price_larger_than_purchase_price(cusip_list, quantity_list)
+
+
+@run_multiple_times_before_failing
+def test_64972GWZ3():
+    '''Tests that the CUSIP 64972GWZ3 does not have negative bid ask spreads.'''
+    cusip_list = ['64972GWZ3']
+    quantity_list = [25, 100, 500, 1000, 5000, 10000]    # arbitrarily chosen
+    _sell_price_larger_than_purchase_price(cusip_list, quantity_list)

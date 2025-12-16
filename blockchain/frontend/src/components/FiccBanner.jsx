@@ -1,0 +1,25 @@
+/*
+ * @Date: 2025-03-06
+ */
+
+import React from 'react';
+
+const FiccBanner = () => {
+  return (
+    <div className="alert alert-primary mb-4 d-flex align-items-center justify-content-between">
+      <div>
+        <strong>Powered by ficc.ai</strong> - A leading provider of municipal bond pricing and analytics
+      </div>
+      <a 
+        href="https://ficc.ai" 
+        target="_blank" 
+        rel="noopener noreferrer" 
+        className="btn btn-sm btn-outline-primary"
+      >
+        Visit ficc.ai
+      </a>
+    </div>
+  );
+};
+
+export default FiccBanner; 

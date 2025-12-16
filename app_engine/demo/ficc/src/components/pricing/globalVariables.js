@@ -1,0 +1,1 @@
+const FONT_SIZE = '14px'

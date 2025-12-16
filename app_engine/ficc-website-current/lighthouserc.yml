@@ -1,0 +1,44 @@
+ci:
+  collect:
+    numberOfRuns: 4
+    staticDistDir: './out'
+    url: '/index.html'
+    settings:
+      throttling:
+        cpuSlowdownMultiplier: 3
+      throttlingMethod: devtools
+      onlyAudits:
+        - first-contentful-paint
+        - speed-index
+        - largest-contentful-paint
+        - cumulative-layout-shift
+        - interactive
+        - total-blocking-time
+  upload:
+    target: 'temporary-public-storage'
+  assert:
+    assertions:
+      first-contentful-paint:
+        - warn
+        - maxNumericValue: 1800
+          aggregationMethod: optimistic
+      largest-contentful-paint:
+        - warn
+        - maxNumericValue: 2500
+          aggregationMethod: optimistic
+      speed-index:
+        - warn
+        - maxNumericValue: 3370
+          aggregationMethod: optimistic
+      cumulative-layout-shift:
+        - warn
+        - maxNumericValue: .1
+          aggregationMethod: optimistic
+      interactive:
+        - warn
+        - maxNumericValue: 3780
+          aggregationMethod: optimistic
+      total-blocking-time:
+        - warn
+        - maxNumericValue: 200
+          aggregationMethod: optimistic

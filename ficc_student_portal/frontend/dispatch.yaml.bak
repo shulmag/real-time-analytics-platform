@@ -1,0 +1,12 @@
+dispatch:
+  - url: "pricing.ficc.ai/*"
+    service: default
+  
+  - url: "stellar.ficc.ai/*"
+    service: blockchain
+
+  - url: "beacon.ficc.ai/*"
+    service: monitor 
+
+  - url: "campus.ficc.ai/*"
+    service: student 

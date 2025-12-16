@@ -1,0 +1,59 @@
+# -*- coding: utf-8 -*-
+# @Author: Developer
+# @Date:   2021-09-06 11:06:27
+# @Last Modified by:   Developer
+# @Last Modified time: 2021-09-06 11:06:27
+
+
+from google.cloud import bigquery
+import os
+import pandas as pd
+import pickle
+import redis
+import smtplib, ssl
+from email.mime.text import MIMEText
+from google.cloud import secretmanager
+
+bq_client = bigquery.Client()
+job_config = bigquery.job.QueryJobConfig(allow_large_results=True)
+redis_host = os.environ.get('REDISHOST', '10.146.62.92')
+redis_port = int(os.environ.get('REDISPORT', 6379))
+redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+
+def sqltodf(sql,limit = ""):
+    if limit != "": 
+        limit = f" WHERE trade_date < DATE({limit})"
+    bqr = bq_client.query(sql + limit).result()
+    return bqr.to_dataframe()
+
+#The following fetches Nelson-Siegel coefficient and standard scalar parameters from BigQuery and sends them to a dataframe. 
+
+nelson = sqltodf("select * from `eng-reactor-287421.yield_curves.nelson_siegel_coef_daily`")
+scalar = sqltodf("select * from`eng-reactor-287421.yield_curves.standardscaler_parameters_daily`")
+
+#The below sets the index of both dataframes to date column and converts the data type to datetime. 
+
+nelson.set_index("date",drop=True,inplace=True)
+scalar.set_index("date",drop=True,inplace=True)
+scalar.index = pd.to_datetime(scalar.index)
+nelson.index = pd.to_datetime(scalar.index)
+
+# The following function serializes the data and sends it to redis. 
+
+def upload_data_to_redis(key, value):
+    value = pickle.dumps(value,protocol=pickle.HIGHEST_PROTOCOL)
+    redis_client.set(key, value)
+
+#The following iterates over the rows and creates a single dataframe. 
+
+def main(args):
+    for index, _ in nelson.iterrows():
+        nelson_values=nelson.loc[[index]]
+        scalar_values=scalar.loc[[index]]
+        temp_dict={"nelson_values":nelson_values, "scalar_values":scalar_values}
+        string_date = index.strftime('%Y-%m-%d')
+        try:
+            upload_data_to_redis(string_date,temp_dict)
+        except Exception as e:
+            raise e
+    return "Success!!"

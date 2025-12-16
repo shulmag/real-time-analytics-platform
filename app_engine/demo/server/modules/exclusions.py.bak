@@ -1,0 +1,147 @@
+'''
+Author: Developer Ray
+Date: 2024-10-29
+Last Editor: Developer Watson
+Last Edit Date: 2028-08-28
+Description: Functions that are used to refuse to price certain CUSIPs.
+'''
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+from modules.ficc.utils.trade_dict_to_list import TRADE_FEATURE_TO_INDEX
+
+from modules.auxiliary_variables import SEQUENCE_LENGTH, SEQUENCE_LENGTH_DOLLAR_PRICE
+from modules.auxiliary_functions import get_feature_value, set_feature_value
+
+
+CUSIPS_UNDER_REVIEW = {'798712BK0',    # from Maria Smith
+                       '355850AF5',    # added by Developer talking to Peter Hill on 2024-05-20: 355850AF5 and 355850AG3 are from the same issuer but one of them has a high yield in the history and so we decline to price both
+                       '355850AG3'}    # added by Developer talking to Peter Hill on 2024-05-20: 355850AF5 and 355850AG3 are from the same issuer but one of them has a high yield in the history and so we decline to price both
+
+# These messages are used when a CUSIP cannot be priced
+CUSIP_ERROR_MESSAGE = {'invalid': 'CUSIP is invalid', 
+                       'invalid_user_price': 'User Price is either missing or invalid (must be a number)', 
+                       'not_found': 'CUSIP not supported', 
+                       'invalid_check_digit': 'The check digit of the input CUSIP is not a digit between 0 and 9', 
+                       'not_outstanding': 'CUSIP is no longer outstanding', 
+                    #    'defaulted': 'CUSIP has defaulted',    # moved to `auxiliary_variables.py::DOLLAR_PRICE_MODEL_DISPLAY_TEXT` since this exclusion is now being handled by the dollar price model
+                       'maturing_soon': 'CUSIP is maturing very soon or has already matured',    # some cases have been moved to `auxiliary_variables.py::DOLLAR_PRICE_MODEL_DISPLAY_TEXT` since this exclusion is now being handled by the dollar price model
+                       'not_bonds': 'CUSIP is not supported because we do not support Anticipation Notes, Certificates of Obligation, Warrants, or Commercial Paper', 
+                       'insufficient_data': 'One or more of the following fields necessary to compute yield has not been reported for this CUSIP: dated date, interest payment/coupon date, maturity date, incorporated state code, coupon (interest) rate', 
+                       'negative_yield_in_history': 'MSRB reported yields for this CUSIP are missing or negative. Support for this CUSIP is coming soon!', 
+                       'irregular_coupon_rate': 'This CUSIP has an irregular/variable coupon rate or interest payment frequency. Support for this CUSIP is coming soon!', 
+                    #    'high_yield_in_history': 'MSRB reported yields for this CUSIP are abnormally high (greater than 10%). Email us at myles@ficc.ai if you would like to see this CUSIP supported!',    # moved to `auxiliary_variables.py::DOLLAR_PRICE_MODEL_DISPLAY_TEXT` since this exclusion is now being handled by the dollar price model
+                       'null_dollar_price_in_history': 'MSRB reported prices are missing for this CUSIP. Support for this CUSIP is coming soon!', 
+                       'bank_loan': 'Private placements and bank loans not yet supported. Support for this CUSIP is coming soon!', 
+                       'under_review': 'This CUSIP is under review. Support for this CUSIP is coming soon!', 
+                       'quantity_greater_than_outstanding_amount': lambda outstanding_amount: f'The quantity attempting to be priced is larger than the amount outstanding of ${int(outstanding_amount)} for this CUSIP'}    # '{:,}.format(...) is used to add commas to the number: https://stackoverflow.com/questions/5180365/add-commas-into-number-string; removed the commas in the number since it was causing problems with automated CSV parsing as the commas were creating additional columns
+
+IMPORTANT_FEATURES = ['coupon', 'interest_payment_frequency', 'coupon_type', 'default_indicator', 'incorporated_state_code']
+IMPORTANT_DATES = ['next_coupon_payment_date', 'maturity_date', 'first_coupon_date', 'accrual_date', 'delivery_date']
+ADDITIONAL_DATES_TO_CHECK_FOR_INVALID_VALUES = ['last_period_accrues_from_date']
+
+
+def missing_important_dates_or_dates_are_out_of_bounds(single_cusip_data: pd.Series | np.ndarray, trade_date: pd.Timestamp):
+    '''Checks whether important dates needed for pricing are null. To price a CUSIP, we need 
+    `next_coupon_payment_date`, `maturity_date`, `first_coupon_date`, `accrual_date`, and `delivery_date`, 
+    and we need to make sure that these dates are in bounds according to pandas. Sometimes the reference data puts a 
+    placeholder date of ‘9999-12-31’ or something like that which is out of bounds and unable to be handled 
+    by pandas. However, we only need these features if the CUSIP is neither called nor a zero coupon bond.'''
+    def date_is_out_of_bounds(date):
+        try:
+            pd.to_datetime(date)
+            return False    # Not out of bounds
+        except (ValueError, pd.errors.OutOfBoundsDatetime):
+            return True    # Out of bounds
+    
+    if isinstance(trade_date, pd.Timestamp) or isinstance(trade_date, datetime):    # only instance of `trade_date` already being a `datetime.date` object is when calling server code from point-in-time pricing notebooks, and in this case, calling `.date()` will raise the following error: `AttributeError: 'datetime.date' object has no attribute 'date'`
+        trade_date = trade_date.date()    # convert to `datetime.date` for comparison
+
+    interest_payment_frequency = get_feature_value(single_cusip_data, 'interest_payment_frequency')    # guaranteed to not be `pd.NA` since the line that calls `missing_important_dates(...)` checks first whether this value is not `pd.NA`; this note is important because `pd.NA == 5` for example returns `pd.NA` instead of the expected `False` leading to `TypeError: boolean value of NA is ambiguous`
+    coupon_type = get_feature_value(single_cusip_data, 'coupon_type')    # guaranteed to not be `pd.NA` since the line that calls `missing_important_dates(...)` checks first whether this value is not `pd.NA`; this note is important because `pd.NA == 5` for example returns `pd.NA` instead of the expected `False` leading to `TypeError: boolean value of NA is ambiguous`
+    
+    coupon = get_feature_value(single_cusip_data, 'coupon')
+    is_zero_coupon = (coupon_type == 17) or (interest_payment_frequency == 16) or (pd.notna(coupon) and coupon == 0)
+    needs_important_dates = (interest_payment_frequency != 23) and (interest_payment_frequency != 16) and (coupon_type != 4)
+
+    if is_zero_coupon and not needs_important_dates: return False    # no need to check if important dates are missing or out of bounds if the CUSIP is a zero coupon bond and does not need important dates
+    
+    is_missing_important_dates, important_dates_are_out_of_bounds = False, False    # initialization
+
+    first_coupon_date = get_feature_value(single_cusip_data, 'first_coupon_date')    # storing outside the loop because `first_coupon_date` is used to replace `next_coupon_payment_date` if it is missing; if exists, type is `datetime.date`
+    for date in IMPORTANT_DATES:
+        date_value = get_feature_value(single_cusip_data, date)
+        if pd.isna(date_value):
+            # replace `next_coupon_payment_date` with `first_coupon_date` if it is missing only if `first_coupon_date` is not missing and is after the current date because technically this is the next coupon payment date since the first coupon payment date is in the future which happens for new issues
+            if date == 'next_coupon_payment_date' and pd.notna(first_coupon_date) and first_coupon_date > trade_date:    # `first_coupon_date` is of type `datetime.date`
+                set_feature_value(single_cusip_data, 'next_coupon_payment_date', first_coupon_date)
+            else:
+                #COMMENTING OUT AS THIS IS CREATING TOO MUCH LOGGING 2025-08-28
+                #print(f'CUSIP {get_feature_value(single_cusip_data, "cusip")} has missing {date}')
+                is_missing_important_dates = True
+                break
+        elif date_is_out_of_bounds(date_value):
+            print(f'CUSIP {get_feature_value(single_cusip_data, "cusip")} has {date} with value {date_value} which is out of bounds')
+            important_dates_are_out_of_bounds = True
+            break
+    
+    for date in ADDITIONAL_DATES_TO_CHECK_FOR_INVALID_VALUES:
+        date_value = get_feature_value(single_cusip_data, date)
+        if pd.notna(date_value) and date_is_out_of_bounds(date_value):
+            print(f'CUSIP {get_feature_value(single_cusip_data, "cusip")} has {date} with value {date_value} which is out of bounds')
+            important_dates_are_out_of_bounds = True
+            break
+
+    return is_missing_important_dates or important_dates_are_out_of_bounds
+
+
+def missing_important_features(single_cusip_data):
+    '''Checks whether important features needed for pricing are null. Specifically, 
+    performs a null check on the features in `IMPORTANT_FEATURES`.'''
+    return any([pd.isna(get_feature_value(single_cusip_data, feature)) for feature in IMPORTANT_FEATURES])
+
+
+def get_trade_history_yields(trade_history):
+    if len(trade_history) == 0: return []
+    trade_history = trade_history[:SEQUENCE_LENGTH]    # only consider the last `SEQUENCE_LENGTH` trades
+    yield_idx = TRADE_FEATURE_TO_INDEX['yield']
+    return [trade[yield_idx] for trade in trade_history]
+
+
+def get_trade_history_dollar_prices(trade_history):
+    if len(trade_history) == 0: return []
+    trade_history = trade_history[:SEQUENCE_LENGTH_DOLLAR_PRICE]    # only consider the last `SEQUENCE_LENGTH_DOLLAR_PRICE` trades
+    dollar_price_idx = TRADE_FEATURE_TO_INDEX['dollar_price']
+    return [trade[dollar_price_idx] for trade in trade_history]
+
+
+def yield_in_history_is_null_or_nonpositive(trade_history):
+    '''Checks whether the MSRB reported yield is null or zero or negative, in which case, we 
+    should initially decline to price with a descriptive message for the user.
+    NOTE: this exclusion is currently unused.'''
+    trade_history_yields = get_trade_history_yields(trade_history)
+    return trade_history_yields != [] and (any(pd.isnull(trade_history_yields)) or any(trade_history_yield <= 0 for trade_history_yield in trade_history_yields))
+
+
+def yield_in_history_is_high(trade_history):
+    '''Checks whether the MSRB reported yield is greater than 10, in which case, we 
+    should initially decline to price with a descriptive message for the user. 
+    TODO: handle pricing for this case, possibly with the dollar price model.'''
+    trade_history_yields = get_trade_history_yields(trade_history)
+    return trade_history_yields != [] and None not in trade_history_yields and any(trade_history_yield > 10 for trade_history_yield in trade_history_yields)
+
+
+def dollar_price_in_history_is_null(trade_history):
+    '''Checks whether the MSRB reported dollar price is null, in which case, we should decline to price.'''
+    trade_history_dollar_prices = get_trade_history_dollar_prices(trade_history)
+    return trade_history_dollar_prices != [] and any([pd.isna(dollar_price) for dollar_price in trade_history_dollar_prices])
+
+
+def irregular_coupon_rate(single_cusip_data):
+    '''Checks whether the coupon rate is irregular / variable or whether the interest payment 
+    frequency is one that we cannot yet handle.'''
+    interest_payment_frequency = get_feature_value(single_cusip_data, 'interest_payment_frequency')    # guaranteed to not be `pd.NA` since the line that calls `missing_important_dates(...)` which is called before `irregular_coupon_rate(...)` checks first whether this value is not `pd.NA`; this note is important because `pd.NA == 5` for example returns `pd.NA` instead of the expected `False` leading to `TypeError: boolean value of NA is ambiguous`
+    coupon_type = get_feature_value(single_cusip_data, 'coupon_type')    # guaranteed to not be `pd.NA` since the line that calls `missing_important_dates(...)` which is called before `irregular_coupon_rate(...)` checks first whether this value is not `pd.NA`; this note is important because `pd.NA == 5` for example returns `pd.NA` instead of the expected `False` leading to `TypeError: boolean value of NA is ambiguous`
+    return interest_payment_frequency not in (1, 2, 3, 5, 16) or coupon_type not in (3, 4, 8, 17, 23, 24)    # `coupon_type == 3` corresponds to bonds that have an initial period with a fixed coupon

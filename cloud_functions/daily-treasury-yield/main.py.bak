@@ -1,0 +1,77 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2025-01-21
+Description: Fetches treasury values once per day.
+             See [this Notion page](https://www.notion.so/Yield-Curve-0e9d3fb1a49a4789826083361257a962?pvs=4#189eb87466c280d9ad01dc717ba0c6ae) for more details on related cloud functions and procedures.
+'''
+from datetime import datetime
+
+import pandas as pd
+from pytz import timezone
+
+from google.cloud import bigquery
+
+
+EASTERN = timezone('US/Eastern')
+CURRENT_DATETIME = datetime.now(EASTERN)
+CURRENT_YEAR_MONTH = CURRENT_DATETIME.strftime('%Y%m')
+
+PROJECT_ID = 'eng-reactor-287421'
+TABLE_NAME = f'{PROJECT_ID}.treasury_yield.daily_yield_rate'
+
+
+def upload_data_to_bigquery(df: pd.DataFrame):
+    schema = [bigquery.SchemaField('Date', 'DATE'),
+              bigquery.SchemaField('year_1', 'FLOAT'),
+              bigquery.SchemaField('year_2', 'FLOAT'),
+              bigquery.SchemaField('year_3', 'FLOAT'),
+              bigquery.SchemaField('year_5', 'FLOAT'),
+              bigquery.SchemaField('year_7', 'FLOAT'),
+              bigquery.SchemaField('year_10', 'FLOAT'),
+              bigquery.SchemaField('year_20', 'FLOAT'),
+              bigquery.SchemaField('year_30', 'FLOAT')]
+
+    client = bigquery.Client(project='eng-reactor-287421', location='US')
+    job_config = bigquery.LoadJobConfig(schema=schema, write_disposition='WRITE_APPEND')
+    job = client.load_table_from_dataframe(df, TABLE_NAME, job_config=job_config)
+    try:
+        job.result()    # waits for job to complete
+        print(f'Successfully uploaded the following DataFrame to {TABLE_NAME}:\n{df}')
+    except Exception as e:
+        print(f'Failed to upload the following DataFrame to {TABLE_NAME}:\n{df}')
+        raise e
+
+
+def upload_data_to_bucket():
+    bq_client = bigquery.Client()
+    query = f'SELECT * FROM `{TABLE_NAME}` ORDER BY date DESC'
+    print(f'Getting data from the query: {query}')
+    data = bq_client.query(query).result().to_dataframe()
+    data.set_index('Date', drop=True, inplace=True)
+    data = data[~data.index.duplicated(keep='first')]
+    bucket_file_path = 'gs://treasury_rate_df/treasury_rate_df.pkl'
+    data.to_pickle(bucket_file_path)
+    print(f'Successfully uploaded the result of the query to {bucket_file_path}')
+
+
+def main(args):
+    treasury_data = pd.read_csv(f'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all/{CURRENT_YEAR_MONTH}?type=daily_treasury_yield_curve&amp;field_tdr_date_value_month={CURRENT_YEAR_MONTH}&amp;page&amp;_format=csv')
+    treasury_data.Date = pd.to_datetime(treasury_data.Date)
+    treasury_data.sort_values('Date', ascending=False, inplace=True)
+    treasury_data = treasury_data.iloc[:1]    # chooses the most recent data
+    print(f'Retrieved the following treasury data from https://home.treasury.gov/ as the most recent:\n{treasury_data}')
+
+    treasury_data = treasury_data[['1 Yr', '2 Yr', '3 Yr', '5 Yr', '7 Yr', '10 Yr', '20 Yr', '30 Yr', 'Date']]
+    treasury_data.Date = treasury_data.Date.apply(lambda x: x.date())
+    treasury_data.columns = ['year_1',
+                             'year_2',
+                             'year_3',
+                             'year_5',
+                             'year_7',
+                             'year_10',
+                             'year_20',
+                             'year_30',
+                             'Date']
+    upload_data_to_bigquery(treasury_data)    # must first update the BigQuery table since this is used when uploading the results to the Google Cloud bucket downstream
+    upload_data_to_bucket()
+    return 'SUCCESS'

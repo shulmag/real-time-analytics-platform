@@ -1,0 +1,48 @@
+'''
+ '''
+
+import quandl
+from google.cloud import bigquery
+
+quandl.ApiConfig.api_key = 'C6tWjxHm29zz7L5BLQxW'
+
+def uploadData(df):
+    schema = [bigquery.SchemaField("Date", "DATE"),
+              bigquery.SchemaField("year_1", "FLOAT"),
+              bigquery.SchemaField("year_2", "FLOAT"),
+              bigquery.SchemaField("year_3", "FLOAT"),
+              bigquery.SchemaField("year_5", "FLOAT"),
+              bigquery.SchemaField("year_7", "FLOAT"),
+              bigquery.SchemaField("year_10", "FLOAT"),
+              bigquery.SchemaField("year_20", "FLOAT"),
+              bigquery.SchemaField("year_30", "FLOAT")]
+
+    client = bigquery.Client(project="eng-reactor-287421",
+                             location="US")
+    job_config = bigquery.LoadJobConfig(schema = schema,
+                                        write_disposition="WRITE_APPEND")
+
+    job = client.load_table_from_dataframe(df,
+                                           "eng-reactor-287421.treasury_yield.daily_yield_rate",
+                                           job_config=job_config)
+
+    try:
+        job.result()
+        print("Upload Successful")
+    except Exception as e:
+        print("Failed to Upload")
+        raise e
+
+def main(args):
+    treasury_data = quandl.get("USTREASURY/YIELD")
+    treasury_data = treasury_data.iloc[-1:]
+
+    # Selecting the desired columns
+    treasury_data = treasury_data[['1 YR','2 YR','3 YR','5 YR','7 YR','10 YR','20 YR','30 YR']]
+    treasury_data['Date'] = treasury_data.index
+    treasury_data.Date = treasury_data.Date.apply(lambda x: x.date())
+    treasury_data.columns = ['year_1', 'year_2', 'year_3', 'year_5', 'year_7', 'year_10', 'year_20', 'year_30','Date']
+
+    uploadData(treasury_data)
+
+    return "SUCCESS"

@@ -1,0 +1,116 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-17
+Description: Process the trade history and the trade history from similar trades for prediction using the model.
+'''
+import pandas as pd
+
+from modules.ficc.utils.pad_trade_history import pad_trade_history
+from modules.ficc.utils.trade_list_to_array import trade_list_to_array, trade_list_to_array_similar_trades
+from modules.ficc.utils.auxiliary_functions import process_ratings
+
+
+def get_last_features_names(same_cusip: bool = True):
+    '''`same_cusip` is a boolean that determines whether the feature names refer to the trades coming 
+    from the same cusip trade history or the similar trades trade history.'''
+    assert same_cusip is True or same_cusip is False, f'`same_cusip` is not a boolean type: {same_cusip}'
+    prefix = 'last' if same_cusip else 'last_similar' 
+    base_features = ['yield_spread',
+                     'ficc_ycl',
+                     'rtrs_control_number',
+                     'yield',
+                     'dollar_price',
+                     'seconds_ago',
+                     'size',
+                     'calc_date', 
+                     'maturity_date', 
+                     'next_call_date', 
+                     'par_call_date', 
+                     'refund_date',
+                     'trade_datetime',
+                     'calc_day_cat',
+                     'settlement_date',
+                     'trade_type']
+    return [prefix + '_' + feature for feature in base_features]
+
+
+def get_recent_trades_and_last_trade_features(trades_df: pd.DataFrame, 
+                                              current_datetime,    # used solely for caching
+                                              treasury_rate_df: pd.DataFrame, 
+                                              is_batch_pricing: bool, 
+                                              num_trades_in_yield_spread_history: int, 
+                                              num_trades_in_dollar_price_history: int, 
+                                              holidays) -> pd.DataFrame:
+    last_features = get_last_features_names(same_cusip=True)
+    features_needed_for_processing = ['cusip', 'recent', 'coupon_type', 'trade_datetime', 'reason_for_using_dollar_price_model']
+    temp = trades_df[features_needed_for_processing].apply(trade_list_to_array, 
+                                                           axis=1, 
+                                                           args=([current_datetime, treasury_rate_df, is_batch_pricing, num_trades_in_yield_spread_history, num_trades_in_dollar_price_history, holidays, len(last_features)]))    # do not perform `parallel_apply(...)` since the parallelization is occurring more upstream
+    
+    features_to_extract = ['trade_history', 'last_features', 'previous_trades_features', 'trade_history_dollar_price',  'model_used', 'reason_for_using_dollar_price_model']
+    trades_df[features_to_extract] = pd.DataFrame(temp.tolist(), index=trades_df.index)
+    trades_df[last_features] = pd.DataFrame(trades_df['last_features'].tolist(), index=trades_df.index)
+    trades_df.drop(columns=['recent', 'last_features'], inplace=True)
+    return trades_df
+
+
+def process_trade_history(trades_df: pd.DataFrame,
+                          current_datetime,    # used solely for caching
+                          num_trades_in_yield_spread_history: int, 
+                          num_trades_in_dollar_price_history: int, 
+                          num_features_per_trade: int, 
+                          min_trades_in_history: int, 
+                          process_ratings_bool: bool, 
+                          treasury_rate_df: pd.DataFrame, 
+                          holidays, 
+                          is_batch_pricing: bool) -> pd.DataFrame:
+    '''NOTE: `current_datetime` is used solely for caching and should be the same as the `trade_datetime` 
+    column in `data` (in situations where the user is not intentionally trying to set the values to be 
+    different, e.g., point-in-time pricing).'''
+    trades_df = process_ratings(trades_df, process_ratings_bool)
+    trades_df = get_recent_trades_and_last_trade_features(trades_df, 
+                                                          current_datetime, 
+                                                          treasury_rate_df, 
+                                                          is_batch_pricing, 
+                                                          num_trades_in_yield_spread_history, 
+                                                          num_trades_in_dollar_price_history, 
+                                                          holidays)
+    
+    # Padding trade history for yield spread model
+    dollar_price_model_used = trades_df['model_used'] == 'dollar_price'
+    trades_df.loc[~dollar_price_model_used, 'trade_history'] = trades_df.loc[~dollar_price_model_used, 'trade_history'].apply(pad_trade_history, args=[num_trades_in_yield_spread_history, 
+                                                                                                                                                       num_features_per_trade, 
+                                                                                                                                                       min_trades_in_history])
+    # Padding trade history for dollar price model
+    trades_df.loc[dollar_price_model_used, 'trade_history_dollar_price'] = trades_df.loc[dollar_price_model_used, 'trade_history_dollar_price'].apply(pad_trade_history, args=[num_trades_in_dollar_price_history, 
+                                                                                                                                                                               num_features_per_trade - 1,    # dollar price model uses one less feature for each trade in the trade history (no `treasury_spread`)
+                                                                                                                                                                               min_trades_in_history])
+    return trades_df
+
+
+def get_recent_similar_trades_and_last_similar_trade_features(trades_df: pd.DataFrame, 
+                                                              current_datetime,    # used solely for caching
+                                                              treasury_rate_df: pd.DataFrame, 
+                                                              trade_history_length: int, 
+                                                              holidays) -> pd.DataFrame:
+    last_features = get_last_features_names(same_cusip=False)
+    temp = trades_df[['cusip', 'recent_similar', 'trade_datetime']].apply(trade_list_to_array_similar_trades, axis=1, args=([current_datetime, trade_history_length, treasury_rate_df, holidays, len(last_features)]))    # do not perform parallel_apply since the parallelization is occurring more upstream
+    trades_df[['similar_trade_history', 'last_similar_trade_features']] = pd.DataFrame(temp.tolist(), index=trades_df.index)
+    trades_df[last_features] = pd.DataFrame(trades_df['last_similar_trade_features'].tolist(), index=trades_df.index)
+    trades_df.drop(columns=['recent_similar', 'last_similar_trade_features'], inplace=True)
+    return trades_df
+
+
+def process_similar_trade_history(trades_df: pd.DataFrame, 
+                                  current_datetime,    # used solely for caching
+                                  trade_history_length: int, 
+                                  num_features_per_trade: int, 
+                                  min_trades_in_history: int, 
+                                  treasury_rate_df: pd.DataFrame, 
+                                  holidays) -> pd.DataFrame:
+    '''NOTE: `current_datetime` is used solely for caching and should be the same as the `trade_datetime` 
+    column in `data` (in situations where the user is not intentionally trying to set the values to be 
+    different, e.g., point-in-time pricing).'''
+    trades_df = get_recent_similar_trades_and_last_similar_trade_features(trades_df, current_datetime, treasury_rate_df, trade_history_length, holidays)
+    trades_df['similar_trade_history'] = trades_df['similar_trade_history'].apply(pad_trade_history, args=[trade_history_length, num_features_per_trade, min_trades_in_history])
+    return trades_df

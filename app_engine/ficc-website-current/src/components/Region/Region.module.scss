@@ -1,0 +1,82 @@
+@use "../../styles/lib/" as *;
+
+.root {
+  contain: content;
+}
+
+.company {
+  & > div {
+    & > div {
+      gap: 2px;
+      background: color("grey.7");
+      padding-block-start: 2px;
+      padding-block-end: 2px;
+    }
+  }
+
+  section {
+    padding: 16%;
+    background: color("text.contrast");
+
+    @include screen {
+      @include col(span 4);
+    }
+  }
+}
+
+.team {
+  @include region-buffer;
+  gap: 0;
+  padding-block-end: 150px;
+
+  & > div {
+    & > div {
+      gap: 2px;
+      background: color("grey.7");
+
+      @include screen {
+        margin-block-start: spacing(7);
+      }
+    }
+  }
+
+  h2:not(.outline) {
+    span {
+      @include underline;
+    }
+  }
+
+  [class="filler"] {
+    display: none;
+
+    @include screen {
+      @include col(span 6);
+      display: block;
+      background: color("text.contrast");
+    }
+  }
+
+  section {
+    padding-block-start: spacing(6);
+    padding-block-end: spacing(6);
+    background: color("text.contrast");
+
+    @include screen {
+      @include col(span 6);
+
+      &:nth-of-type(odd) {
+        padding-inline-end: spacing(6);
+      }
+
+      &:nth-of-type(even) {
+        padding-inline-start: spacing(6);
+        margin-inline-end: -1px;
+      }
+    }
+
+    h3 {
+      font-size: 1.5rem;
+      color: color("text.secondary");
+    }
+  }
+}

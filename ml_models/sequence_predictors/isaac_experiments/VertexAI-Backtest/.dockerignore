@@ -1,0 +1,6 @@
+*.sh
+*.git
+*.ipynb_checkpoints
+*.log
+*.pkl
+*.ipynb

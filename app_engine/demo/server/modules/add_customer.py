@@ -1,0 +1,46 @@
+'''
+Description: Add a customer lead from contact us form.
+'''
+from modules.auxiliary_variables import bq_client
+from modules.auxiliary_functions import access_secret_version
+
+
+EMAIL_RECIPIENTS = ['gil@ficc.ai', 'myles@ficc.ai', 'eng@ficc.ai']
+
+
+def send_email(subject, message, recipients=EMAIL_RECIPIENTS):
+    import smtplib    # lazy loading for lower latency
+    from email.mime.text import MIMEText    # lazy loading for lower latency
+
+    sender_email = access_secret_version('notifications_username')
+    password = access_secret_version('notifications_password')
+    smtp_server = 'smtp.gmail.com'
+    port = 587
+    
+    server = smtplib.SMTP(smtp_server, port)
+    server.starttls()
+    server.login(sender_email, password)
+    
+    message = MIMEText(message)
+    message['Subject'] = subject
+    message['From'] = sender_email
+    message['To'] = ', '.join(recipients)
+    
+    try:
+        server.sendmail(sender_email, recipients, message.as_string())
+    except Exception as e:
+        print(e)
+    server.quit()
+
+
+def add_prospect(company, name, email, message):
+    from flask import jsonify, make_response    # lazy loading for lower latency
+    
+    email_message = f'Name: {name}\nEmail: {email}\nCompany: {company}\n\nMessage:\n{message}'
+    send_email(f'Contact Us form from pricing.ficc.ai/contact used by {name}', email_message)
+    
+    query = f'''CALL `eng-reactor-287421.contact_us.create_customer`("{company}","{name}","{email}");'''
+    bqr = bq_client.query(query).result()
+    df = bqr.to_dataframe()
+    res = make_response(jsonify(df.to_dict('records')), 200)
+    return res

@@ -1,0 +1,11 @@
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/libed25519_dalek-4c59a2319125daac.rmeta: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/constants.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/errors.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signature.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signing.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/verifying.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/hazmat.rs
+
+/Users/gil/git/ficc/blockchain/soroban-muni-contracts/target/debug/deps/ed25519_dalek-4c59a2319125daac.d: /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/lib.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/constants.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/errors.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signature.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signing.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/verifying.rs /Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/hazmat.rs
+
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/lib.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/constants.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/errors.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signature.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/signing.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/verifying.rs:
+/Users/gil/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ed25519-dalek-2.1.1/src/hazmat.rs:

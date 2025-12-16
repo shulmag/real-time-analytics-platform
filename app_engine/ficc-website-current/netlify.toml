@@ -1,0 +1,14 @@
+[build]
+base = "/"
+command = "npm run static"
+publish = "out/"
+
+[build.environment]
+NEXT_SERVERLESS = "true"
+NODE_VERSION = "14.16.1"
+NPM_VERSION = "8.1.2"
+PREVIEW = "true"
+NETLIFY_NEXT_PLUGIN_SKIP = "true"
+
+[context.production.environment]
+PREVIEW = "false"

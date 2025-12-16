@@ -1,0 +1,188 @@
+/*
+ * @Author: Gil Shulman 
+ * @Date: 2025-02-25
+ * @Last Modified by: Gil Shulman
+ * @Last Modified time: 2025-03-06
+ */
+
+// Common color palette
+export const colors = {
+    primary: '#3182ce',
+    primaryDark: '#2c5282',
+    secondary: '#4a5568',
+    background: '#ffffff',
+    backgroundAlt: '#f7fafc',
+    backgroundHighlight: '#edf2f7',
+    backgroundActive: '#e2e8f0',
+    border: '#e2e8f0',
+    borderDark: '#cbd5e0',
+    text: '#2d3748',
+    textSecondary: '#4a5568',
+    textMuted: '#718096',
+    success: '#48bb78',
+    warning: '#ed8936',
+    danger: '#e53e3e',
+    info: '#4299e1'
+  };
+  
+  // Common spacing values
+  export const spacing = {
+    xs: '4px',
+    sm: '8px',
+    md: '12px',
+    lg: '16px',
+    xl: '20px',
+    xxl: '24px',
+    xxxl: '32px'
+  };
+  
+  // Typography
+  export const typography = {
+    fontFamily: "'Helvetica Neue', Helvetica, Arial, sans-serif",
+    fontSize: {
+      xs: '0.75rem',     // 12px
+      sm: '0.85rem',     // 14px
+      md: '0.95rem',     // 15px
+      lg: '1.1rem',      // 18px
+      xl: '1.25rem',     // 20px
+      xxl: '1.5rem'      // 24px
+    },
+    fontWeight: {
+      regular: '400',
+      medium: '500',
+      semiBold: '600',
+      bold: '700'
+    }
+  };
+  
+  // Border radius
+  export const borderRadius = {
+    sm: '4px',
+    md: '6px',
+    lg: '8px',
+    xl: '10px'
+  };
+  
+  // Shadow styles
+  export const shadows = {
+    sm: '0 1px 3px rgba(0,0,0,0.05)',
+    md: '0 2px 5px rgba(0,0,0,0.05)',
+    lg: '0 4px 8px rgba(0,0,0,0.1)'
+  };
+  
+  // Table styles
+  export const tableStyles = {
+    table: {
+      borderCollapse: 'separate',
+      borderSpacing: 0,
+      width: '100%',
+      marginBottom: 0
+    },
+    tableHeader: {
+      backgroundColor: colors.backgroundHighlight,
+      color: colors.textSecondary,
+      fontWeight: typography.fontWeight.semiBold,
+      fontSize: typography.fontSize.sm,
+      padding: `${spacing.md} ${spacing.lg}`,
+      borderBottom: `2px solid ${colors.border}`,
+      textAlign: 'left',
+      verticalAlign: 'middle'
+    },
+    tableCell: {
+      padding: `${spacing.md} ${spacing.lg}`,
+      borderTop: `1px solid ${colors.border}`,
+      fontSize: typography.fontSize.md,
+      color: colors.text,
+      verticalAlign: 'middle'
+    },
+    highlightCell: {
+      backgroundColor: '#ebf8ff',
+      fontWeight: typography.fontWeight.semiBold,
+      color: colors.primary,
+      padding: `${spacing.xs} ${spacing.md}`,
+      borderRadius: borderRadius.sm,
+      display: 'inline-block'
+    }
+  };
+  
+  // Card styles
+  export const cardStyles = {
+    card: {
+      borderRadius: borderRadius.lg,
+      border: `1px solid ${colors.border}`,
+      boxShadow: shadows.md,
+      marginBottom: spacing.xxxl
+    },
+    cardHeader: {
+      backgroundColor: colors.backgroundAlt,
+      padding: `${spacing.lg} ${spacing.xl}`,
+      borderBottom: `1px solid ${colors.border}`
+    },
+    headerTitle: {
+      color: colors.text,
+      fontSize: typography.fontSize.lg,
+      fontWeight: typography.fontWeight.semiBold,
+      margin: 0
+    }
+  };
+  
+  // Form styles
+  export const formStyles = {
+    label: {
+      color: colors.textSecondary,
+      fontSize: typography.fontSize.sm,
+      fontWeight: typography.fontWeight.medium,
+      marginBottom: spacing.sm
+    },
+    input: {
+      borderRadius: borderRadius.md,
+      padding: `${spacing.md} ${spacing.lg}`,
+      border: `1px solid ${colors.border}`,
+      fontSize: typography.fontSize.md
+    }
+  };
+  
+  // Button styles
+  export const buttonStyles = {
+    button: {
+      padding: `${spacing.md} ${spacing.xl}`,
+      borderRadius: borderRadius.md,
+      fontWeight: typography.fontWeight.semiBold,
+      transition: 'all 0.2s ease'
+    },
+    primary: {
+      backgroundColor: colors.primary,
+      border: 'none',
+      color: '#ffffff'
+    },
+    secondary: {
+      backgroundColor: colors.backgroundHighlight,
+      border: `1px solid ${colors.border}`,
+      color: colors.textSecondary
+    }
+  };
+  
+  // Nested table styles
+  export const nestedTableStyles = {
+    container: {
+      backgroundColor: colors.backgroundAlt,
+      padding: `${spacing.md} ${spacing.lg}`,
+      borderTop: `1px solid ${colors.border}`
+    },
+    table: {
+      margin: 0,
+      fontSize: typography.fontSize.sm
+    },
+    header: {
+      backgroundColor: colors.backgroundHighlight,
+      color: colors.textSecondary,
+      fontWeight: typography.fontWeight.semiBold,
+      fontSize: typography.fontSize.xs,
+      padding: `${spacing.md} ${spacing.md}`
+    },
+    cell: {
+      padding: `${spacing.md} ${spacing.md}`,
+      fontSize: typography.fontSize.sm,
+      color: colors.textSecondary
+    }
+  };

@@ -1,0 +1,213 @@
+#!/bin/bash
+
+# Author: Gil Shulman
+# Date: 2024-12-02
+# Last Editor: Developer Ray
+# Last Edit Date: 2025-03-20
+# Description: Build images and deploy all servers with traffic updates post-deployment. Use `bash deploy-ficc-servers.sh` to run. 
+#              NOTE: the code in the script needs to be run from `ficc/app_engine/demo/server/` when building images, and so the first part of the script performs this directory change assuming that the script is being run from `ficc/cloud_functions/deploy-servers/`.
+
+# Set default value to "True" if no argument is provided
+BUILD_IMAGES=${1:-True}
+echo "BUILD_IMAGES: $BUILD_IMAGES"
+
+if [ "$BUILD_IMAGES" = "True" ]; then
+    # Change to the correct directory
+    cd ../../app_engine/demo/server || {
+        echo "Error: Could not change to server directory"
+        exit 1
+    }
+fi
+
+# Array to hold process IDs of background jobs
+build_image_pids=()
+deploy_and_update_traffic_pids=()
+
+# Global variables
+PROJECT_ID="eng-reactor-287421"
+ARTIFACT_REGISTRY="cloud-run-source-deploy"
+REGION="us-central1"    # arbitrarily chosen when service was first deployed
+IMAGE_URI_LOCATION="$REGION-docker.pkg.dev/$PROJECT_ID/$ARTIFACT_REGISTRY"
+VPC_CONNECTOR_LOCATION="projects/$PROJECT_ID/locations/$REGION/connectors"
+
+CPU_ROUTER=2    # reasonable number of CPUs based on CPU utilization chart
+MEMORY_ROUTER="4Gi"    # reasonable memory based on memory utilization chart
+CPU_HIGH_MEMORY=8    # maximum number of CPUs for a Google Cloud Run container
+MEMORY_HIGH_MEMORY="32Gi"    # maximum memory for a Google Cloud Run container
+CONCURRENCY=16    # make sure that the number of workers multiplied by the number of threads (both specified in `Dockerfile`) equals this value 
+TIMEOUT=3600    # maximum timeout (in seconds) for a Google Cloud Run container
+ENVIRONMENT="gen1"    # optimized for bursty traffic with lesser transient timeout failures
+MIN_INSTANCES_ROUTER=1    # without setting min instances, we see cold starts of up to 40 seconds, so for all customer facing servers, we should set a min instance count; having a min instance of 1 costs $10 per day
+MAX_INSTANCES=1000    # set the value to the maximum number for a Google Cloud Run container
+
+# Define services and their Dockerfiles
+SERVICES=("router" "high_memory")
+DOCKERFILES=("Dockerfile.router" "Dockerfile.high_memory")
+
+
+# Function to terminate all background processes
+terminate_background_processes() {
+    echo "Terminating all background processes..."
+    pids=("${build_image_pids[@]}" "${deploy_and_update_traffic_pids[@]}")
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true    # suppress errors if a process has already exited
+    done
+    exit 1
+}
+
+
+# Trap to catch errors and interruptions (trap is used to catch signals (INT, TERM, ERR) and execute the terminate_background_processes function when such signals are received; ERR ensures any failure in commands triggers cleanup)
+trap terminate_background_processes INT TERM ERR
+
+
+# Function to build an image
+build_image() {
+    local SERVICE=$1
+    local DOCKERFILE=$2
+    
+    local IMAGE_URI="$IMAGE_URI_LOCATION/$SERVICE"
+
+    echo "Building $SERVICE and uploading to $IMAGE_URI using $DOCKERFILE..."
+    # Done in parallel (use of `&` at the end of the command indicates that it will be run in parallel with the other commands)
+    (
+        if gcloud builds submit --config=cloudbuild.yaml --substitutions=_IMAGE_URI="$IMAGE_URI",_DOCKERFILE="$DOCKERFILE"; then
+            echo "Build successful for $SERVICE." 
+        else
+            echo "Build failed for $SERVICE."
+            exit 1
+        fi
+    ) & build_image_pids+=($!)  # Run entire block in background and track PID
+}
+
+
+# Function to deploy a server and update traffic
+deploy_and_update_traffic() {
+    local SERVICE_NAME=$1
+    local VPC_CONNECTOR=$2
+    local IMAGE_URI=$3
+    local MIN_INSTANCES_PARAM=$4
+    local CPU_PARAM=$5
+    local MEMORY_PARAM=$6
+    local ROUTE_TO_DIFFERENT_SERVER=$7
+
+    echo "Deploying and updating traffic for $SERVICE_NAME..."
+    
+    if gcloud run deploy "$SERVICE_NAME" \
+        --image "$IMAGE_URI" \
+        --allow-unauthenticated \
+        --region "$REGION" \
+        --vpc-connector "$VPC_CONNECTOR" \
+        --cpu "$CPU_PARAM" \
+        --memory "$MEMORY_PARAM" \
+        --concurrency "$CONCURRENCY" \
+        --timeout "$TIMEOUT" \
+        --min-instances "$MIN_INSTANCES_PARAM" \
+        --max-instances "$MAX_INSTANCES" \
+        --set-env-vars ROUTE_TO_DIFFERENT_SERVER="$ROUTE_TO_DIFFERENT_SERVER" \
+        --execution-environment "$ENVIRONMENT"; then
+        echo "Deployment successful for $SERVICE_NAME. Updating traffic..."
+        if gcloud run services update-traffic "$SERVICE_NAME" --to-latest --region "$REGION"; then
+            echo "Traffic updated for $SERVICE_NAME."
+        else
+            echo "Traffic update failed for $SERVICE_NAME."
+            exit 1
+        fi
+    else
+        echo "Deployment failed for $SERVICE_NAME."
+        exit 1
+    fi
+}
+
+
+# Function to deploy a router server and update traffic
+deploy_and_update_traffic_for_router_service() {
+    local SERVICE_NAME=$1
+    local VPC_CONNECTOR=$2
+    
+    # Deploy the service in the background in parallel with the rest of the servers (use of `&` at the end of the command indicates that it will be run in parallel with the other commands)
+    deploy_and_update_traffic "$SERVICE_NAME" \
+        "$VPC_CONNECTOR" \
+        "$IMAGE_URI_LOCATION/router" \
+        "$MIN_INSTANCES_ROUTER" \
+        "$CPU_ROUTER" \
+        "$MEMORY_ROUTER" \
+        "True" &
+    
+    deploy_and_update_traffic_pids+=($!)    # Run entire block in background and track PID
+}
+
+
+# Function to deploy a high memory server and update traffic
+deploy_and_update_traffic_for_high_memory_service() {
+    local SERVICE_NAME=$1
+    local VPC_CONNECTOR=$2
+    
+    # Deploy the service in the background in parallel with the rest of the servers (use of `&` at the end of the command indicates that it will be run in parallel with the other commands)
+    deploy_and_update_traffic "$SERVICE_NAME" \
+        "$VPC_CONNECTOR" \
+        "$IMAGE_URI_LOCATION/high_memory" \
+        0 \
+        "$CPU_HIGH_MEMORY" \
+        "$MEMORY_HIGH_MEMORY" \
+        "False" &
+    
+    deploy_and_update_traffic_pids+=($!)    # Run entire block in background and track PID
+}
+
+if [ "$BUILD_IMAGES" = "True" ]; then
+    echo "Starting building base Dockerfile image ..."    # cannot be run in parallel with building the other images since the other images inherit from this one
+    gcloud builds submit --config=cloudbuild.yaml --substitutions=_IMAGE_URI="$IMAGE_URI_LOCATION/base",_DOCKERFILE="Dockerfile.base"
+
+
+    echo "Starting building images in parallel ..."
+    for i in "${!SERVICES[@]}"; do
+        build_image "${SERVICES[$i]}" "${DOCKERFILES[$i]}"
+    done
+
+    # Print all process IDs
+    echo "Background PIDs (use 'kill -9 <PID1> <PID2> <PID3> ...' to terminate):"
+    for pid in "${build_image_pids[@]}"; do
+        echo "PID: $pid"
+    done
+
+    # Wait for all background processes to complete
+    for pid in "${build_image_pids[@]}"; do
+        if ! wait "$pid"; then
+            echo "Error: One or more builds failed."
+            terminate_background_processes    # when wait detects a failure, or when interrupted manually, the terminate_background_processes function is invoked to kill all active jobs
+        fi
+    done
+fi
+
+echo "Starting deployment and traffic update of all servers ..."
+
+# Deploy main server
+deploy_and_update_traffic_for_router_service "server" "$VPC_CONNECTOR_LOCATION/server-connector"
+
+# Deploy high memory server (used for batch pricing and compliance)
+deploy_and_update_traffic_for_high_memory_service "server-batch-pricing-and-compliance" "$VPC_CONNECTOR_LOCATION/server-connector"
+
+# Deploy Investortools server
+deploy_and_update_traffic_for_high_memory_service "server-investortools" "$VPC_CONNECTOR_LOCATION/server-connector-2"
+
+# Deploy Vanguard servers (0, 1, and 2)
+for i in {0..2}; do
+    deploy_and_update_traffic_for_high_memory_service "server-vanguard-$i" "$VPC_CONNECTOR_LOCATION/server-connector-vanguard"
+done
+
+
+# Print all process IDs
+echo "Background PIDs (use 'kill -9 <PID1> <PID2> <PID3> ...' to terminate):"
+for pid in "${deploy_and_update_traffic_pids[@]}"; do
+    echo "PID: $pid"
+done
+
+# Wait for all background processes to complete
+for pid in "${deploy_and_update_traffic_pids[@]}"; do
+    if ! wait "$pid"; then
+        echo "Error: One or more deployments failed or traffic updates failed."
+        terminate_background_processes    # when wait detects a failure, or when interrupted manually, the terminate_background_processes function is invoked to kill all active jobs
+    fi
+done
+
+echo "All servers successfully deployed"

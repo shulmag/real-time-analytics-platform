@@ -1,0 +1,121 @@
+# Model Experimentation Framework for Vertex AI 
+_Last Updated: 22/1/2024_
+
+
+The code here demonstrates how to train and experiment with models on Vertex AI. Vertex AI simplifies the process of training and experimenting, especially for tasks like hyperparameter tuning, by providing tools for result tracking and resource scaling to enable parallelization. This code is based on the backtesting framework in `ficc/VertexAI/VertexAI-Backtest/`.
+
+## Background on Vertex AI's Experimentation Platform 
+Vertex AI provides an experimentation platform for consistent and scalable ML model development. At the core of this platform is containerization - a model training application should be packaged as a container and pushed to GCP's artifact or container registry, which is accessible by Vertex AI. Each experiment of the same group is hence based on the same container image, ensuring consistency across runtime environments and transparency in results and logs, all of which can be accessed on Vertex AI. 
+
+A container should take some parameters as input (such as model hyperparameters and storage path for input and output artifacts) and should output a trained model and a loss metric, which is communicated to Vertex AI via the hypertune package.
+
+Vertex AI handles container orchestration, which means that the management, scaling, and deploying of the containerized applications are handled by Vertex AI without worrying about the underlying infrastructure. This means that all the user needs to provide is the container image and input parameters. For hyperparameter tuning, Vertex AI takes a set/range of possible values for hyperparameters, automatically samples from those possible values, and runs a separate container instance for each combination of hyperparameters. The maximum number of runs, which determines the maximum number of hyperparameter combinations that Vertex AI will test, is specified by the user. 
+
+For the purposes of model experimentation, we care less about hyperparameter combinations and want to focus on multiple runs of the same experiment to ensure reliability in our results. This is due to the inherently stochastic nature of training a neural network with stochastic optimizers like Adam and random weight initialization. 
+
+To adapt the model experimentation platform for this purpose, we simply pass a dummy hyperparameter called n_runs, which is an integer $[1,n]$, where $n$ is just how many models we want to run (though technically this parameter can be called anything). Vertex AI then creates $n$ containers, each with the exact same model and data parameters. The benefit of doing this instead of using multiple training jobs is that all the results are shown in a single dashboard on Vertex AI's console. 
+
+## Experiment Framework
+We want our experimentation framework to be as model-agnostic as possible, meaning that it should be able to train any neural network regardless of the architecture. This allows for faster iteration - if we hard-code model architecture into the training application, this means that the container must be rebuilt every time we test a new model. 
+
+To allow for model agnosticism, the container takes a custom_model_path argument, which points to a folder in Cloud Storage that containers a model template (saved keras model) and model features (json). Motivating this is the fact that any tf/keras model can be fit as long as our inputs match the model inputs, regardless of what the actual architecture is. The general workflow is as follows: 
+
+1. Build and compile a keras model without fitting it. Save the model to a cloud storage folder along with model_features.json, which should be a dictionary of the model's features. The folder should have the following structure:
+```
+|-- custom model folder
+| |-- model
+| | |-- keras_metadata.pb
+| | |-- saved_model.pb
+| | |-- assets
+| | |-- variables
+| |-- model_features.json
+```
+Sample model_features.json (note that keys must match the following exactly): 
+```
+{
+'BINARY_FEATURES': ['callable', 'sinking', 'zerocoupon'], 
+'CATEGORICAL_FEATURES': ['rating', 'incorporated_state_code', 'trade_type', 'purpose_class'],
+'NON_CATEGORICAL_FEATURES': ['quantity', 'days_to_maturity', 'days_to_call'], 
+'ADDITIONAL_SEQUENCES': ['similar_trade_history_5']
+}
+```
+Note that `'ADDITIONAL_SEQUENCES'` represents other sequences that are to be processed with an LSTM. In this example, `'similar_trade_history_5'` represents a sequence of the most recent trades for CUSIPs that are from the same series and with a maturity within 5 years of that of the target CUSIP.
+
+2. Create a Vertex AI job supplying the custom model folder under the --custom-model-path argument. Refer to the next section for more details on how to create a job on Vertex AI
+
+## Getting Started
+
+To get started, follow these steps:
+
+**Note: this assumes that you want to push a new container after making modifications. If you want to run an experiment using a pre-existing container, go to step 2.** 
+
+1. Run the `setup_customjob.sh` script to create and push the custom container image required by Vertex AI. Remember to modify the project name, repo and image name in `setup_customjob.sh` if required.
+
+```bash
+./setup_customjob.sh
+```
+
+If output has to be logged, use the following to log output in `output.txt`.
+
+```bash
+./setup_customjob.sh 2>&1 | tee output.txt
+```
+
+2. Run code under the 'Vertex AI' header in `SDK Demo.ipynb` to set up a vertex AI job. In its current iteration, the model-training container takes the following arguments : 
+```bash
+--data_bucket #Storage bucket for training data
+--file #File name for training data
+
+
+#NOTE: the following dates are provided in in YYYY-MM-DD format, such as 2023-12-01. Refer to SDK Demo.ipynb for example
+--train_start #Start of training window, inclusive 
+--train_end #End of training window, inclusive
+--test_start #Start of testing window, inclusive
+--test_end #End of testing window, inclusive
+
+--BATCH_SIZE
+--DROPOUT
+--LEARNING_RATE
+--NUM_EPOCHS
+--VALIDATION_SPLIT
+
+--model #If running default experiment, can be default, bottleneck or ensemble
+--ensemble_size #If running default experiment, ensemble size for model
+--custom_model_path #If running custom experiment, file path to customer model and model_features.json. Overrides --model and --ensemble_size arguments if provided
+
+--verbose #Option to print arguments
+--experiment_name #Name of folder to store results in ficc-model-experiments bucket
+--experiment_number #Experiment ID, used to run multiple experiments
+```
+
+3. Experiment runs are shown on the Vertex AI Hyperparameter Tuning Job page on GCP Console, [here](https://console.cloud.google.com/vertex-ai/training/hyperparameter-tuning-jobs?authuser=1&project=eng-reactor-287421).
+
+
+## Debugging
+Vertex AI performs experiment runs using pre-built or custom container images. In this instance, we are using a custom container image with the code for our training application. The `setup_customjob.sh` script automates the process of building the docker image and uploading it to GCP's artifact registry, where it can be retrieved by Vertex AI for custom jobs. However, debugging the training application is often easier done locally, which can be done by running the following:
+
+If debugging the docker image, build it first then run it, replacing kwargs with your required parameters:
+```bash
+docker build -f Dockerfile -t ${IMAGE_NAME} ./
+docker run --gpus=all ${IMAGE_NAME} **kwargs
+```
+
+For help with arguments the train.py script takes, run:
+```bash
+python train.py --help
+```
+
+If just debugging train.py:
+```bash
+python train.py \
+--target_date=2023-05-26  \
+--train_months=1 \
+--NUM_EPOCHS=1 \
+--VALIDATION_SPLIT=0.1 \
+--bucket=custom-train-job-test  \
+--file=data_latest_01-09_no_exclusions.pkl \
+--bucket=custom-train-job-test \
+--BATCH_SIZE=10000 
+--LEARNING_RATE=0.0007
+```
+

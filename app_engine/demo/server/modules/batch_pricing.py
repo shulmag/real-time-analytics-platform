@@ -1,0 +1,944 @@
+'''
+Description: Functions that support batch pricing, i.e., pricing a list of CUSIPs as a list from an API call or a CSV file.
+'''
+import asyncio    # used for asynchronous API calls
+
+import os    # used to return the archived results CSV
+from functools import partial
+import logging as python_logging    # to not confuse with google.cloud.logging
+import warnings    # used to ignore warnings
+import numpy as np
+import pandas as pd
+# import requests
+import math
+import multiprocess as mp
+from datetime import datetime
+
+from modules.ficc.utils.diff_in_days import diff_in_days_two_dates    # , diff_in_days
+from modules.ficc.utils.auxiliary_functions import function_timer
+
+from modules.auxiliary_variables import EASTERN, \
+                                        PRICE_BOTH_DIRECTIONS_TO_CORRECT_INVERSION, \
+                                        LARGE_BATCH_SIZE, \
+                                        SINGLE_FUNCTION_CALL_BATCH_SIZE, \
+                                        YEAR_MONTH_DAY, \
+                                        YEAR_MONTH_DAY_HOUR_MIN_SEC, \
+                                        DISPLAY_PRECISION, \
+                                        DOLLAR_PRICE_MODEL_DISPLAY_TEXT, \
+                                        MONTH_DAY_YEAR, \
+                                        NUMERICAL_ERROR, \
+                                        TRADE_TYPE_CODE_TO_TEXT, \
+                                        QUANTITY_LOWER_BOUND, \
+                                        QUANTITY_UPPER_BOUND, \
+                                        LOGGING_FEATURES, \
+                                        FEATURES_FOR_OUTPUT_CSV, \
+                                        ADDITIONAL_FEATURES_FOR_COMPLIANCE_CSV, \
+                                        USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING, \
+                                        DATE_FROM_WHICH_PAST_REFERENCE_DATA_IS_STORED_IN_REDIS
+from modules.auxiliary_functions import get_current_datetime, datetime_as_string, current_datetime_as_string, get_settlement_date, get_outstanding_amount, round_for_logging, is_valid_time_format    #, convert_64_bit_columns_to_32_bit
+from modules.logging_functions import log_usage
+from modules.point_in_time_pricing import next_week_day_if_datetime_is_after_business_hours
+from modules.data_preparation_for_pricing import pre_processing, get_inputs_for_nn, reverse_direction_concat, process_data_for_pricing, get_data_from_redis, get_data_from_df
+from modules.pricing_functions import predict_spread, predict_dollar_price, get_trade_price_from_yield_spread_model
+from modules.compliance import determine_compliance_rating
+from modules.errors import CustomMessageError
+from modules.exclusions import CUSIP_ERROR_MESSAGE
+from modules.asynchronous_api_calls import price_batches as price_batches_async
+
+
+def check_inversion_and_flip_prices_batch(df: pd.DataFrame, keep_price_delta: bool = False) -> pd.DataFrame:
+    '''Inverts dealer buy and dealer sell prices, ytw and calc_date for a dataframe with both sides of the 
+    trade priced. 
+
+    Each original trade is indexed by the 'id' column, which is used to create a dictionary of price, ytw 
+    and calc_date of the other side of the trade. Using 'id' as a key enables multiple trades to have the 
+    same cusip without conflict. It is then referenced to invert predictions if predictions cross.
+    
+    `keep_price_delta` is a boolean flag that determines whether we keep the price difference between the 
+    price when the `trade_type` is 'S' and the price when the the `trade_type` is 'P'. This delta is used 
+    for compliance.'''
+    id_corresponding_to_original_D_trades = set(df.loc[df['trade_type'] == 'D', 'id'])
+    S_idx = df['trade_type'] == 'S'
+    P_idx = df['trade_type'] == 'P'
+    SP_idx = (S_idx | P_idx) & (~df['id'].isin(id_corresponding_to_original_D_trades))
+    original_trades = df['original_trade']
+    outputs_to_swap = ['price', 'ficc_ytw', 'calc_date']
+    
+    opposite_side_dict = dict(zip(df[SP_idx & original_trades]['id'], 
+                                  df[SP_idx & ~original_trades][outputs_to_swap].to_records(index=False)))
+
+    def invert_row(row):
+        '''Inverts the price of a single row if it crosses, taking reference from a dictionary of predicted 
+        price, ytw and calc_date of the other side of the trade.'''
+        id = row['id']
+        trade_type = row['trade_type']
+        if trade_type == 'S':
+            S_price = row['price']
+            P_price, ytw, calc_date = opposite_side_dict[id]
+            if S_price < P_price:
+                row[outputs_to_swap] = P_price, ytw, calc_date
+        else:
+            P_price = row['price']
+            S_price, ytw, calc_date = opposite_side_dict[id]
+            if S_price < P_price:
+                row[outputs_to_swap] = S_price, ytw, calc_date
+        if keep_price_delta: row['bid_ask_price_delta'] = np.round(np.abs(S_price - P_price), DISPLAY_PRECISION)
+        return row
+    df_SP = df[SP_idx & original_trades].apply(invert_row, axis=1)
+    
+    df_D = df[~SP_idx]
+    if len(df_D) > 0:
+        if keep_price_delta:
+            df_D_SP = df_D[df_D['trade_type'].isin(['S', 'P'])]    # get the `S` and `P` trades created for the original `D` trade
+            df_D_SP_prices = df_D_SP.pivot(index='id', columns='trade_type', values='price')    # pivot to get 'S' and 'P' as columns, so that the new DataFrame has each row has an index value of `id` and two columns, `S` and `P`, where the values are the price values
+            id_to_price_delta = np.round(np.abs(df_D_SP_prices['S'] - df_D_SP_prices['P']), DISPLAY_PRECISION).to_dict()
+            df_D['bid_ask_price_delta'] = df_D['id'].map(id_to_price_delta)
+        else:
+            df_D['bid_ask_price_delta'] = np.nan
+        df_D = df_D[df_D['original_trade']]
+    return pd.concat([df_SP, df_D])
+
+
+def get_ytw_dollar_price_for_list(df: pd.DataFrame, 
+                                  current_datetime: datetime, 
+                                  quantity_list: list, 
+                                  trade_type_list: list, 
+                                  current_date: datetime, 
+                                  settlement_date: datetime, 
+                                  use_trade_datetime_column_for_pricing: bool = False, 
+                                  keep_price_delta: bool = False):
+    '''Return a list of ytw values for a dataframe on `df`. The `reference_datetime` is used to get the 
+    yield curve level. Setting `use_trade_datetime_column_for_pricing` to `True` is to declare that the 
+    `trade_datetime` is not the `current_datetime`, but instead the `trade_datetime` column of the data. 
+    `keep_price_delta` is a boolean flag that determines whether we keep the price difference between the 
+    price when the `trade_type` is 'S' and the price when the the `trade_type` is 'P'. This delta value 
+    is used for compliance. When performing point-in-time pricing, `current_datetime` may be set to the 
+    datetime of the archived model to be used.
+    NOTE: This was modified to handle inverted trades. This is done after `process_data(...)` is called 
+    to minimize repeated data retrieval and processing.'''
+    use_similar_trade_history = (not use_trade_datetime_column_for_pricing) or USE_SIMILAR_TRADES_MODEL_FOR_YIELD_SPREAD_PREDICTIONS_FOR_POINT_IN_TIME_PRICING
+    df = process_data_for_pricing(df, quantity_list, trade_type_list, current_date, settlement_date, current_datetime, True, use_trade_datetime_column_for_pricing, use_similar_trade_history)    # get reference data and feature engineering 
+    
+    if PRICE_BOTH_DIRECTIONS_TO_CORRECT_INVERSION or keep_price_delta:    # need to price both sides if keeping price delta for compliance
+        with warnings.catch_warnings():
+            warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+            df['original_trade'] = True     # `original_trade` flag is used to return only the trades that were priced initially, not the hypothetical prices for the other side of the trade
+            df['id'] = range(len(df))    # index each 'S' or 'P' trade with an id for easier identification of rows at the trade-level rather than cusip-level
+        
+        # separate 'S' and 'P' trades from 'D' trades
+        df_SP = df[df.trade_type != 'D']
+        df_D = df[df.trade_type == 'D']
+        
+        df_SP = reverse_direction_concat(df_SP, interdealer=False)
+        if keep_price_delta: df_D = reverse_direction_concat(df_D, interdealer=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: In a future version, object-dtype columns with all-bool values will not be included in reductions with bool_only=True. Explicitly cast to bool dtype instead.`
+            df = pd.concat([df_SP, df_D])
+        del df_SP, df_D
+
+    df = pre_processing(df)
+    if type(df) == str: return df
+
+    use_yield_spread_model = df['model_used'] == 'yield_spread'
+    df_yield_spread = df[use_yield_spread_model]    # use the yield spread model on these CUSIPs
+    df_dollar_price = df[~use_yield_spread_model]    # use the dollar price model on these CUSIPs
+    del use_yield_spread_model
+    del df
+
+    if len(df_yield_spread) > 0:
+        df_list_yield_spread = get_inputs_for_nn(df_yield_spread, use_dollar_price_model=False, use_similar_trade_history=use_similar_trade_history, using_archived_vertexai_model=use_trade_datetime_column_for_pricing)
+        estimated_yield_spread = predict_spread(df_list_yield_spread, use_similar_trade_history, current_datetime if use_trade_datetime_column_for_pricing else None)    # second argument is for point-in-time pricing
+        estimated_yield_spread = np.array(estimated_yield_spread) / 100
+        estimated_yield_spread = estimated_yield_spread.ravel()    # `np.ravel` returns a contiguous flattened array
+        df_yield_spread['yield_spread'] = estimated_yield_spread    # used for logging
+        yield_curve = np.array(df_yield_spread['ficc_ycl']) / 100    # changing yield_curve_level to ficc_ycl. This now comes from the data package
+        ytw = np.add(estimated_yield_spread, yield_curve)
+        ytw = np.abs(ytw)    # ytw should always be positive
+        df_yield_spread['ficc_ytw'] = ytw
+        df_yield_spread['ficc_ycl'] = yield_curve    # used for logging
+        df_yield_spread['price'], df_yield_spread['calc_date'] = zip(*df_yield_spread.apply(get_trade_price_from_yield_spread_model, axis=1))
+
+    if len(df_dollar_price) > 0:
+        df_list_dollar_price = get_inputs_for_nn(df_dollar_price, use_dollar_price_model=True, using_archived_vertexai_model=use_trade_datetime_column_for_pricing)
+        estimated_dollar_price = predict_dollar_price(df_list_dollar_price, current_datetime if use_trade_datetime_column_for_pricing else None)    # second argument is for point-in-time pricing
+        estimated_dollar_price = np.array(estimated_dollar_price).ravel()
+        df_dollar_price['price'] = estimated_dollar_price
+        # df_dollar_price['ficc_ytw'], df_dollar_price['calc_date'] = zip(*df_dollar_price.apply(get_estimated_yield, axis=1))    # converting the dollar price estimate from the dollar price model to ytw
+        df_dollar_price['ficc_ytw'] = None
+        df_dollar_price['calc_date'] = None
+        df_dollar_price['yield_spread'] = None
+        df_dollar_price['ficc_ycl'] = None
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: In a future version, object-dtype columns with all-bool values will not be included in reductions with bool_only=True. Explicitly cast to bool dtype instead.`
+        df = pd.concat([df_yield_spread, df_dollar_price])
+    
+    if PRICE_BOTH_DIRECTIONS_TO_CORRECT_INVERSION or keep_price_delta:
+        df = check_inversion_and_flip_prices_batch(df, keep_price_delta)
+        df = df[df.original_trade]    # return only the original trades
+    
+    # df = convert_64_bit_columns_to_32_bit(df)    # unused because very little change in memory usage (< 5% using `df.memory_usage(deep=True).sum()`) and causes downstream rounding issues
+    return df.sort_index()
+
+
+def add_ytw_price_calculationdate_coupon(df):
+    '''Add the features: (1) 'price', (2) 'yield_to_worst_date', (3) 'ytw', (4) 'coupon', and return the new dataframe.
+    TODO: refactor this so that it can be used in `get_prediction_from_individual_pricing`.'''
+    df['price'] = np.round(df.price, DISPLAY_PRECISION)
+
+    df['yield_to_worst_date'] = None
+    calc_date_not_null = df['calc_date'].notnull()
+    if calc_date_not_null.sum() > 0: df.loc[calc_date_not_null, 'yield_to_worst_date'] = pd.to_datetime(df.loc[calc_date_not_null, 'calc_date']).dt.strftime(MONTH_DAY_YEAR)    # without the `.sum() > 0` condition an exception is raised since `.dt` cannot be applied to an empty series
+    
+    df['ytw'] = NUMERICAL_ERROR
+    ficc_ytw_not_null = df['ficc_ytw'].notnull()
+    ficc_ytw_not_null_float = df.loc[ficc_ytw_not_null, 'ficc_ytw'].astype(float)
+    if ficc_ytw_not_null.sum() > 0: df.loc[ficc_ytw_not_null, 'ytw'] = np.round(ficc_ytw_not_null_float, DISPLAY_PRECISION)    # works when `ficc_ytw` is `None` because it is automatically converted to `np.NaN` object which works with `np.round(...)`
+    df['ytw_LOGGING_PRECISION'] = NUMERICAL_ERROR
+    if ficc_ytw_not_null.sum() > 0: df.loc[ficc_ytw_not_null, 'ytw_LOGGING_PRECISION'] = round_for_logging(ficc_ytw_not_null_float)    # used for logging
+    
+    df['coupon'] = np.round(df['coupon'].astype(float), DISPLAY_PRECISION)
+
+    # below features are used for logging
+    yield_spread_not_null = df['yield_spread'].notnull()
+    df.loc[yield_spread_not_null, 'yield_spread'] = round_for_logging(df.loc[yield_spread_not_null, 'yield_spread'])
+    ficc_ycl_not_null = df['ficc_ycl'].notnull()
+    df.loc[ficc_ycl_not_null, 'ficc_ycl'] = round_for_logging(df.loc[ficc_ycl_not_null, 'ficc_ycl'])
+    return df
+
+
+def _fill_basic_error_columns(df: pd.DataFrame, trade_datetime_list_or_current_datetime=None) -> pd.DataFrame:
+    with warnings.catch_warnings():
+        warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+
+        # each of the following lines raises a `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+        df['ytw'] = NUMERICAL_ERROR
+        df['ytw_LOGGING_PRECISION'] = NUMERICAL_ERROR
+        df['price'] = NUMERICAL_ERROR
+        df['yield_spread'] = NUMERICAL_ERROR
+        df['ficc_ycl'] = NUMERICAL_ERROR
+        df['coupon'] = pd.NA
+        df['security_description'] = pd.NA
+        df['maturity_date'] = pd.NA
+        df['model_used'] = None
+        df['reason_for_using_dollar_price_model'] = None
+        df['trade_datetime'] = trade_datetime_list_or_current_datetime    # this column is needed for output compliance CSV
+    return df
+
+
+def fill_error_columns(df: pd.DataFrame, message_key: str, series_with_error_message_per_row=None, trade_datetime_list_or_current_datetime=None) -> pd.DataFrame:
+    if len(df) == 0: return df
+
+    if series_with_error_message_per_row is None:
+        message = CUSIP_ERROR_MESSAGE[message_key]
+    else:
+        message = series_with_error_message_per_row.apply(lambda error_message: CUSIP_ERROR_MESSAGE[message_key](error_message))
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+        df['yield_to_worst_date'] = message    # keeping this line so that logging stays the same
+        df['error_message'] = message
+    return _fill_basic_error_columns(df, trade_datetime_list_or_current_datetime)
+
+
+def fill_all_error_columns(df: pd.DataFrame, trade_datetime_list_or_current_datetime=None) -> pd.DataFrame:
+    if len(df) == 0: return df
+    grouped_by_message = df.groupby('message')
+    df['yield_to_worst_date'] = grouped_by_message.message.transform(lambda x: CUSIP_ERROR_MESSAGE[x.name])    # keeping this line so that logging stays the same; assign a value to each group: https://stackoverflow.com/questions/69951813/groupby-specific-column-then-assign-new-values-base-on-conditions
+    df['error_message'] = df['yield_to_worst_date']
+    return _fill_basic_error_columns(df, trade_datetime_list_or_current_datetime)
+
+
+def get_cusips_with_settlement_date_after_maturity_date_or_refund_date(df: pd.DataFrame, settlement_date: datetime, trade_datetime_list_or_current_datetime):
+    '''Return two dataframes that are split from `df`, where the first dataframe contains all the line items 
+    where the settlement date is before the maturity date and the second dataframe contains all the line items 
+    where the settlement date is after the maturity date.'''
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: Comparison of Timestamp with datetime.date is deprecated in order to match the standard library behavior. In a future version these will be considered non-comparable. Use 'ts == pd.Timestamp(date)' or 'ts.date() == date' instead.`
+        maturity_date_or_refund_date = pd.Series(
+            np.where(df['is_called'], df['refund_date'], df['maturity_date']),    # if `is_called` is `True`, use `refund_date`, otherwise use `maturity_date`
+            index=df.index    # maintain original index
+        )
+        settlement_date_after_maturity_date_or_refund_date = maturity_date_or_refund_date <= settlement_date
+    df_settlement_date_after_maturity_date_or_refund_date = df[settlement_date_after_maturity_date_or_refund_date]
+    if isinstance(trade_datetime_list_or_current_datetime, list):    # extract the correct values of `trade_datetime_list_or_current_datetime` for `fill_error_columns(...)`
+        settlement_date_after_maturity_date_indices = settlement_date_after_maturity_date_or_refund_date.to_numpy().nonzero()[0]    # return the indices where the values in the bool_series are `True`; `.nonzero()` method returns a tuple of arrays, so you access the first element to get the indices
+        trade_datetime_list_or_current_datetime = [trade_datetime_list_or_current_datetime[index] for index in settlement_date_after_maturity_date_indices]
+    df_settlement_date_after_maturity_date_or_refund_date = fill_error_columns(df_settlement_date_after_maturity_date_or_refund_date, 'maturing_soon', trade_datetime_list_or_current_datetime=trade_datetime_list_or_current_datetime)
+    df_settlement_date_before_maturity_date_or_refund_date = df[~settlement_date_after_maturity_date_or_refund_date]
+    return df_settlement_date_before_maturity_date_or_refund_date, df_settlement_date_after_maturity_date_or_refund_date
+
+
+def replace_quantity_with_outstanding_amount_if_quantity_is_greater_than_outstanding_amount(df: pd.DataFrame, set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool, trade_datetime_list_or_current_datetime=None) -> pd.DataFrame:
+    '''The following 5 lines of code are inspired by `price_cusips_list(...)` in `finance.py`.'''
+    '''Return two dataframes that are split from `df`, where the first dataframe contains all the line items 
+    where the quantity is lesser than the outstanding amount and the second dataframe contains all the line 
+    items where the quantity is greater than the outstanding amount.'''
+    outstanding_amount = get_outstanding_amount(df, batch_pricing=True)
+    outstanding_amount = outstanding_amount.fillna(np.inf)    # ensures that the condition of whether the quantity is greater than the amount outstanding will always be `False` if `outstanding_amount` does not exist
+    outstanding_amount = outstanding_amount.replace(0, np.inf)    # ensures that the condition of whether the quantity is greater than the amount outstanding will always be `False` if `outstanding_amount` is 0
+    quantity_greater_than_outstanding_amount = df['quantity'] > outstanding_amount
+    df_quantity_greater_than_outstanding_amount = df[quantity_greater_than_outstanding_amount]
+    outstanding_amount_for_cusips_greater_than_outstanding_amount = outstanding_amount[quantity_greater_than_outstanding_amount]
+    if set_quantity_to_amount_outstanding_if_less_than_given_quantity:
+        df.loc[quantity_greater_than_outstanding_amount, 'quantity'] = outstanding_amount_for_cusips_greater_than_outstanding_amount
+        df.loc[quantity_greater_than_outstanding_amount, 'non_log_transformed_quantity'] = outstanding_amount_for_cusips_greater_than_outstanding_amount
+        df_quantity_greater_than_outstanding_amount = pd.DataFrame()    # setting this to an empty dataframe so it does not affect the future step of concatenating this dataframe with the other ones that have CUSIPs that cannot be priced
+    else:
+        if isinstance(trade_datetime_list_or_current_datetime, list):    # extract the correct values of `trade_datetime_list_or_current_datetime` for `fill_error_columns(...)`
+            settlement_date_after_maturity_date_indices = quantity_greater_than_outstanding_amount.to_numpy().nonzero()[0]    # return the indices where the values in the bool_series are `True`; `.nonzero()` method returns a tuple of arrays, so you access the first element to get the indices
+            trade_datetime_list_or_current_datetime = [trade_datetime_list_or_current_datetime[index] for index in settlement_date_after_maturity_date_indices]
+        df_quantity_greater_than_outstanding_amount = fill_error_columns(df_quantity_greater_than_outstanding_amount, 'quantity_greater_than_outstanding_amount', outstanding_amount_for_cusips_greater_than_outstanding_amount, trade_datetime_list_or_current_datetime)
+        df = df[~quantity_greater_than_outstanding_amount]
+    return df, df_quantity_greater_than_outstanding_amount
+
+
+def refuse_to_price_cusips_within_60_days_of_calc_date(cusips_can_be_priced_df: pd.DataFrame, ignore_error_cusips: bool, trade_datetime_list_or_current_datetime) -> pd.DataFrame:
+    not_null_calc_date = cusips_can_be_priced_df['calc_date'].notnull()
+    if not_null_calc_date.sum() > 0:    # only enter if at least one CUSIP has a calc date
+        cusips_with_calc_date = cusips_can_be_priced_df[not_null_calc_date]
+        cusips_wo_calc_date = cusips_can_be_priced_df[~not_null_calc_date]
+        DAYS_TO_CALC_DATE_COLUMN_NAME = 'days_to_calc_date'
+        cusips_with_calc_date[DAYS_TO_CALC_DATE_COLUMN_NAME] = cusips_with_calc_date.apply(lambda row: diff_in_days_two_dates(row['calc_date'], row['settlement_date'], convention='exact'), axis=1)
+        within_60_days_of_calc_date = cusips_with_calc_date[DAYS_TO_CALC_DATE_COLUMN_NAME] <= 60
+        cusips_with_calc_date = cusips_with_calc_date.drop(columns=DAYS_TO_CALC_DATE_COLUMN_NAME)
+        cusips_within_60_days_of_calc_date = cusips_with_calc_date[within_60_days_of_calc_date]
+        cusips_not_within_60_days_of_calc_date = cusips_with_calc_date[~within_60_days_of_calc_date]
+        cusips_within_60_days_of_calc_date = pd.DataFrame() if ignore_error_cusips else fill_error_columns(cusips_within_60_days_of_calc_date, 'maturing_soon', trade_datetime_list_or_current_datetime=trade_datetime_list_or_current_datetime)    # setting this to an empty dataframe if `ignore_error_cusips` is `True` so it does not affect the future step of concatenating this dataframe with the other ones that have CUSIPs that cannot be priced
+        cusips_can_be_priced_df = pd.concat([cusips_wo_calc_date, cusips_not_within_60_days_of_calc_date, cusips_within_60_days_of_calc_date])
+    return cusips_can_be_priced_df
+
+
+def price_cusips_df(cusips_to_be_priced_df: pd.DataFrame, 
+                    current_date_string: str, 
+                    current_datetime: datetime = None, 
+                    trade_datetime_list: list = None, 
+                    use_trade_datetime_column_for_pricing: bool = False, 
+                    use_for_compliance: bool = False, 
+                    set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool = False) -> pd.DataFrame:
+    '''When performing point-in-time pricing, `current_datetime` may be set to the datetime of the archived model to be used.'''
+    if len(cusips_to_be_priced_df) != 0:
+        settlement_date = get_settlement_date(current_date_string)
+        trade_datetime_list_or_current_datetime = trade_datetime_list if trade_datetime_list is not None else current_datetime    # this column is needed for output compliance CSV
+        cusips_to_be_priced_df, cusips_to_be_priced_df_settlement_date_after_maturity_date_or_refund_date = get_cusips_with_settlement_date_after_maturity_date_or_refund_date(cusips_to_be_priced_df, settlement_date, trade_datetime_list_or_current_datetime)
+        cusips_to_be_priced_df, cusips_can_be_priced_quantity_greater_than_outstanding_amount = replace_quantity_with_outstanding_amount_if_quantity_is_greater_than_outstanding_amount(cusips_to_be_priced_df, set_quantity_to_amount_outstanding_if_less_than_given_quantity, trade_datetime_list_or_current_datetime)
+        
+        if len(cusips_to_be_priced_df) > 0:    # only attempt to price cusips if there are any remaining after removing those where the settlement date is after the maturity date and where the quantity is lesser than the outstanding_amount
+            cusip_indices_that_can_be_priced = list(cusips_to_be_priced_df.index.values)    # using these index values to replace the index values after calling `get_ytw_dollar_price_for_list(...)` since `get_ytw_dollar_price_for_list(...)` manipulates the index values due to inversion correction 
+            cusips_to_be_priced_df = get_ytw_dollar_price_for_list(cusips_to_be_priced_df, 
+                                                                   current_datetime, 
+                                                                   cusips_to_be_priced_df['quantity'].values, 
+                                                                   cusips_to_be_priced_df['trade_type'].values, 
+                                                                   pd.to_datetime(current_date_string, format=YEAR_MONTH_DAY), 
+                                                                   settlement_date, 
+                                                                   use_trade_datetime_column_for_pricing, 
+                                                                   use_for_compliance)
+            cusips_to_be_priced_df.index = cusip_indices_that_can_be_priced    # using these index values to replace the index values after calling `get_ytw_dollar_price_for_list(...)` since `get_ytw_dollar_price_for_list(...)` manipulates the index values due to inversion correction 
+            # converting estimated yield to dollar price
+            cusips_to_be_priced_df = add_ytw_price_calculationdate_coupon(cusips_to_be_priced_df)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: In a future version, object-dtype columns with all-bool values will not be included in reductions with bool_only=True. Explicitly cast to bool dtype instead.`
+                cusips_to_be_priced_df = pd.concat([cusips_to_be_priced_df, cusips_to_be_priced_df_settlement_date_after_maturity_date_or_refund_date, cusips_can_be_priced_quantity_greater_than_outstanding_amount])
+            
+            cusips_to_be_priced_df['quantity'] = cusips_to_be_priced_df['non_log_transformed_quantity']    # put the non-log10 transformed quantity back into the dataframe
+            # cusips_to_be_priced_df = refuse_to_price_cusips_within_60_days_of_calc_date(cusips_to_be_priced_df, ignore_error_cusips, trade_datetime_list_or_current_datetime)
+        else:    # all of the CUSIPs in the original `cusips_to_be_priced_df` are now in either `cusips_to_be_priced_df_settlement_date_after_maturity_date_or_refund_date` or `cusips_can_be_priced_quantity_greater_than_outstanding_amount`
+            cusips_to_be_priced_df = pd.concat([cusips_to_be_priced_df_settlement_date_after_maturity_date_or_refund_date, cusips_can_be_priced_quantity_greater_than_outstanding_amount])
+        if use_for_compliance: cusips_to_be_priced_df['compliance_rating'] = cusips_to_be_priced_df.apply(determine_compliance_rating, axis=1)
+    return cusips_to_be_priced_df
+
+
+def price_cusips_list(cusip_list, 
+                      quantity_list, 
+                      trade_type_list, 
+                      current_datetime: datetime = None, 
+                      use_trade_datetime_column_for_pricing: bool = False, 
+                      use_for_compliance: bool = False, 
+                      user_price_list: list = None, 
+                      trade_datetime_list: list = None, 
+                      ignore_error_cusips: bool = False, 
+                      set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool = False, 
+                      cusip_with_trade_history_and_reference_data_df: pd.DataFrame = None, 
+                      additional_columns_for_compliance: pd.DataFrame = None):
+    '''This function takes a list of CUSIPs and returns price and YTW estimates for each. The optional 
+    argument `current_datetime` is used for calling `price_cusips_list(...)` with a datetime of choice 
+    for point-in-time pricing. The optional argument `use_trade_datetime_column_for_pricing` is used to 
+    declare that the `trade_datetime` is not the `current_datetime`, but instead the `trade_datetime` 
+    column of the data returned from `get_data_from_redis(...)`. `use_for_compliance` is a boolean flag that 
+    handles the user inputted price and other logic for compliance. `cusip_with_trade_history_and_reference_data_df` 
+    is an optional DataFrame where each line item contains the reference data and trade history meaning that 
+    we do not need to perform data processing, and is used when performing point-in-time pricing for 
+    trades in materialized trade history. `additional_columns_for_compliance` is a DataFrame storing columns 
+    that may be used for customer compliance such as `compliance_side` and customer specific identifying information 
+    that is only accessed when using the compliance module locally.'''
+    if current_datetime is None: current_datetime = get_current_datetime()    # `current_datetime` will always be `None` unless we are doing point-in-time pricing, and in that case it will be passed in as an optional argument
+    current_date_string = datetime_as_string(current_datetime, precision='day')
+    current_datetime_string = datetime_as_string(current_datetime)
+    current_datetime = pd.to_datetime(current_datetime_string, format=YEAR_MONTH_DAY_HOUR_MIN_SEC)    # used to remove the timezone from the datetime in order to not raise errors for downstream operations 
+
+    if trade_datetime_list is not None:    # entering this `if` statement means that we are perfoming point-in-time pricing using the `trade_datetime` list as the time the trade is occurring
+        use_trade_datetime_column_for_pricing = True
+        cusips_can_be_priced_df, cusips_cannot_be_priced_df = get_data_from_df(cusip_list, quantity_list, trade_type_list, trade_datetime_list, user_price_list, cusip_with_trade_history_and_reference_data_df)
+    else:
+        cusips_can_be_priced_df, cusips_cannot_be_priced_df = get_data_from_redis(cusip_list, pd.to_datetime(current_date_string, format=YEAR_MONTH_DAY), user_price_list)
+    # if len(cusips_cannot_be_priced_df) != 0: print(cusips_cannot_be_priced_df.to_markdown())    # used for debugging to check why certain CUSIPs cannot be priced
+
+    quantity_list = np.array(quantity_list)    # converted to numpy list in order to easily index by list
+    trade_type_list = np.array(trade_type_list)    # converted to numpy list in order to easily index by list
+    if use_for_compliance: user_price_list = np.array(user_price_list)    # converted to numpy list in order to easily index by list; `float` conversion occurs in `process_user_price(...)`
+
+    cusip_indices_that_can_be_priced = list(cusips_can_be_priced_df.index.values)
+    if not ignore_error_cusips: cusip_indices_that_cannot_be_priced = list(cusips_cannot_be_priced_df.index.values)
+    quantities_for_cusips_that_can_be_priced = quantity_list[cusip_indices_that_can_be_priced]
+    cusips_can_be_priced_df['quantity'] = quantities_for_cusips_that_can_be_priced
+    cusips_can_be_priced_df['non_log_transformed_quantity'] = quantities_for_cusips_that_can_be_priced    # this is used for later restoring the non-log10 transformed quantities and quantities for CUSIPs not priced to the dataframe
+    cusips_can_be_priced_df['trade_type'] = trade_type_list[cusip_indices_that_can_be_priced]
+    if use_for_compliance: cusips_can_be_priced_df['user_price'] = user_price_list[cusip_indices_that_can_be_priced]
+    
+    if not ignore_error_cusips:
+        cusips_cannot_be_priced_df['quantity'] = quantity_list[cusip_indices_that_cannot_be_priced]
+        cusips_cannot_be_priced_df['trade_type'] = trade_type_list[cusip_indices_that_cannot_be_priced]
+
+    if use_for_compliance and additional_columns_for_compliance is not None:
+        additional_columns_for_compliance = additional_columns_for_compliance.reset_index(drop=True)    # since `cusips_can_be_priced_df` and `cusips_cannot_be_priced_df` are created upstream from lists, the index of the hypothetical DataFrame resulting from concatenating `cusips_can_be_priced_df` and `cusips_cannot_be_priced_df` would be from 0...n-1, whereas `additional_columns_for_compliance` may have an index that is not reset
+        assert len(additional_columns_for_compliance) == len(cusip_list), f'Number of items for additional columns for compliance: {len(additional_columns_for_compliance)} should match the number of CUSIPs being priced: {len(cusip_list)}'
+        cusips_can_be_priced_df = pd.concat([cusips_can_be_priced_df, additional_columns_for_compliance.loc[cusip_indices_that_can_be_priced]], axis=1)
+        if not ignore_error_cusips: cusips_cannot_be_priced_df = pd.concat([cusips_cannot_be_priced_df, additional_columns_for_compliance.loc[cusip_indices_that_cannot_be_priced]], axis=1)
+
+    price_cusips_df_caller = lambda df, trade_date_string, trade_datetime, trade_datetime_list: price_cusips_df(df, 
+                                                                                                                trade_date_string, 
+                                                                                                                trade_datetime, 
+                                                                                                                trade_datetime_list, 
+                                                                                                                use_trade_datetime_column_for_pricing, 
+                                                                                                                use_for_compliance, 
+                                                                                                                set_quantity_to_amount_outstanding_if_less_than_given_quantity)
+    if len(cusips_can_be_priced_df) > 0:    # run the below procedures only if there are CUSIPs to price
+        if use_trade_datetime_column_for_pricing:
+            price_cusips_df_for_trade_datetime_caller = lambda df, trade_date_string, model_datetime: price_cusips_df_caller(df, 
+                                                                                                                            trade_date_string, 
+                                                                                                                            model_datetime, 
+                                                                                                                            df['trade_datetime'].tolist())
+            cusips_can_be_priced_df['model_datetime'] = cusips_can_be_priced_df['trade_datetime'].apply(next_week_day_if_datetime_is_after_business_hours)
+            cusips_can_be_priced_df['trade_date_string'] = cusips_can_be_priced_df['trade_datetime'].apply(lambda trade_datetime: datetime_as_string(trade_datetime, precision='day'))
+            cusips_can_be_priced_df = pd.concat([price_cusips_df_for_trade_datetime_caller(df, trade_date_string, model_datetime) for (trade_date_string, model_datetime), df in cusips_can_be_priced_df.groupby(['trade_date_string', 'model_datetime'])]) if len(cusips_can_be_priced_df) > 0 else cusips_can_be_priced_df    # need ternary statement to avoid error when attempting to call group by on an empty DataFrame
+            cusips_can_be_priced_df = cusips_can_be_priced_df.drop(columns=['model_datetime', 'trade_date_string'])
+        else:
+            cusips_can_be_priced_df = price_cusips_df_caller(cusips_can_be_priced_df, current_date_string, current_datetime, trade_datetime_list)
+    
+    if not ignore_error_cusips:
+        if use_for_compliance:
+            cusips_cannot_be_priced_df['bid_ask_price_delta'] = pd.NA    # need this for output CSV (see `ADDITIONAL_FEATURES_FOR_COMPLIANCE_CSV`)
+            cusips_cannot_be_priced_df['compliance_rating'] = pd.NA
+            cusips_cannot_be_priced_df['user_price'] = pd.NA
+        cusips_cannot_be_priced_df = fill_all_error_columns(cusips_cannot_be_priced_df)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: In a future version, object-dtype columns with all-bool values will not be included in reductions with bool_only=True. Explicitly cast to bool dtype instead.`
+            cusips_df = pd.concat([cusips_can_be_priced_df, cusips_cannot_be_priced_df])
+    else:
+        cusips_df = cusips_can_be_priced_df
+    return cusips_df.sort_index()
+
+
+def price_cusips_list_for_compliance(cusip_chunk: list, quantity_chunk: list, trade_type_chunk: list, user_price_chunk: list, trade_datetime_chunk: list) -> pd.DataFrame:
+    price_at_realtime_indices = [idx for idx, trade_datetime in enumerate(trade_datetime_chunk) if pd.isna(trade_datetime)]    # if `trade_datetime` is `NaT`, we default to pricing at real time
+    price_at_trade_datetime_indices = [idx for idx, trade_datetime in enumerate(trade_datetime_chunk) if not pd.isna(trade_datetime)]
+    
+    def price_at_realtime_or_trade_datetime(indices: list, realtime_or_trade_datetime: str) -> pd.DataFrame:
+        if len(indices) == 0: return None    # no cusips to price
+        assert realtime_or_trade_datetime in ('realtime', 'trade_datetime'), f'realtime_or_trade_datetime: {realtime_or_trade_datetime} must be one of {("realtime", "trade_datetime")}'
+        chunk_at_indices = lambda chunk: at_indices(chunk, indices)    # helper function to isolate all items that correspond to being priced either in realtime or at the specified trade_datetime
+        trade_datetime_list = None if realtime_or_trade_datetime == 'realtime' else chunk_at_indices(trade_datetime_chunk)    # setting the `trade_datetime_list` argument to `None` allows us to price in realtime
+        priced_df = price_cusips_list(chunk_at_indices(cusip_chunk), chunk_at_indices(quantity_chunk), chunk_at_indices(trade_type_chunk), use_for_compliance=True, user_price_list=chunk_at_indices(user_price_chunk), trade_datetime_list=trade_datetime_list)    # do not have `ignore_error_cusips` or `set_quantity_to_amount_outstanding_if_less_than_given_quantity` optional arguments since these are only relevant for the `large_batch_pricing` cloud function and not for the compliance module
+        priced_df.index = indices    # set the index values after pricing so that after concatenation, we can sort by the index values and maintain the initial input order
+        return priced_df
+    
+    priced_at_realtime = price_at_realtime_or_trade_datetime(price_at_realtime_indices, 'realtime')
+    priced_at_trade_datetime = price_at_realtime_or_trade_datetime(price_at_trade_datetime_indices, 'trade_datetime')
+    return pd.concat([df for df in [priced_at_realtime, priced_at_trade_datetime] if df is not None]).sort_index()    # sort by the index values to maintain the initial input order since the index values were set before
+
+
+def prepare_batch_pricing_results_for_logging(df: pd.DataFrame) -> pd.DataFrame:
+    '''After results received from batch pricing, modify `df` to be able to be logged.'''
+    df['direction'] = df['trade_type']    # used for logging
+    df['trade_type'] = df['trade_type'].map(TRADE_TYPE_CODE_TO_TEXT)    # replace trade_type code with human readable text for output csv
+    df['quantity'] = df['quantity'].astype(int)
+    df['quantity_output'] = df['quantity']
+
+    # handle cusips that have errored by first marking all as not having errored, then isolating the ones that have errored and marking them as such
+    df['error'] = False
+    df.loc[df['price'] == NUMERICAL_ERROR, 'error'] = True    # could have chosen either the `price` field or the `ytw` field since both are filled with `NUMERICAL_ERROR` when there is a pricing error
+
+    df['quantity'] = df['quantity'] // 1000    # when logging, quantity is in thousands
+    return df
+
+
+def prepare_batch_pricing_results_to_output_to_user(df: pd.DataFrame, additional_columns: list = []) -> pd.DataFrame:
+    '''After results are logged, make modify `df` to be outputted in a user-friendly format.'''
+    df['quantity'] = df['quantity_output']
+    dollar_price_model_used = df['model_used'] == 'dollar_price'
+    df.loc[dollar_price_model_used, 'error_message'] = df.loc[dollar_price_model_used, 'reason_for_using_dollar_price_model'].map(DOLLAR_PRICE_MODEL_DISPLAY_TEXT)    # if `df` is combined as a result of API calls to due to being a part of large batch pricing, then the conversion with `DOLLAR_PRICE_MODEL_DISPLAY_TEXT` has already been handled
+    # df.loc[dollar_price_model_used, 'ytw'] = df.loc[dollar_price_model_used, 'reason_for_using_dollar_price_model'].map(DOLLAR_PRICE_MODEL_DISPLAY_TEXT)    # if `df` is combined as a result of API calls to due to being a part of large batch pricing, then the conversion with `DOLLAR_PRICE_MODEL_DISPLAY_TEXT` has already been handled
+    df.loc[df['error'], 'yield_to_worst_date'] = pd.NA
+    df = df[FEATURES_FOR_OUTPUT_CSV + additional_columns]    # + ['model_used']]    # `model_used` was used for debugging purposes when it was included in the output csv
+
+    with warnings.catch_warnings():
+        warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)    # suppress `SettingWithCopyWarning: A value is trying to be set on a copy of a slice from a DataFrame. Try using .loc[row_indexer,col_indexer] = value instead.`
+        df['maturity_date'] = pd.to_datetime(df['maturity_date']).dt.strftime(MONTH_DAY_YEAR)    # first convert the date object to a datetime object and then do a string format
+
+        if 'trade_datetime' in df.columns:
+            na_trade_datetime = df['trade_datetime'].isna()
+            df['trade_datetime'] = pd.to_datetime(df['trade_datetime'], errors='coerce')    # convert to datetime, keeping NaT for invalid values
+            formatted_trade_datetime = pd.Series('', index=df.index)    # initialize a full-length formatted column with empty strings
+            formatted_trade_datetime.loc[~na_trade_datetime] = df.loc[~na_trade_datetime, 'trade_datetime'].dt.strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC) + ' ET'
+            df['trade_datetime'] = formatted_trade_datetime
+        
+    for col in ('ytw', 'price'):
+        if col in df.columns:
+            df.loc[df[col] == -1, col] = None
+    return df
+
+
+def get_chunks(chunk_size, *lists, last_item_is_its_own_chunk: bool = False):
+    '''Returns chunks of each list in lists. `last_item_is_its_own_chunk` is a boolean that determines whether 
+    the last item of each list should be in a chunk by itself. This is useful to extract just the last items from 
+    the lists and perform a quick procedure on those before tackling the entire other lists, and this is done to 
+    speed up large batch pricing. If a list is `None`, then use `None` for its place in the chunk.
+    
+    >>> get_chunks(2, [1, 2, 3], [4, 5, 6])
+    [[[1, 2], [4, 5]], [[3], [6]]]
+    >>> get_chunks(2, [1, 2, 3], None)
+    [[[1, 2], None], [[3], None]]
+    >>> get_chunks(2, [1, 2, 3, 7], [4, 5, 6, 8])
+    [[[1, 2], [4, 5]], [[3, 7], [6, 8]]]
+    >>> get_chunks(2, [1, 2, 3, 7], [4, 5, 6, 8], None)
+    [[[1, 2], [4, 5], None], [[3, 7], [6, 8], None]]
+    >>> get_chunks(2, [1, 2, 3, 7], None, [4, 5, 6, 8])
+    [[[1, 2], None, [4, 5]], [[3, 7], None, [6, 8]]]
+    >>> get_chunks(2, [1, 2, 3, 7], [4, 5, 6, 8], last_item_is_its_own_chunk=True)
+    [[[1, 2], [4, 5]], [[3], [6]], [[7], [8]]]
+    >>> get_chunks(2, [1, 2, 3, 7], [4, 5, 6, 8], None, last_item_is_its_own_chunk=True)
+    [[[1, 2], [4, 5], None], [[3], [6], None], [[7], [8], None]]
+    >>> get_chunks(3, [1, 2, 3, 7], [4, 5, 6, 8], last_item_is_its_own_chunk=True)
+    [[[1, 2, 3], [4, 5, 6]], [[7], [8]]]
+    >>> get_chunks(2, [1, 2, 3, 7], [4, 5, 6, 8], [9, 10, 11, 12], last_item_is_its_own_chunk=True)
+    [[[1, 2], [4, 5], [9, 10]], [[3], [6], [11]], [[7], [8], [12]]]
+    '''
+    assert len(lists) > 0, 'Need to provide lists into `get_chunks(...)`'
+    len_first_list = len(lists[0])
+    assert len_first_list is not None, 'The first list passed in is `None`'
+    assert all([len_first_list == len(lst) for lst in lists if lst is not None]), 'Not all lists passed into `get_chunks(...)` are the same size'
+    last_item = [[[lst.pop()] if lst is not None else None for lst in lists]] if last_item_is_its_own_chunk else []
+    if last_item_is_its_own_chunk: len_first_list -= 1
+    return [[lst[chunk_start_idx : chunk_start_idx + chunk_size] if lst is not None else None for lst in lists] for chunk_start_idx in range(0, len_first_list, chunk_size)] + last_item
+
+
+def process_quantity(user_quantity, default_quantity, process_in_api_call: bool = False):
+    if user_quantity is None:    # no quantity was provided, so return `default_quantity` which has been modified if it is a large batch or not
+        return default_quantity
+    elif process_in_api_call:    # quantity was provided by the user, but no need to modify it here, can do it in the API call
+        return user_quantity
+    try:    # quantity provided, and needs to be handled since there is no API call that is going to be made to handle it
+        quantity = round(float(user_quantity)) * 1000    # need to use `round(float(x))` instead of `int(x)` since the value may come in as a decimal, and in this case the value should be rounded, see `app_engine/demo/server/resources.py::get_quantities_from_quantity_list(...)`
+        return max(min(quantity, QUANTITY_UPPER_BOUND * 1000), QUANTITY_LOWER_BOUND * 1000)    # if quantity is outside of the range [QUANTITY_LOWER_BOUND * 1000, QUANTITY_UPPER_BOUND * 1000], then put it back into the range
+    except ValueError:    # catches the case where quantity value is not a valid integer
+        return default_quantity    # `quantity` is initialized to `default_quantity` which has been modified if it is a large batch or not
+
+
+def process_user_price(user_price: str, process_in_api_call: bool = False) -> float:
+    if user_price is None or process_in_api_call: return user_price    # `user_price` was provided by the user (or is empty), but no need to modify it here, can modify it (if provided) in the API call
+    try:
+        return float(user_price)
+    except ValueError:    # catches the case where the user_price value is not a valid float
+        return None
+
+
+def process_trade_datetime(trade_datetime: str, process_in_api_call: bool = False, current_datetime: datetime = None) -> datetime:
+    if trade_datetime == '': trade_datetime = None
+    if trade_datetime is None or process_in_api_call: return trade_datetime    # `trade_datetime` was provided by the user (or is empty), but no need to modify it here, can modify it (if provided) in the API call
+    try:
+        trade_datetime = pd.to_datetime(trade_datetime).tz_localize(None)    # do not specify a format to allow for any (reasonable) format; remove timezone if one exists (most likely one will not exist because it is coming from a string input)
+        if pd.isna(trade_datetime): return None    # sometimes `pd.to_datetime(...)` does not raise an exception, but just silently returns a special pandas `NaT` value
+    except Exception as e:
+        print(f'Unable to convert {trade_datetime} to a valid datetime object since the string must be in the following format: {YEAR_MONTH_DAY_HOUR_MIN_SEC}. {type(e)}: {e}')
+        return None
+    
+    if current_datetime is None: current_datetime = datetime.now(EASTERN)
+    if trade_datetime < DATE_FROM_WHICH_PAST_REFERENCE_DATA_IS_STORED_IN_REDIS or trade_datetime > current_datetime.replace(tzinfo=None):    # need to remove timezone so that comparison does not cause `TypeError: can't compare offset-naive and offset-aware datetimes`
+        print(f'Pricing at realtime because the trade datetime: {trade_datetime} was either before {DATE_FROM_WHICH_PAST_REFERENCE_DATA_IS_STORED_IN_REDIS} or in the future')
+        return None
+    return trade_datetime
+    
+
+def at_indices(lst, indices):
+    '''Return each item from `lst` which is at an index in `indices`.
+    
+    >>> at_indices([1, 2, 3, 4, 5], [1, 3])
+    [2, 4]
+    '''
+    return [lst[idx] for idx in indices]
+
+
+def replace_na_with_none(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    if column in df.columns: df[column] = df[df[column].isna()][column] = None    # TODO: this code works for now, but see if it can be made simpler and why `df[column] = df[column].fillna(None)` does not work
+    return df
+
+
+def add_logging_fields_for_batch_pricing(df: pd.DataFrame, user: str, api_call: bool, error: bool = False) -> pd.DataFrame:
+    '''Use the priced dataframe, `df`, directly for logging since the `.to_dict('records')` function will format this nicely into a list of dicts, and when 
+    needing to assign a single value (e.g., setting 'direction' to 'D') to all rows, it is syntactically clean to assign it to a column of a dataframe. 
+    NOTE: we do not need to populate the quantity field since this is already done in `price_cusips_list(...)` upstream.'''
+    df['user'] = user
+    df['api_call'] = api_call
+    df['time'] = current_datetime_as_string()
+    df['direction'] = df['trade_type'] if error or 'direction' not in df.columns else df['direction']
+    df['daily_schoonover_report'] = False
+    df['real_time_yield_curve'] = False
+    df['batch'] = True
+    df['show_similar_bonds'] = False
+    df['ficc_price'] = NUMERICAL_ERROR if error else df.price
+    df['ficc_ytw'] = NUMERICAL_ERROR if error else df.ytw_LOGGING_PRECISION
+
+    price_not_null = df['ficc_price'].notnull()
+    df.loc[price_not_null, 'ficc_price'] = round_for_logging(df.loc[price_not_null, 'ficc_price']) # make sure none NULL values of ficc_price is rounded
+
+    df['yield_spread'] = NUMERICAL_ERROR if error or 'yield_spread' not in df.columns else df['yield_spread']
+    df = replace_na_with_none(df, 'yield_spread')    # without this function, sometimes `np.nan` values get passed into the `usage_dict` and logging fails
+
+    df['ficc_ycl'] = NUMERICAL_ERROR if error or 'ficc_ycl' not in df.columns else df['ficc_ycl']
+    df = replace_na_with_none(df, 'ficc_ycl')    # without this function, sometimes `np.nan` values get passed into the `usage_dict` and logging fails
+
+    df['calc_date'] = 'None' if error else df.yield_to_worst_date
+    df['model_used'] = None if error else df.model_used
+    if 'error' not in df.columns: df['error'] = error
+    return df
+
+
+def return_none_if_list_only_contains_none(lst: list):
+    '''Return `None` if `lst` only contains `None` values. This is to simplify the code to not 
+    pass large lists of `None` when all of these values will get replaced by a default value 
+    further downstream.
+    
+    >>> return_none_if_list_only_contains_none([None, None, None])
+    >>> return_none_if_list_only_contains_none([None, 1, None])
+    [None, 1, None]
+    '''
+    return None if all(item is None for item in lst) else lst
+
+
+def extract_lists_from_file(file, extract_lists_for_compliance: bool) -> list:
+    '''Extract the CUSIP list, quantity list, and trade type list from the file. If compliance is 
+    being performed, i.e., `extract_lists_for_compliance` is set to `True`, then also extract the 
+    user price list and the trade datetime list.'''
+    import codecs    # lazy loading for lower latency
+    import csv    # lazy loading for lower latency
+
+    reader = csv.reader(codecs.iterdecode(file, 'utf-8-sig'))    # important to have 'utf-8-sig' to remove the byte order mark that is sometimes present in CSVs exported from Excel on Windows that are passed into batch pricing; the byte order mark is a code that is automatically appended to the beginning of the file of the following form: \ufeff
+    cusip_list, quantity_list, trade_type_list = [], [], []
+    if extract_lists_for_compliance: user_price_list, trade_datetime_list = [], []
+    for row in reader:
+        if len(row) > 0 and row[0] != '':    # first check if the row is empty before processing and then check if the CUSIP is not empty
+            cusip_list.append(row[0].upper())    # uppercase each CUSIP
+            quantity_list.append(row[1] if len(row) > 1 else None)    # condition is `True` if the user has inputted a quantity
+            trade_type_list.append(row[2] if len(row) > 2 else None)    # condition is `True` if the user has inputted a trade type
+            if extract_lists_for_compliance:
+                user_price_list.append(row[3] if len(row) > 3 else None)
+                trade_datetime_list.append(row[4] if len(row) > 4 else None)
+    lists = [cusip_list,    # `cusip_list` should never be all `None` values
+             return_none_if_list_only_contains_none(quantity_list), 
+             return_none_if_list_only_contains_none(trade_type_list)]
+    if extract_lists_for_compliance: lists.extend([return_none_if_list_only_contains_none(user_price_list), 
+                                                   return_none_if_list_only_contains_none(trade_datetime_list)])
+    return lists
+
+
+def filename_or_df(df: pd.DataFrame, filename: str, file_passed_in: bool, download_csv: bool):
+    '''Create file before returning `df` or `temporary_filename` so that results are saved and can be returned 
+    without recomputation. Return filename if input was CSV or return dataframe if user inputted lists.'''
+    df.to_csv(filename, index=False)
+    if not file_passed_in or (not download_csv): return df    # return df if we're not downloading the CSV
+    return filename
+
+
+def successfully_priced(priced_batch) -> bool:
+    '''Determines whether `priced_batch` is a successfully priced batch. Most reliable way to check if 
+    `priced_batch` is a successfully priced batch is to check whether it is a `pd.DataFrame` instance. 
+    If `priced_batch` is unsuccessfully priced, it may be an error instance or a `None` value.'''
+    return isinstance(priced_batch, pd.DataFrame)
+
+
+def get_successfully_priced_batches(priced_batches_list: list, cusip_batches_list: list, print_failed_batch_info: bool = True) -> list[pd.DataFrame]:
+    '''Return only the batches in `list_of_batches` which have successfully priced. If `print_failed_batch_info` 
+    is `True`, print debugging output for each failed batch.'''
+    NUM_CUSIPS_PER_PRINT_STATEMENT = 500    # avoids Python truncation of very long lists in print output
+    successful_batches, failed_batches = [], []
+    for priced_batch, cusip_list_batch in zip(priced_batches_list, cusip_batches_list):    # iterate through each of the priced batches and output CUSIPs and other information on a batch that was not successfully priced for easier debugging
+        if successfully_priced(priced_batch):
+            successful_batches.append(priced_batch)
+        else:
+            failed_batches.append(priced_batch)
+            if print_failed_batch_info:
+                print(f'ERROR (batch failed): A batch was unable to be priced. The CUSIPs in the priced batch (printing in chunks of {NUM_CUSIPS_PER_PRINT_STATEMENT} to avoid truncation in print output):')    # python_logging.warning(f'A batch was unable to be priced. The CUSIPs in the priced batch (printing in chunks of {NUM_CUSIPS_PER_PRINT_STATEMENT} to avoid truncation in print output):')
+                for idx in range(0, len(cusip_list_batch), NUM_CUSIPS_PER_PRINT_STATEMENT):
+                    print(f'\tERROR (batch failed): {cusip_list_batch[idx : idx + NUM_CUSIPS_PER_PRINT_STATEMENT]}')    # python_logging.warning(cusip_list_batch[idx : idx + NUM_CUSIPS_PER_PRINT_STATEMENT])
+    
+    num_batches_failed = len(failed_batches)
+    if print_failed_batch_info and num_batches_failed > 0: print(f'ERROR (batch failed): {num_batches_failed} batches failed out of {len(successful_batches) + num_batches_failed} total batches')    # python_logging.warning(f'{num_batches_failed} batches failed out of {len(successful_batches) + num_batches_failed} total batches')
+    return successful_batches
+
+
+def get_priced_df_on_different_server(cusip_quantity_tradetype_chunks: list, 
+                                      is_large_batch: bool, 
+                                      use_for_compliance: bool, 
+                                      access_token, 
+                                      username: str, 
+                                      password: str, 
+                                      default_quantity: int, 
+                                      default_trade_type: str, 
+                                      ignore_error_cusips: bool, 
+                                      set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool, 
+                                      current_time: str, 
+                                      discard_failed_batches: bool) -> list[pd.DataFrame]:
+    price_batches_async_caller = partial(price_batches_async, username=username, 
+                                                              password=password, 
+                                                              access_token=access_token, 
+                                                              default_quantity=default_quantity, 
+                                                              default_trade_type=default_trade_type, 
+                                                              ignore_error_cusips=ignore_error_cusips, 
+                                                              set_quantity_to_amount_outstanding_if_less_than_given_quantity=set_quantity_to_amount_outstanding_if_less_than_given_quantity, 
+                                                              time=current_time, 
+                                                              use_for_compliance=use_for_compliance, 
+                                                              discard_failed_batches=discard_failed_batches)
+
+    if use_for_compliance and is_large_batch: raise CustomMessageError(f'Do not support compliance for over {LARGE_BATCH_SIZE} CUSIPs at once')
+    max_async_calls_at_once = 200
+    num_chunks = len(cusip_quantity_tradetype_chunks)
+    print(f'INFO: Making {num_chunks} asynchronous API calls (after making one non-asynchronous call with just the last line item) with {max_async_calls_at_once} maximum asynchronous calls at once')    # python_logging.info(f'Making asynchronous API calls (after making one non-asynchronous call) with {max_async_calls_at_once} maximum asynchronous calls at once')
+    cusip_list_batches = [cusip_quantity_tradetype_chunks[chunk_idx][0] for chunk_idx in range(num_chunks)]
+    quantity_list_batches = [cusip_quantity_tradetype_chunks[chunk_idx][1] for chunk_idx in range(num_chunks)]
+    trade_type_list_batches = [cusip_quantity_tradetype_chunks[chunk_idx][2] for chunk_idx in range(num_chunks)]
+    if use_for_compliance:
+        user_price_list_batches = [cusip_quantity_tradetype_chunks[chunk_idx][3] for chunk_idx in range(num_chunks)]
+        trade_datetime_list_batches = [cusip_quantity_tradetype_chunks[chunk_idx][4] for chunk_idx in range(num_chunks)]
+    del cusip_quantity_tradetype_chunks    # performing for memory management
+
+    last_batch_priced = []
+    if not use_for_compliance:    # only perform last item pricing when not performing compliance because pricing a single batch / line item takes a long time in compliance so waiting for this before pricing the rest of the items can greatly increase latency
+        last_cusip_list, last_quantity_list, last_trade_type_list = cusip_list_batches.pop(), quantity_list_batches.pop(), trade_type_list_batches.pop()
+        lists = [[last_cusip_list], [last_quantity_list], [last_trade_type_list]]    # need to wrap with an extra list so that it represents a batch of size 1
+        last_batch_priced = asyncio.run(price_batches_async_caller(*lists))    # price the last batch as a trial to make sure that credentials are set before making the asynchronous calls
+    
+    priced_batches = []
+    for batch_group_start_idx in range(0, len(cusip_list_batches), max_async_calls_at_once):
+        batch_group_end_idx = batch_group_start_idx + max_async_calls_at_once
+        lists = [cusip_list_batches[batch_group_start_idx : batch_group_end_idx], 
+                 quantity_list_batches[batch_group_start_idx : batch_group_end_idx], 
+                 trade_type_list_batches[batch_group_start_idx : batch_group_end_idx]]
+        if use_for_compliance: lists.extend([user_price_list_batches[batch_group_start_idx : batch_group_end_idx], 
+                                             trade_datetime_list_batches[batch_group_start_idx : batch_group_end_idx]])
+        priced_batches.extend(asyncio.run(price_batches_async_caller(*lists, long_pause_on_first_request=use_for_compliance and batch_group_start_idx == 0)))    # perform long pause to make sure credentials are set, but only do this for compliance (and obviously, the very first occurence) since batch pricing prices the last item
+    
+    priced_batches = priced_batches + last_batch_priced
+    if discard_failed_batches: priced_batches = get_successfully_priced_batches(priced_batches, cusip_list_batches)
+    return priced_batches
+
+
+def get_priced_df_on_this_server(cusip_quantity_tradetype_chunks: list, 
+                                 use_for_compliance: bool, 
+                                 ignore_error_cusips: bool, 
+                                 set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool, 
+                                 current_time: str) -> list[pd.DataFrame]:
+    if use_for_compliance:
+        price_cusips_list_func = price_cusips_list_for_compliance
+    else:
+        datetime_to_be_priced_at = datetime.strptime(current_datetime_as_string(precision='day') + ' ' + current_time, YEAR_MONTH_DAY_HOUR_MIN_SEC) if is_valid_time_format(current_time) else None    # since `current_time` is used only for the batch pricing (non-compliance) module, we can check whether `current_time` is valid and create the `current_datetime` here
+        price_cusips_list_func = partial(price_cusips_list, current_datetime=datetime_to_be_priced_at, 
+                                                            ignore_error_cusips=ignore_error_cusips, 
+                                                            set_quantity_to_amount_outstanding_if_less_than_given_quantity=set_quantity_to_amount_outstanding_if_less_than_given_quantity)
+    total_number_of_items_to_price = sum([len(chunk[0]) for chunk in cusip_quantity_tradetype_chunks])    # each chunk contains equally sized lists of cusips, quantities, and trade_types respectively (maybe also user_prices and trade_datetimes for compliance)
+    if total_number_of_items_to_price <= SINGLE_FUNCTION_CALL_BATCH_SIZE:    # no need for parallelization since the overhead is too high for how few items are being priced
+        df_list = [price_cusips_list_func(*chunk) for chunk in cusip_quantity_tradetype_chunks]
+    else:
+        with mp.Pool() as pool_object:    # using template from https://docs.python.org/3/library/multiprocessing.html
+            df_list = pool_object.starmap(price_cusips_list_func, cusip_quantity_tradetype_chunks)    # need to use starmap since lambda function has multiple arguments: https://stackoverflow.com/questions/5442910/how-to-use-multiprocessing-pool-map-with-multiple-arguments
+    return df_list
+
+
+def concatenate_dataframe_list_and_handle_errors(dataframe_list: list) -> pd.DataFrame:
+    '''Concatenate the dataframes in `dataframe_list` into a single dataframe. Handles upstream errors where items in `dataframe_list` 
+    are `Exception` objects that result from an asynchronous call raising an exception, by providing helpful debugging print.'''
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', FutureWarning)   # temporarily suppress: `FutureWarning: In a future version, object-dtype columns with all-bool values will not be included in reductions with bool_only=True. Explicitly cast to bool dtype instead.`
+            return pd.concat(dataframe_list)
+    except TypeError as e:    # when an upstream function gets an `AssertionError`, this line raises `TypeError: cannot concatenate object of type '<class 'AssertionError'>'; only Series and DataFrame objs are valid`
+        for dataframe in dataframe_list:
+            if isinstance(dataframe, Exception): print(f'{type(dataframe)}: {dataframe}')    # `dataframe` is an error object
+        raise e
+
+
+@function_timer
+def get_priced_df(cusip_quantity_tradetype_chunks: list, 
+                  is_large_batch: bool, 
+                  route_to_different_server: bool, 
+                  use_for_compliance: bool, 
+                  access_token, 
+                  username: str, 
+                  password: str, 
+                  default_quantity: int, 
+                  default_trade_type: str, 
+                  ignore_error_cusips: bool, 
+                  set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool, 
+                  current_time: str, 
+                  discard_failed_batches: bool) -> pd.DataFrame:
+    '''NOTE: `cusip_quantity_tradetype_chunks` may contain the user prices and trade datetimes if the function is being used for compliance. 
+    `discard_faield_batches` is a boolean only relevant for a large batch operation (i.e., `is_large_batch` is `True`) that returns a priced 
+    output discarding all failed batches, if there are any (instead of raising an error which is the default behavior with `discard_failed_batches` 
+    set to `False`). This is used by Investortools, i.e., set to `True` to not error out the entire output if only a few batches fail.'''
+    if is_large_batch or route_to_different_server:    # the actual batch pricing (data retrieval, processing, and pricing) will be done in a different request
+        get_priced_df_func = get_priced_df_on_different_server
+        additional_arguments = {'is_large_batch': is_large_batch, 
+                                'access_token': access_token, 
+                                'username': username, 
+                                'password': password, 
+                                'default_quantity': default_quantity, 
+                                'default_trade_type': default_trade_type, 
+                                'discard_failed_batches': discard_failed_batches}    # only relevent when `is_large_batch` is `True`
+    else:
+        get_priced_df_func = get_priced_df_on_this_server
+        additional_arguments = {}
+    df_list = get_priced_df_func(cusip_quantity_tradetype_chunks=cusip_quantity_tradetype_chunks, 
+                                 use_for_compliance=use_for_compliance, 
+                                 ignore_error_cusips=ignore_error_cusips, 
+                                 set_quantity_to_amount_outstanding_if_less_than_given_quantity=set_quantity_to_amount_outstanding_if_less_than_given_quantity, 
+                                 current_time=current_time, 
+                                 **additional_arguments)
+    df_list = concatenate_dataframe_list_and_handle_errors(df_list)    # NOTE: `df_list` is now a `pd.DataFrame`, but keeping the variable name the same to save memory
+    return df_list.reset_index(drop=True)    # need .reset_index(...) to avoid `ValueError: DataFrame index must be unique for orient='columns'`
+
+
+def get_predictions_from_batch_pricing(file_obj_or_list_tuple, 
+                                       default_quantity, 
+                                       default_trade_type, 
+                                       user, 
+                                       api_call: bool, 
+                                       access_token=None, 
+                                       username: str = None, 
+                                       password: str = None, 
+                                       logging: bool = True, 
+                                       use_for_compliance: bool = False, 
+                                       download_csv: bool = False, 
+                                       route_to_different_server: bool = False, 
+                                       use_cached_priced_file: bool = False, 
+                                       ignore_error_cusips: bool = False,    # currently used only for `large_batch_pricing` cloud function
+                                       set_quantity_to_amount_outstanding_if_less_than_given_quantity: bool = False,    # currently used only for `large_batch_pricing` cloud function
+                                       current_time: str = None, 
+                                       discard_failed_batches: bool = False):
+    '''Optional argument `logging` a boolean that can be turned off when testing `get_predictions_from_batch_pricing(...)` 
+    (e.g., in notebooks such as `inspect_redis_data.ipynb`). `current_time` is used to perform point-in-time pricing 
+    directly from an external API call with the model deployed on VertexAI instead of an archived model, since it is 
+    assumed that the datetime would be the current date and the `current_time`. `discard_faield_batches` is a boolean only 
+    relevant for a large batch operation (i.e., `is_large_batch` is `True`) that returns a priced output discarding all 
+    failed batches, if there are any (instead of raising an error which is the default behavior with `discard_failed_batches` 
+    set to `False`). This is used by Investortools, i.e., set to `True` to not error out the entire output if only a few 
+    batches fail.'''
+    default_quantity = int(default_quantity)
+    results_filename = f'/tmp/results{"_compliance" if use_for_compliance else ""}.csv'
+    if use_cached_priced_file and download_csv and os.path.exists(results_filename): return results_filename    # return the archived results iff the `download_csv` button is pressed and `use_cached_priced_file` is True; last condition is a sanity check that should always be `True` if `download_csv` is `True` since the `download_csv` button is only available after the CSV has been created
+    try:    # wrap in try except to perform logging even when there is an error
+        if type(file_obj_or_list_tuple) == tuple:
+            file_passed_in = False
+            cusip_list, quantity_list, trade_type_list = file_obj_or_list_tuple[:3]
+            if use_for_compliance: user_price_list, trade_datetime_list = file_obj_or_list_tuple[-2:]    # if using for compliance then the last two items should be the `user_price_list` and the `trade_datetime_list` respectively
+            assert type(cusip_list) == list, f'cusip_list shoud be of type list, but is instead {type(cusip_list)} and has value {cusip_list}'
+        else:
+            file_passed_in = True
+            lists = extract_lists_from_file(file_obj_or_list_tuple, use_for_compliance)
+            if use_for_compliance:
+                cusip_list, quantity_list, trade_type_list, user_price_list, trade_datetime_list = lists
+            else:
+                cusip_list, quantity_list, trade_type_list = lists
+
+        features_for_output_csv = FEATURES_FOR_OUTPUT_CSV
+        if use_for_compliance: features_for_output_csv = features_for_output_csv + ADDITIONAL_FEATURES_FOR_COMPLIANCE_CSV
+        filename_or_df_caller = partial(filename_or_df, filename=results_filename, 
+                                                        file_passed_in=file_passed_in, 
+                                                        download_csv=download_csv)
+        if len(cusip_list) == 0: return filename_or_df_caller(pd.DataFrame(columns=features_for_output_csv))    # create empty dataframe with just column headers
+
+        is_large_batch = len(cusip_list) > LARGE_BATCH_SIZE    # used to control logging and initializations for making API call to function
+        if not route_to_different_server: assert is_large_batch is False, f'Only perform large batch pricing when routing to a different server'
+        batch_pricing_will_be_done_in_a_different_request = is_large_batch or route_to_different_server
+        if not batch_pricing_will_be_done_in_a_different_request:    # no need to process these lists if the requests are handled elsewhere
+            if quantity_list is None: quantity_list = [None] * len(cusip_list)
+            if trade_type_list is None: trade_type_list = [None] * len(cusip_list)
+            if use_for_compliance:
+                if user_price_list is None: user_price_list = [None] * len(cusip_list)
+                if trade_datetime_list is None: trade_datetime_list = [None] * len(cusip_list)
+            
+            assert len(cusip_list) == len(quantity_list) == len(trade_type_list), f'Number of cusips: {len(cusip_list)} must equal number of quantities: {len(quantity_list)} and number of trade types: {len(trade_type_list)}'    # these lengths are assumed to be equal when batch pricing in chunks
+            if use_for_compliance: assert len(cusip_list) == len(user_price_list) == len(trade_datetime_list), f'Number of cusips: {len(cusip_list)} must equal number of user prices: {len(user_price_list)} and number of trade datetimes: {len(trade_datetime_list)}'    # these lengths are assumed to be equal when batch pricing in chunks
+
+            default_quantity *= 1000    # used to fill in the quantity of a hypothetical trade if there is no quantity provided in the csv
+            quantity_list = [process_quantity(quantity, default_quantity, batch_pricing_will_be_done_in_a_different_request) for quantity in quantity_list]    # override `quantity_list`
+            trade_type_list = [user_trade_type.upper() if user_trade_type in ('s', 'p', 'd') else user_trade_type for user_trade_type in trade_type_list]
+            trade_type_list = [user_trade_type if user_trade_type in ('S', 'P', 'D') else default_trade_type for user_trade_type in trade_type_list]    # override `trade_type_list`
+            if use_for_compliance:
+                user_price_list = [process_user_price(user_price, batch_pricing_will_be_done_in_a_different_request) for user_price in user_price_list]    # override `user_price_list`
+                now = datetime.now(EASTERN)    # used to ensure that `trade_datetime` inputs are not in the future
+                trade_datetime_list = [process_trade_datetime(trade_datetime, batch_pricing_will_be_done_in_a_different_request, now) for trade_datetime in trade_datetime_list]    # override `trade_datetime_list`
+        
+        if is_large_batch:
+            chunk_size = LARGE_BATCH_SIZE
+        else:
+            chunk_size = SINGLE_FUNCTION_CALL_BATCH_SIZE if len(cusip_list) <= SINGLE_FUNCTION_CALL_BATCH_SIZE else math.ceil(len(cusip_list) / os.cpu_count())
+        lists = [cusip_list, quantity_list, trade_type_list]
+        if use_for_compliance: lists.extend([user_price_list, trade_datetime_list])
+        cusip_quantity_tradetype_chunks = get_chunks(chunk_size, *lists, last_item_is_its_own_chunk=is_large_batch and not use_for_compliance) if is_large_batch or not route_to_different_server else [lists]    # do not separate the last line item for compliance because pricing a single batch / line item takes a long time in compliance so waiting for this before pricing the rest of the items can greatly increase latency (the bad case is that there are two items and so the second item gets priced after the first item is finished pricing, which takes very long)
+        df = get_priced_df(cusip_quantity_tradetype_chunks, 
+                           is_large_batch, 
+                           route_to_different_server, 
+                           use_for_compliance, 
+                           access_token, 
+                           username, 
+                           password, 
+                           default_quantity, 
+                           default_trade_type, 
+                           ignore_error_cusips, 
+                           set_quantity_to_amount_outstanding_if_less_than_given_quantity, 
+                           current_time, 
+                           discard_failed_batches)
+
+        if len(df) == 0:    # for the case when `ignore_error_cusips` is `True` and so `df` may be empty
+            df = pd.DataFrame(columns=features_for_output_csv)    # create empty dataframe with just column headers
+        elif not batch_pricing_will_be_done_in_a_different_request:    # do not perform logging when a different request is handling the batch pricing since the logging will take place there
+            df = prepare_batch_pricing_results_for_logging(df)
+            df = add_logging_fields_for_batch_pricing(df, user, api_call)
+            if logging: log_usage(df[LOGGING_FEATURES.keys()].to_dict('records'))    # LOGGING_FEATURES.keys() gets each of the features needed for logging
+            additional_features = ADDITIONAL_FEATURES_FOR_COMPLIANCE_CSV if use_for_compliance else []
+            df = prepare_batch_pricing_results_to_output_to_user(df, additional_features)
+        return filename_or_df_caller(df)
+    except Exception as e:
+        len_cusip_list = 1
+        if 'df' not in locals():
+            df = pd.DataFrame()
+            if 'cusip_list' in locals():    # `df` was not successfully created, i.e., `price_cusips_list(...)` did not work
+                df['cusip'] = cusip_list
+                len_cusip_list = len(cusip_list)
+            else:    # file could not be read, so there are no cusips to log
+                df['cusip'] = ['None']
+
+        if 'quantity_list' in locals():
+            df['quantity'] = [process_quantity(quantity, default_quantity) for quantity in quantity_list]
+        else:
+            df['quantity'] = [default_quantity] * len_cusip_list
+        df['quantity'] = df['quantity'] // 1000    # need to call `process_quantity(...)` on the values since we assume that `df['quantity']` ends up as a numeric dtype
+
+        if 'trade_type_list' in locals():
+            df['trade_type'] = trade_type_list
+        else:
+            df['trade_type'] = [default_trade_type] * len_cusip_list
+
+        df = add_logging_fields_for_batch_pricing(df, user, api_call, error=True)    # we know this function exists since `cusip_list` exists
+        log_usage(df[LOGGING_FEATURES.keys()].to_dict('records'))
+        raise e

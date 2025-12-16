@@ -1,0 +1,148 @@
+'''
+ # @ Create date: 2022-08-22
+ # @ Modified date: 2024-10-15
+ '''
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from pandas.tseries.offsets import CustomBusinessDay
+from pandas.tseries.holiday import USFederalHolidayCalendar
+import statsmodels.api as sm
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error
+
+from google.cloud import bigquery
+
+
+BUSINESS_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())    # used to skip over holidays when adding or subtracting business days
+
+
+bq_client = bigquery.Client()
+PROJECT_ID = 'eng-reactor-287421'
+DATASET_NAME = 'yield_curves_v2'
+TABLE_ID = f'{PROJECT_ID}.{DATASET_NAME}.shape_parameters'
+schema = [bigquery.SchemaField('Date', 'DATE'),
+          bigquery.SchemaField('L', 'FLOAT')]
+
+sp_index_tables = ['sp_12_22_year_national_amt_free_index',
+                   'sp_15plus_year_national_amt_free_index',
+                   'sp_7_12_year_national_amt_free_municipal_bond_index_yield',
+                   'sp_muni_high_quality_index_yield',
+                   'sp_high_quality_intermediate_managed_amt_free_municipal_bond_index_yield',
+                   'sp_high_quality_short_intermediate_municipal_bond_index_yield',
+                   'sp_high_quality_short_municipal_bond_index_yield',
+                   'sp_long_term_national_amt_free_municipal_bond_index_yield']
+
+sp_maturity_tables = ['sp_12_22_year_national_amt_free_index',
+                      'sp_15plus_year_national_amt_free_index',
+                      'sp_7_12_year_national_amt_free_index',
+                      'sp_high_quality_index',
+                      'sp_high_quality_intermediate_managed_amt_free_index',
+                      'sp_high_quality_short_intermediate_index',
+                      'sp_high_quality_short_index',
+                      'sp_long_term_national_amt_free_municipal_bond_index_yield']
+
+
+def uploadData(df, TABLE_ID, schema):
+    client = bigquery.Client(project=PROJECT_ID, location='US')
+    job_config = bigquery.LoadJobConfig(schema = schema, write_disposition='WRITE_APPEND')
+    job = client.load_table_from_dataframe(df, TABLE_ID,job_config=job_config)
+
+    try:
+        job.result()
+        print('Upload Successful')
+    except Exception as e:
+        print('Failed to Upload')
+        raise e
+
+def load_index_data():
+    index_data  = [] 
+    for table in sp_index_tables:
+        query = f'''SELECT * FROM `{PROJECT_ID}.spBondIndex.{table}` order by date desc'''
+        df = pd.read_gbq(query, project_id=PROJECT_ID, dialect='standard')
+        df['date'] = pd.to_datetime(df['date'], format = '%Y-%m-%d')
+        df['ytw'] = df['ytw'] * 100
+        df = df.drop_duplicates('date')
+        df.set_index('date', inplace=True, drop=True)
+        index_data.append(df)
+    
+    df = pd.concat(index_data, axis=1)
+    df.columns = sp_maturity_tables
+    df.ffill(axis=0, inplace=True)
+    df.dropna(inplace=True)
+    return df
+
+
+def load_maturity_data():
+    maturity_data  = []
+
+    for table in sp_maturity_tables:
+        query = f'SELECT * FROM `{PROJECT_ID}.spBondIndexMaturities.{table}` order by effectivedate desc;'
+        df = pd.read_gbq(query, project_id=PROJECT_ID, dialect='standard')        
+        df['effectivedate'] = pd.to_datetime(df['effectivedate'], format='%Y-%m-%d')
+        df = df.drop_duplicates('effectivedate')
+        df.set_index('effectivedate', inplace=True, drop=True)
+        df = df[['weightedAverageMaturity']]
+        maturity_data.append(df) 
+        
+    df = pd.concat(maturity_data, axis=1)
+    df.columns = sp_maturity_tables
+    df.ffill(axis=0,inplace=True)
+    df.dropna(inplace=True)
+    return df
+
+def get_maturity_dict(maturity_df, date):
+    temp_df = maturity_df.loc[date].T
+    temp_dict = dict(zip(temp_df.index, temp_df.values))
+    return temp_dict
+
+def decay_transformation(t, L):
+    return L*(1-np.exp(-t/L))/t
+
+def laguerre_transformation(t, L):
+    return (L*(1-np.exp(-t/L))/t) -np.exp(-t/L)
+
+def run_NL_model(summary_df_2_2, L,):
+    summary_df_2_2['X1'] = decay_transformation(summary_df_2_2['Weighted_Maturity'], L)
+    summary_df_2_2['X2'] = laguerre_transformation(summary_df_2_2['Weighted_Maturity'], L)
+
+    X = sm.add_constant(summary_df_2_2[['X1','X2']])
+    y = summary_df_2_2.ytw
+    lm = Ridge(alpha=0.001, random_state = 1).fit(X , y)
+
+    predictions = lm.predict(X)
+    mae = mean_absolute_error(y,predictions)
+
+    return lm, mae
+
+def main(args):
+    target_date = datetime.now().date() - (BUSINESS_DAY * 1)
+    index_data = load_index_data()
+    maturity_data = load_maturity_data()
+    maturity_dict = get_maturity_dict(maturity_data, target_date)
+    summary_df = pd.DataFrame(index_data.loc[target_date])
+    summary_df.index
+    summary_df.columns = ['ytw']
+    summary_df['Weighted_Maturity'] = summary_df.index.map(maturity_dict).astype(float)
+
+    result_df = pd.DataFrame(columns=['L', 'MAE', 'model'])
+    tau_dict = {}
+    
+    for i in range(50):
+            model, MAE = run_NL_model(summary_df, i)
+            temp_df = pd.DataFrame({'L': i, 'MAE': MAE, 'model': model}, index=[0])
+            result_df = result_df.append(temp_df)
+    result_df.set_index('L', inplace=True, drop=True)
+    result_df = result_df.sort_values('MAE', ascending=True)
+    tau_dict[target_date] = result_df.index[0]
+
+    tau_table = pd.DataFrame(tau_dict.items(), columns=['Date', 'L'])
+    tau_table['Date'] = pd.to_datetime(tau_table['Date'])
+    tau_table['L'] = tau_table['L'].astype(float)  
+
+    # uploadData(tau_table, TABLE_ID, schema)
+    return 'Upload successful'
+
+
+if __name__ == '__main__':
+    main('Test')

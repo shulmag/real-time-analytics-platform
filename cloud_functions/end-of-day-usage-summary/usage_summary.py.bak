@@ -1,0 +1,160 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2025-03-04
+'''
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+from auxiliary_functions import MAX_NUMBER_OF_RESULTS, SEED, SENDER_EMAIL, SENDER_PASSWORD, SMTP_SERVER, PORT, EMAIL_RECIPIENTS, YEAR_MONTH_DAY_HOUR_MIN_SEC, function_timer, sqltodf, remove_trailing_zeros
+
+
+def send_email(subject, message_list=[], recipients=EMAIL_RECIPIENTS):
+    '''This function comes directly from `cloud_functions/check_demo_status/main.py`.'''
+    message = MIMEMultipart()
+    message['Subject'] = subject
+    message['From'] = SENDER_EMAIL
+    message['To'] = ', '.join(recipients)
+
+    for single_message in message_list:
+        message.attach(single_message)
+    
+    with smtplib.SMTP(SMTP_SERVER, PORT) as server:
+        try:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, recipients, message.as_string())
+        except Exception as e:
+            print(e)
+        finally:
+            server.quit()
+
+
+def get_email_message_split_by_hostname(df):
+    '''Group `df` by hostname so we can see if there is correlation between a particular 
+    company and their usage.'''
+    message_list = []
+    df[['user', 'hostname']] = df['user'].str.split('@', expand=True)    # `expand=True` argument creates two new columns with the split values; https://saturncloud.io/blog/how-to-split-pandas-dataframe-column-values-in-python/
+    for hostname, hostname_df in df.groupby('hostname'):
+        message_list.append(MIMEText('\n@' + hostname + '\n'))
+        hostname_df = hostname_df.drop(columns='hostname')
+        # `index=False` inside `.to_html(...)` removes the index when creating the HTML
+        hostname_df_html = f'''\
+                    <html>
+                    <head></head>
+                    <body>
+                        {hostname_df.to_html(index=False)}
+                    </body>
+                    </html>'''
+        message_list.append(MIMEText(hostname_df_html, 'html'))
+    return message_list
+
+
+@function_timer
+def get_uses_email_message():
+    '''Gets all CUSIPs that were priced by users today.'''
+    query = '''SELECT user, count(user) as total_searches, max(time) as latest_login
+               FROM
+                 `eng-reactor-287421.api_calls_tracker.usage_data`
+               WHERE DATE(time) = CURRENT_DATE('America/New_York')
+                 AND INSTR(user, 'ficc.ai') = 0
+               GROUP BY user 
+               ORDER BY total_searches'''
+    uses_df = sqltodf(query)
+    if len(uses_df) == 0: return None    # returning `None` indicates that there is no usage today since the dataframe is empty
+    uses_df['latest_login'] = uses_df['latest_login'].dt.strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC)
+    header_message = '--------------------Usage today--------------------\n'
+    return [MIMEText(header_message)] + get_email_message_split_by_hostname(uses_df)
+
+
+@function_timer
+def get_user_errors_count_by_user_email_message():
+    '''Gets all CUSIPs that were priced by users today. Second return value is a boolean indicating 
+    whether there was any usage today.'''
+    query = '''SELECT user, count(user) as total_errors
+               FROM
+                 `eng-reactor-287421.api_calls_tracker.usage_data`
+               WHERE error
+                 AND DATE(time) = CURRENT_DATE('America/New_York')
+                 AND INSTR(user, 'ficc.ai') = 0
+               GROUP BY user 
+               ORDER BY total_errors'''
+    user_errors_count_df = sqltodf(query)
+    
+    header_message = '\n--------------------Error count by users today--------------------\n'
+    #Check for the scenario in which there was usage but no errors
+    if len(query) == 0: return [MIMEText(header_message + 'No errors encountered by users today!\n\n')]
+    return [MIMEText(header_message)] + get_email_message_split_by_hostname(user_errors_count_df)
+
+
+@function_timer
+def get_user_errors_email_message():
+    '''Gets all CUSIPs that did not price that were attempted to be priced by users today.'''
+    query = '''SELECT user, time, cusip, calc_date, batch
+               FROM
+                 `eng-reactor-287421.api_calls_tracker.usage_data`
+               WHERE error
+                 AND DATE(time) = CURRENT_DATE('America/New_York')
+                 AND INSTR(user, 'ficc.ai') = 0'''
+    user_errors_df = sqltodf(query)
+    header_message = '\n--------------------Errors faced by users today--------------------\n'
+    if len(user_errors_df) == 0: return [MIMEText(header_message + 'No errors encountered by users today!\n\n')]
+    if len(user_errors_df) > MAX_NUMBER_OF_RESULTS:
+        header_message = header_message + f'Since the usage was more than {MAX_NUMBER_OF_RESULTS}, here is a random sample of {MAX_NUMBER_OF_RESULTS} entries\n'
+        user_errors_df = user_errors_df.sample(n=MAX_NUMBER_OF_RESULTS, random_state=SEED)    # `random_state` ensures reproducability
+    
+    user_errors_df = user_errors_df.rename(columns={'calc_date': 'error_message'})
+    user_errors_df['time'] = user_errors_df['time'].dt.strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC)
+    return [MIMEText(header_message)] + get_email_message_split_by_hostname(user_errors_df)
+
+
+@function_timer
+def get_top_differences_email_message():
+    '''For user priced trades, we want to see if there was a recent (within the last 7 days) trade with the 
+    same CUSIP that had a similar (within 20%) quantity and same trade direction. If this trade exists, then 
+    we look at the price difference between our predicted price and the actual price at which the trade occurs. 
+    We isolate the top 100 price differences.'''
+    query = '''SELECT user, time, cusip, direction, quantity * 1000 AS quantity, ficc_price, ficc_ytw, rtrs_control_number, trade_date, time_of_trade, par_traded, dollar_price, yield, coupon, price_diff
+               FROM (
+                   SELECT *, ROW_NUMBER() OVER(PARTITION BY cusip, direction, quantity ORDER BY trade_date, time_of_trade DESC) AS rnum
+                   FROM (
+                       SELECT logs.user, logs.time, logs.cusip, logs.direction, logs.quantity, logs.ficc_price, logs.ficc_ytw, msrb.par_traded, msrb.yield, msrb.dollar_price, msrb.rtrs_control_number, msrb.trade_date, msrb.time_of_trade,logs.ficc_price - msrb.dollar_price AS price_diff, logs.ficc_ycl, logs.calc_date, msrb.coupon
+                       FROM `eng-reactor-287421.api_calls_tracker.usage_data` AS logs LEFT JOIN `MSRB.msrb_trade_messages` AS msrb ON msrb.cusip = logs.cusip AND msrb.trade_type = logs.direction
+                       WHERE INSTR(logs.user, 'ficc.ai') = 0    -- exclude @ficc.ai users
+                           AND DATE(logs.time) = CURRENT_DATE('America/New_York')
+                           AND msrb.par_traded <= logs.quantity * 1000 * 1.2    -- upper bound for msrb.par_traded is 20 percent more than the quantity inputted by user
+                           AND msrb.par_traded >= logs.quantity * 1000 * 0.8    -- lower bound for msrb.par_traded is 20 percent less than the quantity inputted by user
+                           AND logs.error IS FALSE    -- no need to compare when there is an error since the yield and price value are NUMERICAL_ERROR
+                           AND DATE_DIFF(CURRENT_DATE('America/New_York'), trade_date, day) < 7) )    -- trade_date can be at most 7 days before today
+               WHERE rnum = 1    -- keep only the most recent trade of the day that matches CUSIP and direction
+               ORDER BY ABS(price_diff) DESC    -- sort by largest absolute differences since magnitude, not direction, is important here
+               LIMIT 100    -- only output the top 100 to not get distracted by smaller errors'''
+    top_differences_df = sqltodf(query)
+    header_message = '\n--------------------Top 100 price differences based on usage today--------------------\n'
+    if len(top_differences_df) == 0: return [MIMEText(header_message + 'No trades in the last week that are similar to usage today.\n\n\n')]
+    
+    top_differences_df['time'] = top_differences_df['time'].dt.strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC)
+    top_differences_df['par_traded'] = top_differences_df['par_traded'].astype(int)
+    top_differences_df['ficc_price'] = top_differences_df['ficc_price'].astype(float)    # removes trailing 0's
+    top_differences_df['ficc_ytw'] = top_differences_df['ficc_ytw'].astype(float)    # removes trailing 0's
+    # top_differences_df['coupon'] = top_differences_df['ficc_ytw'].astype('string').str.strip(''.join(['.' + '0'*i for i in range(1, 10)] + ['0'*i for i in range(1, 10)]))    # removes all trailing 0's from coupon values
+    top_differences_df['trade_datetime'] = top_differences_df['trade_date'].astype('string') + ' ' + top_differences_df['time_of_trade'].astype('string')
+    top_differences_df = top_differences_df.drop(columns=['trade_date', 'time_of_trade'])
+    top_differences_df = remove_trailing_zeros(top_differences_df, ['coupon'])
+    return [MIMEText(header_message)] + get_email_message_split_by_hostname(top_differences_df)
+
+
+def send_usage_summary_email(date_today, total: int = None):
+    '''Sends an email to `EMAIL_RECIPIENTS` with the summary of the usage for today.'''
+    uses_message_list = get_uses_email_message()
+    if uses_message_list is None:
+        send_email('No usage today')
+    else:
+        message_list = uses_message_list
+        message_list.extend(get_user_errors_count_by_user_email_message())
+        message_list.extend(get_user_errors_email_message())
+        message_list.extend(get_top_differences_email_message())
+        subject = f'Usage summary for {date_today}'
+        if total is not None: subject += f' (total: {total})'
+        send_email(subject, message_list)
+    print(f'Email sent to {EMAIL_RECIPIENTS}')

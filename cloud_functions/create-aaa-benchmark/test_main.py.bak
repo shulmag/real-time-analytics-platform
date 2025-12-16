@@ -1,0 +1,107 @@
+# Written by Developer
+# 2025-09-04
+# Last Edited by Developer
+# 2025-10-02
+
+import pandas as pd
+from google.cloud import bigquery
+from datetime import datetime
+from pytz import timezone
+import pytest
+import main
+
+
+# ---------- Fixtures ----------
+
+@pytest.fixture(scope="module")
+def set_testing():
+    """Force TESTING mode for the whole module so we don't write to BigQuery."""
+    print("[fixture] Enabling TESTING mode")
+    original = main.TESTING
+    main.TESTING = True
+    try:
+        yield
+    finally:
+        main.TESTING = original
+        print("[fixture] Restored TESTING mode to", original)
+
+
+@pytest.fixture(scope="module")
+def bq_client():
+    print("[fixture] Creating BigQuery client")
+    return bigquery.Client(project=main.PROJECT_ID, location="US")
+
+
+@pytest.fixture(scope="module")
+def five_year_table():
+    full_table = f"{main.PROJECT_ID}.{main.DATASET_NAME}.five_year"
+    print(f"[fixture] Using table: {full_table}")
+    return full_table
+
+
+# ---------- Tests ----------
+
+def test_run_and_upload_smoke(set_testing):
+    """Just ensure the end-to-end runner executes in TESTING mode (no writes)."""
+    print("[test_run_and_upload_smoke] Starting")
+    main.run_and_upload("five_year", 4, 5, "S")
+    # No exception == pass. Keep prints visible with `pytest -s`.
+    print("[test_run_and_upload_smoke] Finished OK")
+
+
+def test_upload_dataframe_schema_matches_table(set_testing, bq_client, five_year_table):
+    """The dataframe we prepare matches the BigQuery table schema (name set equality)."""
+    print("[test_upload_dataframe_schema_matches_table] Fetching YTW")
+    ytw = main.avg_index_ytw(4, 5,"S")
+    assert ytw is not None, "avg_index_ytw returned None"
+    print(f"[test_upload_dataframe_schema_matches_table] Computed mean YTW: {ytw:.6f}")
+
+    eastern_now = datetime.now(timezone("US/Eastern")).replace(second=0, microsecond=0)
+    ts_naive = eastern_now.replace(tzinfo=None)
+    df_to_upload = pd.DataFrame({"datetime": [ts_naive], "mean_ytw": [ytw]})
+    print(f"[test_upload_dataframe_schema_matches_table] DataFrame to upload:\n{df_to_upload}")
+
+    table_ref = bq_client.get_table(five_year_table)
+    schema_cols = [field.name for field in table_ref.schema]
+    print(f"[test_upload_dataframe_schema_matches_table] Table schema: {schema_cols}")
+
+    # BigQuery doesn't care about column order if you pass an explicit schema on load.
+    assert set(df_to_upload.columns) == set(schema_cols), (
+        f"Schema mismatch: table has {schema_cols}, upload has {list(df_to_upload.columns)}"
+    )
+    print("[test_upload_dataframe_schema_matches_table] Schema matches (set equality).")
+
+
+def test_ytw_within_dynamic_historical_bounds(set_testing, bq_client, five_year_table):
+    """The computed YTW is within dynamic bounds derived from historical table stats."""
+    print("[test_ytw_within_dynamic_historical_bounds] Computing YTW...")
+    ytw = main.avg_index_ytw(4, 5, "S")
+    assert ytw is not None, "avg_index_ytw returned None"
+
+    stats_query = f"""
+        SELECT
+          AVG(mean_ytw)  AS historical_avg,
+          STDDEV(mean_ytw) AS historical_std,
+          MIN(mean_ytw)  AS historical_min,
+          MAX(mean_ytw)  AS historical_max
+        FROM `{five_year_table}`
+    """
+    print("[test_ytw_within_dynamic_historical_bounds] Querying historical stats...")
+    stats = bq_client.query(stats_query).result().to_dataframe().iloc[0]
+
+    if pd.isna(stats["historical_avg"]):
+        # If table empty, use a very broad sanity range.
+        assert 0 < ytw < 10
+        print(f"[test_ytw_within_dynamic_historical_bounds] No history; used 0<ytw<10. ytw={ytw:.6f}")
+    else:
+        lower = stats["historical_min"] - 2 * stats["historical_std"]
+        upper = stats["historical_max"] + 2 * stats["historical_std"]
+        assert lower <= ytw <= upper, (
+            f"YTW {ytw:.6f} out of expected range {lower:.3f}–{upper:.3f} "
+            f"(mean={stats['historical_avg']:.3f}, std={stats['historical_std']:.3f})"
+        )
+        print(
+            f"[test_ytw_within_dynamic_historical_bounds] "
+            f"YTW {ytw:.6f} within {lower:.3f}–{upper:.3f} "
+            f"(mean={stats['historical_avg']:.3f}, std={stats['historical_std']:.3f})"
+        )

@@ -1,0 +1,8 @@
+dispatch:
+  # Send all traffic to website?
+  - url: /
+    service: default
+
+  # Send data work to the backend.
+  - url: "data_loader/*"
+    service: data_loader

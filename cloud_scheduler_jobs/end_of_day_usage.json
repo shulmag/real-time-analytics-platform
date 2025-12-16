@@ -1,0 +1,32 @@
+{
+    "attemptDeadline": "600s",
+    "description": "This sends the usage of the product for the day as a table, running the `end_of_day_usage_summary` cloud function. Since the timezone is set to America/New_York, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "body": "e30=",
+        "headers": {
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-central1-eng-reactor-287421.cloudfunctions.net/end_of_day_usage_summary",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-central1-eng-reactor-287421.cloudfunctions.net/end_of_day_usage_summary"
+    },
+    "lastAttemptTime": "2025-01-17T03:00:00.828096Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/end_of_day_usage",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "600s",
+        "minBackoffDuration": "5s",
+        "retryCount": 1
+    },
+    "schedule": "0 22 * * *",
+    "scheduleTime": "2025-01-18T03:00:00.851395Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/New_York",
+    "userUpdateTime": "2024-11-05T01:15:19Z"
+}

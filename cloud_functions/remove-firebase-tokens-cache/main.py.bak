@@ -1,0 +1,26 @@
+'''
+Author: Developer Ray
+Date: 2024-05-28
+Last Editor: Developer Ray
+Last Edit Date: 2024-05-28
+Description: Remove the Firebase tokens cache file so that it does not become stale, i.e., make sure that the cache file does not contain cached tokens for users that have not used the product in a long time.
+'''
+from google.cloud import storage
+
+
+STORAGE_CLIENT = storage.Client()    # this needs to be done after the credentials are created
+
+# these need to match the variables of the same name in `ficc/app_engine/demo/server/resources.py`
+FIREBASE_AUTH_TOKENS_FILENAME = 'firebase_auth_tokens.pkl'
+FIREBASE_AUTH_TOKENS_GCP_BUCKET = 'firebase_auth_tokens'
+
+
+def main(args):
+    bucket = STORAGE_CLIENT.get_bucket(FIREBASE_AUTH_TOKENS_GCP_BUCKET)    # get the bucket
+    blob = bucket.blob(FIREBASE_AUTH_TOKENS_FILENAME)    # get the blob
+    if not blob.exists():    # `file_name` in `bucket_name` does not exist
+        print(f'File {FIREBASE_AUTH_TOKENS_FILENAME} does not exist in {FIREBASE_AUTH_TOKENS_GCP_BUCKET}')
+    else:
+        blob.delete()    # delete the blob
+        print(f'Successfully removed the Firebase authentication tokens cache: removed {FIREBASE_AUTH_TOKENS_FILENAME} from Google cloud bucket {FIREBASE_AUTH_TOKENS_GCP_BUCKET}')
+    return 'SUCCESS'

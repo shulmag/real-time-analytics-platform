@@ -1,0 +1,189 @@
+'''
+Author: Developer Ray
+Date: 2024-04-05
+Last Editor: Developer Ray
+Last Edit Date: 2025-04-17
+Description: Functions that support displaying similar trades on UI after predicted prices are shown.
+'''
+import pandas as pd
+
+from modules.ficc.utils.auxiliary_variables import NUM_OF_DAYS_IN_YEAR
+from modules.ficc.utils.auxiliary_functions import sqltodf
+from modules.ficc.utils.diff_in_days import diff_in_days_two_dates    # , diff_in_days
+from modules.ficc.utils.nelson_siegel_model import yield_curve_level
+
+from modules.auxiliary_variables import bq_client, datetime_display_format, YEAR_MONTH_DAY, MONTH_DAY_YEAR, HOUR_MIN, PROJECT_ID, AUXILIARY_VIEWS_DATASET
+from modules.logging_functions import log_usage
+
+
+def get_query_similar_bonds(cusip, 
+                            predicted_yield, 
+                            predicted_price, 
+                            database_type, 
+                            issuer_choice, 
+                            features_of_interest, 
+                            # coupon, 
+                            min_coupon, 
+                            max_coupon, 
+                            state_code, 
+                            security_description, 
+                            purpose_class, 
+                            # purpose_sub_class, 
+                            rating, 
+                            min_maturity_date, 
+                            max_maturity_date, 
+                            # min_calculation_year, 
+                            # max_calculation_year, 
+                            amount):
+    '''Return a query with the most recent trades that have the arguments coupon, 
+    incorporated_state_code, security_description, purpose_class, and purpose_sub_class 
+    matching the arguments. Return a dataframe with the columns from `features_of_interest` 
+    in addition to the cusip of each similar trade. Make sure to return each cusip only once.'''
+    SIMILAR_YIELD_THRESHOLD = 0.25    # sets the threshold to keep similar trades
+
+    features_of_interest = ['cusip'] + features_of_interest
+
+    # talk to a team member to get more details on the specifics of these queries
+    previous_dayDB = f'`{PROJECT_ID}.auxiliary_views_v2.trade_history_same_issue_5_yr_mat_bucket_1_materialized` AS MSRB'
+    realtimeDB = f'`{AUXILIARY_VIEWS_DATASET}.msrb_trans` AS MSRB LEFT JOIN `{PROJECT_ID}.reference_data_v2.reference_data_flat` AS reference_data ON MSRB.cusip = reference_data.cusip'
+    databases = {'previous_day': previous_dayDB, 'realtime': realtimeDB}
+    if database_type not in databases: raise ValueError(f'database_type value of {database_type} is not recognized')
+
+    inner_join_features_of_interest = []
+    for feature in features_of_interest:
+        prefix = 'MSRB'
+        if database_type == 'realtime' and feature in ('sp_long', 'maturity_date', 'incorporated_state_code'):
+            prefix = 'reference_data'
+        inner_join_features_of_interest.append(prefix + '.' + feature)
+    inner_join_features_of_interest = ', '.join(inner_join_features_of_interest)    # the inner join database should specify that the features are coming from either the MSRB aliased database or the reference_data aliased database; `inner_join_features_of_interest` has now changed type from list to string
+    features_of_interest = ', '.join(features_of_interest)    # `features_of_interest` has now changed type from list to string
+
+    # TODO: think about whether we should include the condition of: `AND msrb.is_non_transaction_based_compensation IS FALSE`
+    conditions = [# f'MSRB.cusip != "{cusip}"',    # not necessary to hide the originally priced CUSIP, which also allows us to have a correct query if similar bonds is searched without pricing a CUSIP first
+                  'MSRB.MSRB_valid_to_date > CURRENT_DATETIME("America/New_York")', 
+                  'MSRB.cusip IS NOT NULL', 
+                  'MSRB.yield IS NOT NULL', 
+                  f'MSRB.coupon >= {min_coupon}', 
+                  f'MSRB.coupon <= {max_coupon}', 
+                  f'MSRB.maturity_date >= DATE("{min_maturity_date}")',    # cast argument to DATE insetad of calling FORMAT_DATE on the BigQuery table column because the per row operation is much slower than a single operation of casting the argument
+                  f'MSRB.maturity_date <= DATE("{max_maturity_date}")',    # cast argument to DATE insetad of calling FORMAT_DATE on the BigQuery table column because the per row operation is much slower than a single operation of casting the argument
+                #   f'CAST(FORMAT_DATE("%Y", MSRB.calc_date) AS INT64) >= {min_calculation_year}', 
+                #   f'CAST(FORMAT_DATE("%Y", MSRB.calc_date) AS INT64) <= {max_calculation_year}', 
+                  ]
+    if predicted_yield is not None: conditions.append(f'ABS(MSRB.yield - {predicted_yield}) <= {SIMILAR_YIELD_THRESHOLD}')    # filters trades that are not within `SIMILAR_YIELD_THRESHOLD` from `predicted_yield`
+    if issuer_choice == 'same_issuer': conditions.append(f'LEFT(MSRB.cusip, 6) = "{cusip[:6]}"')    # first 6 characters of the CUSIP matching implies that the issuer is the same
+    if database_type == 'realtime': conditions.append('reference_data.ref_valid_to_date > current_timestamp')
+
+    database_prefix = 'reference_data' if database_type == 'realtime' else 'MSRB'    # determine which database to get the reference feature from
+
+    if amount != 'undefined' and amount != '': conditions.append(f'MSRB.par_traded >= {amount}000')
+    # if coupon != 'undefined' and coupon != '': conditions.append(f'MSRB.coupon = {coupon}')
+    if state_code != 'undefined' and state_code != '': conditions.append(f'{database_prefix}.incorporated_state_code = "{state_code}"')
+    if security_description != 'undefined' and security_description != '': conditions.append(f'SEARCH(MSRB.security_description,"{security_description}")')
+    if purpose_class != 'undefined' and purpose_class != 0 and purpose_class != '0': conditions.append(f'{database_prefix}.purpose_class = {purpose_class}')
+    # if purpose_sub_class != 'undefined' and purpose_sub_class != '': conditions.append(f'{database_prefix}.purpose_sub_class = {purpose_sub_class}')
+    if rating != 'undefined' and rating != '': conditions.append(f'{database_prefix}.sp_long = "{rating}"')
+    conditions = ' AND '.join(conditions) if conditions else ''    # separate each condition in `conditions` with an AND; `conditions` has now changed type from list to string
+    
+    limit = 100
+    # choosing DISTINCT for only one column: https://stackoverflow.com/questions/5021693/distinct-for-only-one-column
+    query = f'''
+        SELECT {features_of_interest}
+        FROM (
+            SELECT {inner_join_features_of_interest},
+                ROW_NUMBER() OVER (PARTITION BY MSRB.cusip ORDER BY trade_datetime DESC) AS row_num
+            FROM {databases[database_type]}
+            WHERE {conditions})
+        WHERE row_num <= 10
+        ORDER BY trade_datetime DESC
+        LIMIT {limit}'''
+    print(query)
+    return query
+
+
+def get_similar_bonds(user, 
+                      api_call, 
+                      user_triggered, 
+                      cusip, 
+                      predicted_yield=None, 
+                      predicted_price=None, 
+                      realtime='previous_day', 
+                      issuer_choice='any_issuer', 
+                      purpose_class=None, 
+                    #   purpose_sub_class=None, 
+                    #   coupon=None, 
+                      min_coupon=None, 
+                      max_coupon=None, 
+                      state=None, 
+                      description=None, 
+                      rating=None, 
+                      min_maturity_date=None, 
+                      max_maturity_date=None, 
+                    #   min_calculation_year=None, 
+                    #   max_calculation_year=None, 
+                      amount=None):
+    '''Get similar recent trades based on other parameters (e.g., coupon, 
+    purpose_class, state, etc.) matching what the user has specified.'''
+    from flask import jsonify, make_response    # lazy loading for lower latency
+    
+    MINIMUM_NUM_TRADES_FOR_RESTRICTED_QUERY = 5    # threshold for re-running similar bonds query if there is fewer than `MINIMUM_NUM_TRADES_FOR_RESTRICTED_QUERY` results from the restricted query
+
+    features_to_query = ['trade_datetime', 'incorporated_state_code', 'security_description', 'yield', 'dollar_price', 'calc_date', 'settlement_date', 'par_traded', 'trade_type', 'sp_long', 'coupon', 'maturity_date']    
+    reserved_characters = ['+', '-', '=', '&&', '||', '>', '<', '!', '(', ')', '{', '}', '[', ']', '^', '~', '*', '?', ':', '\\', '/']    # list of reserved characters: https://stackoverflow.com/questions/36467500/do-reserved-characters-need-to-be-escaped-in-an-elasticsearch-query
+    for char in reserved_characters:
+        description = description.replace(char, ' ')    # remove reserved characters so that sql query can still run
+    
+    try:    # wrap in try except to perform logging even when there is an error
+        get_query = lambda predicted_yield=None, predicted_price=None: get_query_similar_bonds(cusip, 
+                                                                                               predicted_yield, 
+                                                                                               predicted_price, 
+                                                                                               realtime, 
+                                                                                               issuer_choice, 
+                                                                                               features_to_query, 
+                                                                                               # coupon, 
+                                                                                               min_coupon, 
+                                                                                               max_coupon, 
+                                                                                               state, 
+                                                                                               description, 
+                                                                                               purpose_class, 
+                                                                                               # purpose_sub_class, 
+                                                                                               rating, 
+                                                                                               min_maturity_date, 
+                                                                                               max_maturity_date, 
+                                                                                               # min_calculation_year, 
+                                                                                               # max_calculation_year, 
+                                                                                               amount)
+        df = sqltodf(get_query(predicted_yield, predicted_price), bq_client)
+        if len(df) < MINIMUM_NUM_TRADES_FOR_RESTRICTED_QUERY and (predicted_yield is not None or predicted_price is not None): df = sqltodf(get_query(), bq_client)
+
+        if len(df) > 0:
+            # rename the sp_long column to rating to make it simpler to process in the front end
+            df['rating'] = df['sp_long'].fillna('No rating')    # fill in empty values with 'No rating' to indicate that S&P has not rated this bond
+            df = df.drop(columns='sp_long')
+
+            df['maturity'] = df.apply(lambda row: diff_in_days_two_dates(row['calc_date'], row['settlement_date']), axis=1) / NUM_OF_DAYS_IN_YEAR
+
+            trade_datetime = pd.to_datetime(df['trade_datetime'], format=MONTH_DAY_YEAR + ' ' + HOUR_MIN)
+            df['trade_date'] = trade_datetime.dt.strftime(YEAR_MONTH_DAY + ':' + HOUR_MIN)
+
+            df['yield_curve_level'] = df.apply(lambda row: yield_curve_level(row['maturity'], row['trade_date']), axis=1) / 100
+            df['spread'] = (df['yield'] - df['yield_curve_level']) * 100
+            df = df.drop(columns='trade_date')
+
+            if user_triggered == 'true':
+                log_usage(user=user, api_call=api_call, cusip=cusip, show_similar_bonds=True)    # FIXME: only log when the user initiated the search, not on default cusip pricing. Need a parameter for this
+            df['trade_datetime'] = df['trade_datetime'].dt.strftime(datetime_display_format)
+            df['maturity_date'] = pd.to_datetime(df['maturity_date']).dt.strftime(MONTH_DAY_YEAR)    # first convert the date object to a datetime object and then do a string format
+            df['calc_date'] = df['calc_date'].astype('string')
+            df['coupon'] = df['coupon'].astype(float)    # fixes rounding issue when running the similar bonds search with real-time flag
+
+        df_as_dict = df.to_dict(orient='records')
+        response = make_response(jsonify(df_as_dict))
+        return response
+    except Exception as e:
+        log_usage(user=user, 
+                  api_call=api_call, 
+                  cusip=cusip, 
+                  show_similar_bonds=True, 
+                  error=True)
+        raise e

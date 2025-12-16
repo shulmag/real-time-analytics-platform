@@ -1,0 +1,170 @@
+'''
+Description: Send an email summary with the largest Google Cloud Platform (GCP) expenses for the last day and the last month.
+'''
+import functions_framework
+from datetime import timedelta, datetime
+import pytz
+import pandas as pd
+
+import smtplib
+from email.mime.text import MIMEText
+
+from google.cloud import bigquery, secretmanager
+
+
+EASTERN = pytz.timezone('US/Eastern')
+YEAR_MONTH_DAY = '%Y-%m-%d'
+FULL_DATE_FORMAT = '%A, %B %d, %Y' 
+
+DATETIME_NOW = datetime.now(EASTERN)    # current date and time in Eastern Time
+
+# subtract one day
+YESTERDAY_DATETIME = DATETIME_NOW - timedelta(days=1)
+YESTERDAY_STRING = YESTERDAY_DATETIME.date().strftime(YEAR_MONTH_DAY)
+YESTERDAY_FULL_DATE_FORMAT = YESTERDAY_DATETIME.date().strftime(FULL_DATE_FORMAT)
+
+THIRTY_ONE_DAYS_AG0_STRING = (DATETIME_NOW - timedelta(days=31)).date().strftime(YEAR_MONTH_DAY)
+
+COST_THRESHOLD_24H = 1   # only include costs >= $1 in 24 hours
+COST_THRESHOLD_30D = 5   # only include costs >= $15 in 30 days
+
+
+def query_billing_data(condition: str, min_cost: float):
+    '''Queries GCP billing data from BigQuery for a given time range and processes it using pandas. `min_cost` 
+    is used as a threshold for filtering results.'''
+    client = bigquery.Client()
+
+    query = f'''
+    SELECT
+      cost,
+      CASE
+        WHEN labels[SAFE_OFFSET(0)].value is null THEN CONCAT(service.description, ' ', sku.description)
+        ELSE labels[SAFE_OFFSET(0)].value 
+      END label_value,   -- Because the labels are usually created by us, labels are generally the most meaningful, but in some cases, such as when the label is cloud run revision,
+      -- but the sku is Log Storage, it is more useful to know the SKU. This query should be updated if any of the names in the top expenditures list appear meaningless. 
+      -- It will take some work and possibly the addition of labels to make this field meaningful to us.
+      sku.description,
+      project.name AS name,      
+      usage_start_time
+    FROM
+      `eng-reactor-287421.GCP_Billing.gcp_billing_export_resource_v1_01BD9F_88751F_B68A52`
+    WHERE
+     {condition}
+    '''
+    query_job = client.query(query)
+    results = query_job.result().to_dataframe()
+
+    grouped_results = results.groupby(['label_value'], as_index=False)['cost'].sum()    # group by `label_value` and sum the costs using pandas
+    filtered_results = grouped_results[grouped_results['cost'] >= min_cost]    # filter out low-cost results based on the minimum cost threshold
+    total_cost = filtered_results['cost'].sum()    # calculate the total cost for percentage calculations
+    filtered_results['percentage'] = (filtered_results['cost'] / total_cost) * 100    # calculate percentage contribution of each label
+    sorted_results = filtered_results.sort_values(by='cost', ascending=False)    # sort by total cost
+    return sorted_results, total_cost
+
+
+def find_anomalies_z_score(billing_data_24h, billing_data_30d):
+    '''Finds anomalies using Z-score method. Looks for resources where the Z-score is greater than 2
+    in terms of cost deviation between 24 hours and 30 days.'''
+    merged_data = pd.merge(billing_data_24h, billing_data_30d, on='label_value', how='inner', suffixes=('_24h', '_30d'))    # merge the 24-hour and 30-day data on the 'label_value'
+
+    # calculate Z-score for the 24-hour costs relative to the 30-day costs
+    mean_cost_30d = merged_data['cost_30d'].mean()
+    std_dev_cost_30d = merged_data['cost_30d'].std()
+
+    merged_data['z_score'] = (merged_data['cost_24h'] - mean_cost_30d) / (std_dev_cost_30d + 1e-9)    # avoid division by zero in case of very low variance
+    anomalies = merged_data[(merged_data['z_score'].abs() > 2) & (merged_data['cost_24h'] > 1)]    # filter for significant anomalies (Z-score > 2)
+    return anomalies
+
+
+def access_secret_version(secret_id: str, project_id: str = 'eng-reactor-287421', version_id='latest'):
+    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'
+    response = secretmanager.SecretManagerServiceClient().access_secret_version(request={'name': name})
+    payload = response.payload.data.decode('UTF-8')
+    return payload
+
+
+def send_email(subject, message_body):
+    '''Sends an email using Gmail SMTP with the provided subject and message body.'''
+    receiver_emails = ['eng@ficc.ai', 'gil@ficc.ai', 'eng@ficc.ai', 'myles@ficc.ai']
+    sender_email = access_secret_version('notifications_username')
+    smtp_password = access_secret_version('notifications_password')
+    smtp_server = 'smtp.gmail.com'
+    port = 587    # for TLS encryption
+    
+    msg = MIMEText(message_body, 'html') 
+    msg['Subject'] = subject
+    msg['From'] = sender_email
+    msg['To'] = ', '.join(receiver_emails)
+
+    with smtplib.SMTP(smtp_server, port) as server:
+        try:
+            server.starttls()
+            server.login(sender_email, smtp_password)
+            server.sendmail(sender_email, receiver_emails, msg.as_string())
+        except Exception as e:
+            print(f'Error sending email: {e}')
+        finally:
+            server.quit()
+
+
+@functions_framework.http    # using HTTP trigger instead of CloudEvent
+def main(request):
+    '''Main function to query billing data for the last 24 hours and 30 days, find anomalies using Z-score, 
+    and send an email with the report.'''
+    # query data for both time ranges
+    condition_24_hour = f'''date(usage_start_time) = '{YESTERDAY_STRING}' '''
+    condition_30_days = f'''date(usage_start_time) > '{THIRTY_ONE_DAYS_AG0_STRING}' '''
+    billing_data_24h, total_cost_24h = query_billing_data(condition_24_hour, COST_THRESHOLD_24H)
+    billing_data_30d, total_cost_30d = query_billing_data(condition_30_days, COST_THRESHOLD_30D)
+    anomalies = find_anomalies_z_score(billing_data_24h, billing_data_30d)    # find anomalies using Z-score method
+    
+    full_report = '''
+    <html>
+    <head>
+        <style>
+            /* Set all text and headers explicitly to black */
+            body, h1, h2, h3, h4, h5, h6, p, ul, li, strong, table, th, td {
+                color: black !important;
+                font-family: Arial, sans-serif;
+            }
+            h2 { font-weight: bold; }
+            p, ul { margin-top: 0.5em; }
+            .total-cost { font-size: 20px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+    '''
+    
+    # anomaly report
+    full_report += '<h2>Anomalies in Spending (Z-Score Based):</h2>'
+    if anomalies.empty:
+        full_report += '<p>No significant anomalies found.</p>'
+    else:
+        full_report += "<table border='1' cellspacing='0' cellpadding='5'><tr><th>Resource</th><th>24-hour Cost</th><th>30-day Cost</th><th>Z-Score</th></tr>"
+        for _, row in anomalies.iterrows():
+            full_report += (
+                f"<tr><td>{row['label_value']}</td>"
+                f"<td><strong>${row['cost_24h']:.2f}</strong> ({row['percentage_24h']:.2f}%)</td>"
+                f"<td><strong>${row['cost_30d']:.2f}</strong> ({row['percentage_30d']:.2f}%)</td>"
+                f"<td>{row['z_score']:.2f}</td></tr>"
+            )
+        full_report += '</table><br>'
+
+    # 24-hour billing data with total cost in heading
+    full_report += f"<h2>Total GCP Expenditure for {YESTERDAY_FULL_DATE_FORMAT}: <span style='font-size:24px; font-weight:bold; color:#007bff;'>${total_cost_24h:.2f}</span>.<br><br>Top Project Expenditures (>= ${COST_THRESHOLD_24H}):</h2>"    
+    full_report += '<ul>'
+    for _, row in billing_data_24h.iterrows():
+        full_report += f"<li>{row.get('label_value', 'Unknown')}, Total Cost: <strong>${row.get('cost', 0):.2f}</strong></li>"
+    full_report += '</ul><br>'
+
+    # 30-day billing data with total cost in heading
+    full_report += f"<h2>Total GCP Expenditure for Past 30 Days: <span style='font-size:24px; font-weight:bold; color:#007bff;'>${total_cost_30d:.2f}</span>.<br><br>Top Project Expenditures (>= ${COST_THRESHOLD_30D}):</h2>"    
+    full_report += '<ul>'
+    for _, row in billing_data_30d.iterrows():
+        full_report += f"<li>{row.get('label_value', 'Unknown')}, Total Cost: <strong>${row.get('cost', 0):.2f}</strong></li>"
+    full_report += '</ul><br>'
+
+    full_report += '</body></html>'
+    subject = f'GCP Billing Report with Anomalies for {YESTERDAY_FULL_DATE_FORMAT}'
+    send_email(subject, full_report)
+    return 'SUCCESS', 200

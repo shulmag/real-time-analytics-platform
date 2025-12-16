@@ -1,0 +1,1226 @@
+### As currently configurfed this cloud function performs two functions. 1) It finds new trades in bigquery from the table msrb_trade_messages
+### and computes a calculation date and price for those trades by performing a yield to price conversion.  The calc_date is an important
+### data point that we need for our predictions and which is not present in the msrb trade data.  The calc_date is then uploaded to a bigquery
+### table "calculation_date_and_price"
+### The second important function is to update redis for the demo. To do so, this function once more queries bigquery on a view that is built 
+### on top of a number of tables, including calculation_date_and_price, reference_data_v1.reference_data_flat, and msrb_trade_messages. The main purpose of this view is to 
+### reference data (from ice-flat) to the history of trades (from msrb_trade_messages). 
+### As we work to improve this cloud function, the ultimate hope is that we can eliminate all bigquery calls by 1) combining this cloud function 
+### with the cloud function update_msrb_trade_messages 
+
+import numpy as np
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+from google.cloud import bigquery
+
+bqclient = bigquery.Client()
+
+NUM_OF_DAYS_IN_YEAR = 360
+
+COUPON_FREQUENCY_DICT = {0:"Unknown",
+                        1:"Semiannually",
+                        2:"Monthly",
+                        3:"Annually",
+                        4:"Weekly",
+                        5:"Quarterly",
+                        6:"Every 2 years",
+                        7:"Every 3 years",
+                        8:"Every 4 years",
+                        9:"Every 5 years",
+                        10:"Every 7 years",
+                        11:"Every 8 years",
+                        12:"Biweekly",
+                        13:"Changeable",
+                        14:"Daily",
+                        15:"Term mode",
+                        16:"Interest at maturity",
+                        17:"Bimonthly",
+                        18:"Every 13 weeks",
+                        19:"Irregular",
+                        20:"Every 28 days",
+                        21:"Every 35 days",
+                        22:"Every 26 weeks",
+                        23:"Not Applicable",
+                        24:"Tied to prime",
+                        25:"One time",
+                        26:"Every 10 years",
+                        27:"Frequency to be determined",
+                        28:"Mandatory put",
+                        29:"Every 52 weeks",
+                        30:"When interest adjusts-commercial paper",
+                        31:"Zero coupon",
+                        32:"Certain years only",
+                        33:"Under certain circumstances",
+                        34:"Every 15 years",
+                        35:"Custom",
+                        36:"Single Interest Payment"}
+
+LARGE_NUMBER = 1e6
+
+COUPON_FREQUENCY_TYPE = {"Unknown":LARGE_NUMBER,
+                         "Semiannually":2,
+                         "Monthly":12,
+                         "Annually":1,
+                         "Weekly":52,
+                         "Quarterly":4,
+                         "Every 2 years":0.5,
+                         "Every 3 years":1/3,
+                         "Every 4 years":0.25,
+                         "Every 5 years":0.2,
+                         "Every 7 years":1/7,
+                         "Every 8 years":1/8,
+                         "Biweekly": 26,
+                         "Changeable":44,
+                         "Daily":360,
+                         "Interest at maturity":0,
+                         "Not Applicable":LARGE_NUMBER}
+
+NUM_OF_DAYS_IN_YEAR = 360
+
+'''
+This function compares two date objects whether they are in Timestamp or datetime.date. 
+The different types are causing a future warning. If date1 occurs after date2, return 1. 
+If date1 equals date2, return 0. Otherwise, return -1.
+'''
+def compare_dates(date1, date2):
+    if type(date1) == pd.Timestamp:
+        date1 = date1.date()
+    if type(date2) == pd.Timestamp:
+        date2 = date2.date()
+    
+    if date1 > date2:
+        return 1
+    elif date1 == date2:
+        return 0
+    elif date1 < date2:
+        return -1
+
+'''
+ # @ Author: Developer Shayaan
+ # @ Create Time: 2021-12-20 10:00:17
+ # @ Modified by: Developer
+ # @ Modified time: 2022-01-20 09:33:30
+ # @ Description: This file implements a function to calculate the difference in 
+ # days between two days in accordance to the provision of MSRB rule 33G
+ '''
+
+import pandas as pd
+
+'''
+This function calculates the difference in days using the 360/30 
+convention specified in MSRB Rule Book G-33, rule (e). 
+Note that we only handle the 360/30 convention for date calculations.
+'''
+def diff_in_days_two_dates(end_date, start_date, convention="360/30"):
+    if convention != "360/30":
+        print("unknown convention", convention)
+        return None
+
+    Y2 = end_date.year
+    Y1 = start_date.year
+    M2 = end_date.month
+    M1 = start_date.month
+    D2 = end_date.day
+    D1 = start_date.day
+    D1 = min(D1, 30)
+    if D1 == 30: 
+        D2 = min(D2, 30)
+    return (Y2 - Y1) * 360 + (M2 - M1) * 30 + (D2 - D1)
+
+def diff_in_days(trade, convention="360/30", **kwargs):
+    #See MSRB Rule 33-G for details
+    if 'calc_type' in kwargs:
+        if kwargs['calc_type'] == 'accrual' and not pd.isnull(trade.accrual_date):
+            start_date = trade.accrual_date
+            end_date = trade.settlement_date
+        else:
+            raise ValueError('Invalid arguments')
+    else:
+        start_date = trade.dated_date
+        end_date = trade.settlement_date
+
+    return diff_in_days_two_dates(end_date, start_date, convention)
+
+'''
+ # @ Author: Developer Ray
+ # @ Create Time: 2022-01-13 18:02:00
+ # @ Description: This file implements functions for truncating final outputs.
+ '''
+
+'''
+This file truncations an input to a specified number of decimal
+places. See the doctests.
+'''
+def trunc(x, decimal_places):
+    """
+    >>> trunc(3.33333, 3)
+    3.333
+    >>> trunc(3.99499, 3)
+    3.994
+    >>> trunc(30.99499, 3)
+    30.994
+    """
+    ten_places = 10 ** decimal_places
+    return ((x * ten_places) // 1) / ten_places
+
+'''
+This function rounds the final price according to 
+MSRB Rule Book G-33, rule (d).
+'''
+def trunc_and_round_price(price):
+    return trunc(price, 3)
+
+'''
+This function rounds the final yield according to 
+MSRB Rule Book G-33, rule (d).
+'''
+def trunc_and_round_yield(yield_rate):
+    return round(trunc(yield_rate, 4), 3)
+
+'''
+ # @ Author: Developer 
+ # @ Create Time: 2021-12-15 13:59:54
+ # @ Modified by: Developer
+ # @ Modified time: 2022-02-10 10:49:09
+ # @ Description: This file contains function to help the functions 
+ # to process training data
+ '''
+import pandas as pd
+
+def sqltodf(sql, bq_client):
+    bqr = bq_client.query(sql).result()
+    return bqr.to_dataframe()
+
+
+def drop_extra_columns(df):
+    df.drop(columns=[
+                 'sp_stand_alone',
+                 'sp_icr_school',
+                 'sp_icr_school',
+                 'sp_icr_school',
+                 'sp_watch_long',
+                 'sp_outlook_long',
+                 'sp_prelim_long',
+                 'MSRB_maturity_date',
+                 'MSRB_INST_ORDR_DESC',
+                 'MSRB_valid_from_date',
+                 'MSRB_valid_to_date',
+                 'upload_date',
+                 'sequence_number',
+                 'ref_valid_from_date',
+                 'ref_valid_to_date',
+                 'additional_next_sink_date',
+                 'last_period_accrues_from_date',
+                 'primary_market_settlement_date',
+                 'assumed_settlement_date',
+                 'sale_date','q','d'],
+                  inplace=True)
+    
+    
+    return df
+
+
+def convert_dates(df):
+    date_cols = [col for col in list(df.columns) if 'DATE' in col.upper()]
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col])
+    
+    return df
+
+'''
+This function  
+'''
+def process_ratings(df):
+    df = df[df.sp_long.isin(['BBB+','A-','A','A+','AA-','AA','AA+','AAA','NR'])] 
+    df['rating'] = df['sp_long']
+    return df
+    
+'''
+This function extracts the features of the latest trade from 
+the trade history array
+'''
+def get_latest_trade_feature(x, feature):
+    recent_trade = x[0]
+    if feature == 'yield_spread':
+        return recent_trade[0]
+    elif feature == 'seconds_ago':
+        return recent_trade[-1]
+    elif feature == 'par_traded':
+        return recent_trade[1]
+
+'''
+This function compares two date objects whether they are in Timestamp or datetime.date. 
+The different types are causing a future warning. If date1 occurs after date2, return 1. 
+If date1 equals date2, return 0. Otherwise, return -1.
+'''
+def compare_dates(date1, date2):
+    if type(date1) == pd.Timestamp:
+        date1 = date1.date()
+    if type(date2) == pd.Timestamp:
+        date2 = date2.date()
+    
+    if date1 > date2:
+        return 1
+    elif date1 == date2:
+        return 0
+    elif date1 < date2:
+        return -1
+
+'''
+This function directly calls `compare_dates` to check if two dates are equal.
+'''
+def dates_are_equal(date1, date2):
+    return compare_dates(date1, date2) == 0
+
+'''
+This function converts the columns with object datatypes to category data types
+'''
+def convert_object_to_category(df):
+    print("Converting object data type to categorical data type")
+    for col_name in df.columns:
+        if col_name.endswith("event") or col_name.endswith("redemption") or col_name.endswith("history") or col_name.endswith("date"):
+            continue
+
+        if df[col_name].dtype == "object" and col_name not in ['organization_primary_name','security_description','recent','issue_text','series_name']:
+            df[col_name] = df[col_name].astype("category")
+    return df
+
+'''
+ # @ Author: Developer Ray
+ # @ Create Time: 2022-01-13 17:58:00
+ # @ Modified by: Developer
+ # @ Modified time: 2022-01-24 12:19:00
+ # @ Description: This file implements functions for bonds that have been called.
+ '''
+
+import pandas as pd
+
+'''
+This function provides the end date for a called bond. 
+'''
+def end_date_for_called_bond(trade):
+    if not pd.isnull(trade.refund_date):
+        return trade.refund_date
+    else:
+        raise ValueError(f"Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) is called, but no refund date.")
+
+'''
+This function provides the par value for a called bond.
+'''
+def refund_price_for_called_bond(trade):
+    if not pd.isnull(trade.refund_price):
+        return trade.refund_price
+    else:
+        raise ValueError(f"Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) is called, but no refund price.")
+
+'''
+ # @ Author: Developer Ray
+ # @ Create Time: 2022-01-13 23:04:00
+ # @ Modified by: Developer
+ # @ Modified time: 2022-02-25 14:04:00
+ # @ Description: This file implements functions to compute the price of a trade
+ # given the yield.
+ '''
+'''
+ # @ Author: Developer 
+ # @ Create Time: 2021-12-15 13:59:54
+ # @ Modified by: Developer
+ # @ Modified time: 2022-02-10 10:49:09
+ # @ Description: This file contains function to help the functions 
+ # to process training data
+ '''
+import pandas as pd
+
+def sqltodf(sql, bq_client):
+    bqr = bq_client.query(sql).result()
+    return bqr.to_dataframe()
+
+
+def drop_extra_columns(df):
+    df.drop(columns=[
+                 'sp_stand_alone',
+                 'sp_icr_school',
+                 'sp_icr_school',
+                 'sp_icr_school',
+                 'sp_watch_long',
+                 'sp_outlook_long',
+                 'sp_prelim_long',
+                 'MSRB_maturity_date',
+                 'MSRB_INST_ORDR_DESC',
+                 'MSRB_valid_from_date',
+                 'MSRB_valid_to_date',
+                 'upload_date',
+                 'sequence_number',
+                 'ref_valid_from_date',
+                 'ref_valid_to_date',
+                 'additional_next_sink_date',
+                 'last_period_accrues_from_date',
+                 'primary_market_settlement_date',
+                 'assumed_settlement_date',
+                 'sale_date','q','d'],
+                  inplace=True)
+    
+    
+    return df
+
+
+def convert_dates(df):
+    date_cols = [col for col in list(df.columns) if 'DATE' in col.upper()]
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col])
+    
+    return df
+
+'''
+This function  
+'''
+def process_ratings(df):
+    df = df[df.sp_long.isin(['BBB+','A-','A','A+','AA-','AA','AA+','AAA','NR'])] 
+    df['rating'] = df['sp_long']
+    return df
+    
+'''
+This function extracts the features of the latest trade from 
+the trade history array
+'''
+def get_latest_trade_feature(x, feature):
+    recent_trade = x[0]
+    if feature == 'yield_spread':
+        return recent_trade[0]
+    elif feature == 'seconds_ago':
+        return recent_trade[-1]
+    elif feature == 'par_traded':
+        return recent_trade[1]
+
+'''
+This function compares two date objects whether they are in Timestamp or datetime.date. 
+The different types are causing a future warning. If date1 occurs after date2, return 1. 
+If date1 equals date2, return 0. Otherwise, return -1.
+'''
+def compare_dates(date1, date2):
+    if type(date1) == pd.Timestamp:
+        date1 = date1.date()
+    if type(date2) == pd.Timestamp:
+        date2 = date2.date()
+    
+    if date1 > date2:
+        return 1
+    elif date1 == date2:
+        return 0
+    elif date1 < date2:
+        return -1
+
+'''
+This function directly calls `compare_dates` to check if two dates are equal.
+'''
+def dates_are_equal(date1, date2):
+    return compare_dates(date1, date2) == 0
+
+'''
+This function converts the columns with object datatypes to category data types
+'''
+def convert_object_to_category(df):
+    print("Converting object data type to categorical data type")
+    for col_name in df.columns:
+        if col_name.endswith("event") or col_name.endswith("redemption") or col_name.endswith("history") or col_name.endswith("date"):
+            continue
+
+        if df[col_name].dtype == "object" and col_name not in ['organization_primary_name','security_description','recent','issue_text','series_name']:
+            df[col_name] = df[col_name].astype("category")
+    return df
+
+'''
+ # @ Author: Developer Ray
+ # @ Create Time: 2022-01-13 17:54:00
+ # @ Description: This file implements functions to handle interest payment
+ # frequency information of a bond.
+ '''
+
+from dateutil.relativedelta import relativedelta
+
+
+
+'''
+This function returns the frequency of coupon payments based on 
+the interest payment frequency identifier in the bond reference data.
+'''
+def get_frequency(identifier):
+    # check whether the frequency dict has already been applied to the identifier
+    if type(identifier) == str:
+        return COUPON_FREQUENCY_TYPE[identifier]
+    else:
+        return COUPON_FREQUENCY_TYPE[COUPON_FREQUENCY_DICT[identifier]]
+
+'''
+This function returns a time delta object based on the interest payment frequency. 
+The first step is to identify whether the interest payment frequency passed in 
+is in terms of the number of months in a year or the number of weeks in a year. 
+Then, based on this the time delta object is returned.
+'''
+def get_time_delta_from_interest_frequency(interest_payment_frequency):
+    error_string = lambda num: f"The interest payment frequency of {interest_payment_frequency} is invalid, since it must divide {num}"
+
+    NUM_OF_MONTHS_IN_YEAR = 12
+    NUM_OF_WEEKS_IN_YEAR = 52
+    NUM_OF_DAYS_IN_YEAR = 360
+
+    time_delta = 0
+    if interest_payment_frequency != 0:
+        if interest_payment_frequency <= 1:
+            delta = 1 / interest_payment_frequency
+            time_delta = relativedelta(years=delta)
+        elif interest_payment_frequency > 1 and interest_payment_frequency <= NUM_OF_MONTHS_IN_YEAR:
+            if NUM_OF_MONTHS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_MONTHS_IN_YEAR))
+            delta = NUM_OF_MONTHS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(months=delta)
+        elif interest_payment_frequency > NUM_OF_MONTHS_IN_YEAR and interest_payment_frequency <= NUM_OF_WEEKS_IN_YEAR:
+            if NUM_OF_WEEKS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_WEEKS_IN_YEAR))
+            delta = NUM_OF_WEEKS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(weeks=delta)
+        elif interest_payment_frequency > NUM_OF_WEEKS_IN_YEAR and interest_payment_frequency <= NUM_OF_DAYS_IN_YEAR:
+            if NUM_OF_DAYS_IN_YEAR % interest_payment_frequency != 0:
+                raise ValueError(error_string(NUM_OF_DAYS_IN_YEAR))
+            delta = NUM_OF_DAYS_IN_YEAR / interest_payment_frequency
+            time_delta = relativedelta(days=delta)
+    return time_delta
+
+'''
+ # @ Author: Developer Ray
+ # @ Create Time: 2022-01-13 17:44:00
+ # @ Description: This file implements functions to help with pricing bonds
+ # and computing yields.
+ '''
+
+import pandas as pd
+
+
+
+'''
+This function takes the dataframe from the bigquery and updates certain 
+fields to be the right type. Note that this function mutates the fields 
+passed in dataframe, so the function itself has no return value.
+'''
+def transform_reference_data(df):
+    df['interest_payment_frequency'] = df.apply(lambda trade: get_frequency(trade["interest_payment_frequency"]), axis=1)
+    df['coupon'] = df['coupon'].astype(float)
+    df['yield'] = df['yield'].astype(float)
+    df['deferred'] = (df.interest_payment_frequency == 0) | df.coupon == 0
+    
+    df['next_call_price'] = df['next_call_price'].astype(float)
+    return df
+
+'''
+This function computes the next time a coupon is paid.
+Note that this function could return a `next_coupon_date` that is after the end_date. 
+This does not create a problem since we deal with the final coupon separately in 
+`price_of_bond_with_multiple_periodic_interest_payments`.
+Note that it may be that this function is not necessary because the field 
+`next_coupon_date` is never null when there is a "next coupon date." In the 
+future, we should confirm whether this is the case.
+'''
+def get_next_coupon_date(first_coupon_date, start_date, time_delta):
+    date = first_coupon_date
+    while compare_dates(date, start_date) < 0:
+        date = date + time_delta
+    return date
+#     cannot use the below code since division is not valid between datetime.timedelta and relativedelta, and converting between types introduces potential for errors
+#     num_of_time_periods = int(np.ceil((start_date - first_coupon_date) / time_delta))    # `int` wraps the `ceil` function because the `ceil` function returns a float
+#     return first_coupon_date + time_delta * num_of_time_periods
+
+'''
+This function computes the previous time a coupon was paid for this bond 
+by relating it to the next coupon date.
+Note that it may be that this function is not necessary because the field 
+`previous_coupon_date` is never null when `next_coupon_date` exists. In the 
+future, we should confirm whether this is the case.
+'''
+def get_previous_coupon_date(first_coupon_date, start_date, accrual_date, time_delta, next_coupon_date=None):
+    if next_coupon_date == None:
+        next_coupon_date = get_next_coupon_date(first_coupon_date, start_date, time_delta)
+        
+    if dates_are_equal(next_coupon_date, first_coupon_date):
+        return accrual_date
+    return next_coupon_date - time_delta
+
+'''
+This function is valid for bonds that don't pay coupons, whereas the previous 
+two functions assume the bond pays coupons.
+Note: the field of `next_coupon_payment_date` corresponds to our variable of 
+`next_coupon_date` (removing the word `payment`) for more concise and readable 
+code, and similarly with `previous_coupon_date`
+'''
+def get_prev_coupon_date_and_next_coupon_date(trade, frequency, time_delta):
+    if frequency == 0:
+        next_coupon_date = trade.maturity_date
+        prev_coupon_date = trade.accrual_date
+    else:
+        if pd.isnull(trade.next_coupon_payment_date):
+            next_coupon_date = get_next_coupon_date(trade.first_coupon_date, trade.settlement_date, time_delta)
+        else:
+            next_coupon_date = pd.to_datetime(trade.next_coupon_payment_date)
+
+        if pd.isnull(trade.previous_coupon_payment_date):
+            prev_coupon_date = get_previous_coupon_date(trade.first_coupon_date, trade.settlement_date, trade.accrual_date, time_delta, next_coupon_date)
+        else:
+            prev_coupon_date = pd.to_datetime(trade.previous_coupon_payment_date)
+
+    return prev_coupon_date, next_coupon_date
+
+'''
+This function returns the number of interest payments and the final coupon 
+date based on the next coupon date, the end date, and the gap between coupon 
+payments. This function returns both together because one is always a 
+byproduct of computing the other.
+Note that the special case of an odd final coupon is handled below in 
+`price_of_bond_with_multiple_periodic_interest_payments`.
+'''
+def get_num_of_interest_payments_and_final_coupon_date(next_coupon_date, end_date, time_delta): 
+    if compare_dates(next_coupon_date, end_date) > 0:
+        return 0, next_coupon_date    # return 1, end_date (would be valid in isolation)
+    
+    num_of_interest_payments = 1
+    final_coupon_date = next_coupon_date
+    while compare_dates(final_coupon_date + time_delta, end_date) <= 0:
+        num_of_interest_payments += 1
+        final_coupon_date += time_delta
+    return num_of_interest_payments, final_coupon_date
+
+'''
+This function is called when the interest is only paid at maturity (which is represented 
+in the transformed dataframe as interest payment frequency equaling 0). There are two 
+cases when interest is paid at maturity. The first case is for short term bonds where 
+there is a single coupon payment at maturity, and this logic will reduce to the logic 
+in MSRB Rule Book G-33, rule (b)(i)(A). The second case is when when there is a compounding 
+accreted value (i.e., capital appreciation bonds) which accrues semianually. Then, to get 
+the price of this bond, we need to account for the accrued interest. This can be thought 
+of as a bond that pays a coupon semiannually through the duration of the bond, but all the 
+coupon payments are made as a single payment at the time the bond is called / maturity. 
+For more info and an example, see the link: 
+https://www.investopedia.com/terms/c/cav.asp#:~:text=Compound%20accreted%20value%20(CAV)%20is,useful%20metric%20for%20bond%20investors.
+'''
+def price_of_bond_with_interest_at_maturity(cusip,    # can be used for debugging purposes
+                                            settlement_date, 
+                                            accrual_date, 
+                                            end_date, 
+                                            yield_rate, 
+                                            coupon, 
+                                            RV):
+    NOMINAL_FREQUENCY = 2    # semiannual interest payment frequency
+    accrual_date_to_settlement_date = diff_in_days_two_dates(settlement_date, accrual_date)
+    settlement_date_to_end_date = diff_in_days_two_dates(end_date, settlement_date)
+    accrued = coupon * accrual_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR
+    num_of_periods_from_settlement_date_to_end_date = settlement_date_to_end_date / (NUM_OF_DAYS_IN_YEAR / NOMINAL_FREQUENCY)
+    denom = (1 + yield_rate / NOMINAL_FREQUENCY) ** num_of_periods_from_settlement_date_to_end_date
+    accrual_date_to_end_date = diff_in_days_two_dates(end_date, accrual_date)
+    base = (RV + coupon * accrual_date_to_end_date / NUM_OF_DAYS_IN_YEAR) / denom
+    return base - accrued
+
+'''
+This function computes the price of a bond with multiple periodic interest 
+payments using MSRB Rule Book G-33, rule (b)(i)(B)(2). Comments with capital 
+letter symbols represent those same symbols seen in formula in MSRB rule book.
+'''
+def price_of_bond_with_multiple_periodic_interest_payments(cusip,    # can be used for debugging purposes
+                                                           settlement_date, 
+                                                           accrual_date,
+                                                           first_coupon_date, 
+                                                           prev_coupon_date, 
+                                                           next_coupon_date,    
+                                                           final_coupon_date, 
+                                                           end_date, 
+                                                           frequency,
+                                                           num_of_interest_payments, 
+                                                           yield_rate,
+                                                           coupon, 
+                                                           RV, 
+                                                           time_delta, 
+                                                           last_period_accrues_from_date):
+    num_of_days_in_period = NUM_OF_DAYS_IN_YEAR / frequency
+    discount_rate = 1 + yield_rate / frequency    # 1 + Y / M
+    final_coupon_date_to_end_date = diff_in_days_two_dates(end_date, final_coupon_date)
+    prev_coupon_date_to_settlement_date = diff_in_days_two_dates(settlement_date, prev_coupon_date)    # A
+    interest_due_at_end_date = coupon * final_coupon_date_to_end_date / NUM_OF_DAYS_IN_YEAR
+    
+    RV_and_interest_due_at_end_date = RV + interest_due_at_end_date
+    settlement_date_to_next_coupon_date = diff_in_days_two_dates(next_coupon_date, settlement_date)    # E - A
+    settlement_date_to_next_coupon_date_frac = settlement_date_to_next_coupon_date / num_of_days_in_period    # (E - A) / E
+    final_coupon_date_to_end_date_frac = final_coupon_date_to_end_date / num_of_days_in_period
+    num_of_periods_from_settlement_date_to_end_date = num_of_interest_payments - 1 + settlement_date_to_next_coupon_date_frac + final_coupon_date_to_end_date_frac
+    
+    RV_and_interest_due_at_end_date_discounted = RV_and_interest_due_at_end_date / (discount_rate ** num_of_periods_from_settlement_date_to_end_date)
+    
+    # The following logic statements are necessary to address odd first and final coupons
+    if dates_are_equal(next_coupon_date, first_coupon_date):
+        num_of_days_in_current_interest_payment_period = diff_in_days_two_dates(first_coupon_date, accrual_date)
+    elif not pd.isna(last_period_accrues_from_date) and compare_dates(settlement_date, last_period_accrues_from_date + time_delta) > 0:    # this logic has not been tested
+        num_of_days_in_current_interest_payment_period = 0
+    else:
+        num_of_days_in_current_interest_payment_period = num_of_days_in_period
+
+    coupon_payments_discounted_total = (coupon * num_of_days_in_current_interest_payment_period / NUM_OF_DAYS_IN_YEAR) / \
+                                       (discount_rate ** settlement_date_to_next_coupon_date_frac)
+    coupon_payment = coupon / frequency
+    for k in range(1, num_of_interest_payments):
+        coupon_payment_discounted = coupon_payment / (discount_rate ** (settlement_date_to_next_coupon_date_frac + k))
+        coupon_payments_discounted_total += coupon_payment_discounted
+        
+    accrued = coupon * prev_coupon_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR    # R * A / B
+    return RV_and_interest_due_at_end_date_discounted + coupon_payments_discounted_total - accrued
+
+import numpy as np
+import pandas as pd
+
+'''
+This function is a helper function for `compute_price`. This function calculates the price of a trade, where `yield_rate` 
+is a specific yield and `end_date` is a fixed repayment date. All dates must be valid relative to the settlement 
+date, as opposed to the trade date. Note that "yield" is a reserved word in Python and should not be used as the name 
+of a variable or column.
+Formulas are from https://www.msrb.org/pdf.aspx?url=https%3A%2F%2Fwww.msrb.org%2FRules-and-Interpretations%2FMSRB-Rules%2FGeneral%2FRule-G-33.aspx.
+For all bonds, `base` is the present value of future cashflows to the buyer. 
+The clean price is this price minus the accumulated amount of simple interest that the buyer must pay to the seller, which is called `accrued`.
+Zero-coupon bonds are handled first. For these, the yield is assumed to be compounded semi-annually, i.e., once every six months.
+For bonds with non-zero coupon, the first and last interest payment periods may have a non-standard length,
+so they must be handled separately.
+When referring to the formulas in the MSRB handbook (link above), the below variables map to the code.
+A: prev_coupon_date_to_settlement_date
+B: NUM_OF_DAYS_IN_YEAR
+Y: yield_rate
+N: num_of_interest_payments
+E: num_of_days_in_period
+F: settlement_date_to_next_coupon_date
+P: price
+D: settlement_date_to_end_date
+H: prev_coupon_date_to_end_date
+R: coupon
+'''
+def get_price(cusip, 
+              prev_coupon_date, 
+              first_coupon_date, 
+              next_coupon_date, 
+              end_date, 
+              settlement_date, 
+              accrual_date, 
+              frequency, 
+              yield_rate, 
+              coupon, 
+              RV, 
+              time_delta, 
+              last_period_accrues_from_date):
+    yield_rate = yield_rate / 100
+    
+    # Right now we do not disambiguate zero coupon from interest at maturity. More specfically, 
+    # we should add logic that separates the cases of MSRB Rule Book G-33, rule (b) and rule (c)
+    if frequency == 0:
+        # See description for `price_of_bond_with_interest_at_maturity`
+        price = price_of_bond_with_interest_at_maturity(cusip, 
+                                                        settlement_date, 
+                                                        accrual_date, 
+                                                        end_date, 
+                                                        yield_rate, 
+                                                        coupon, 
+                                                        RV)
+    else:
+        num_of_interest_payments, final_coupon_date = get_num_of_interest_payments_and_final_coupon_date(next_coupon_date, 
+                                                                                                         end_date, 
+                                                                                                         time_delta)
+        prev_coupon_date_to_settlement_date = diff_in_days_two_dates(settlement_date, prev_coupon_date)
+            
+        num_of_days_in_period = NUM_OF_DAYS_IN_YEAR / frequency    # number of days in interest payment period 
+        assert num_of_days_in_period == round(num_of_days_in_period)
+         
+        if compare_dates(end_date, next_coupon_date) <= 0:
+            # MSRB Rule Book G-33, rule (b)(i)(B)(1)
+            settlement_date_to_end_date = diff_in_days_two_dates(end_date, settlement_date)
+            final_coupon_date_to_end_date = diff_in_days_two_dates(end_date, final_coupon_date)
+            interest_due_at_end_date = coupon * final_coupon_date_to_end_date / NUM_OF_DAYS_IN_YEAR
+            base = (RV + coupon / frequency + interest_due_at_end_date) / \
+                   (1 + (yield_rate / frequency) * settlement_date_to_end_date / num_of_days_in_period)
+            accrued = coupon * prev_coupon_date_to_settlement_date / NUM_OF_DAYS_IN_YEAR
+            price = base - accrued
+        else:
+            # MSRB Rule Book G-33, rule (b)(i)(B)(2)
+            price = price_of_bond_with_multiple_periodic_interest_payments(cusip, 
+                                                                           settlement_date, 
+                                                                           accrual_date, 
+                                                                           first_coupon_date, 
+                                                                           prev_coupon_date, 
+                                                                           next_coupon_date, 
+                                                                           final_coupon_date, 
+                                                                           end_date,  
+                                                                           frequency,
+                                                                           num_of_interest_payments, 
+                                                                           yield_rate,
+                                                                           coupon, 
+                                                                           RV, 
+                                                                           time_delta, 
+                                                                           last_period_accrues_from_date)              
+    return trunc_and_round_price(price)
+
+'''
+This function computes the price of a trade. For bonds that have not been called, the price is the lowest of
+three present values: to the next call date (which may be above par), to the next par call date, and to maturity.
+'''
+def compute_price(trade, yield_rate=None):
+    if trade.interest_payment_frequency != 0 and pd.isnull(trade.first_coupon_date): #checks if data is faulty
+        print(f"Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has a coupon but no first coupon date.")    # printing instead of raising an error to not disrupt processing large quantities of trades
+        old_date = pd.to_datetime('2000-01-01') # This is not a good error value because the yield to worst below will always be to this date.
+        return -100, old_date, -100,-100,-100, -1
+    if yield_rate == None:
+        yield_rate = trade['yield']
+    elif type(yield_rate) == str:
+        raise ValueError('Yield rate argument cannot be a string. It must be a numerical value.')
+
+    frequency = trade.interest_payment_frequency
+    time_delta = get_time_delta_from_interest_frequency(frequency)
+    my_prev_coupon_date, my_next_coupon_date = get_prev_coupon_date_and_next_coupon_date(trade, frequency, time_delta)
+
+    get_price_caller = lambda end_date, redemption_value: get_price(trade.cusip, 
+                                                                    my_prev_coupon_date, 
+                                                                    trade.first_coupon_date, 
+                                                                    my_next_coupon_date, 
+                                                                    end_date, 
+                                                                    trade.settlement_date, 
+                                                                    trade.accrual_date, 
+                                                                    frequency, 
+                                                                    yield_rate, 
+                                                                    trade.coupon, 
+                                                                    redemption_value, 
+                                                                    time_delta, 
+                                                                    trade.last_period_accrues_from_date)
+
+    redemption_value_at_maturity = 100
+    if (not trade.is_called) and (not trade.is_callable):
+        yield_to_maturity = get_price_caller(trade.maturity_date, redemption_value_at_maturity)
+        return yield_to_maturity, trade.maturity_date, 0, 0 ,0 ,  2
+    elif trade.is_called:
+        end_date = end_date_for_called_bond(trade)
+
+        if compare_dates(end_date, trade.settlement_date) < 0:
+            print(f"Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has an end date ({end_date}) which is after the settlement date ({trade.settlement_date}).")    # printing instead of raising an error to not disrupt processing large quantities of trades
+            # raise ValueError(f"Bond (CUSIP: {trade.cusip}, RTRS: {trade.rtrs_control_number}) has an end date ({end_date}) which is after the settlement date ({trade.settlement_date}).")
+        
+        redemption_value_at_refund = refund_price_for_called_bond(trade)
+        return get_price_caller(end_date, redemption_value_at_refund), end_date, 0, 0 ,0 , 3
+    else:
+        next_price, to_par_price, maturity_price = float('inf'), float('inf'), float('inf')
+
+        if not pd.isnull(trade.par_call_date):
+            to_par_price = get_price_caller(trade.par_call_date, trade.par_call_price)
+        if not pd.isnull(trade.next_call_date):
+            next_price = get_price_caller(trade.next_call_date, trade.next_call_price)
+        maturity_price = get_price_caller(trade.maturity_date, redemption_value_at_maturity)
+
+        prices_and_dates = [(next_price, trade.next_call_date), 
+                            (to_par_price, trade.par_call_date), 
+                            (maturity_price, trade.maturity_date)]
+        calc_price, calc_date = min(prices_and_dates, key=lambda pair: pair[0]) # this function is stable and will choose the pair which appears first in the case of ties for the lowest price
+    if calc_date == trade.next_call_date:
+        calc_date_selection = 0
+    elif calc_date == trade.par_call_date:
+        calc_date_selection = 1
+    elif calc_date == trade.maturity_date:
+        calc_date_selection = 2
+    elif calc_date == trade.refund_date:
+        calc_date_selection = 3
+    else:
+        calc_date_selection = 4      
+    return calc_price, calc_date, next_price,to_par_price,maturity_price,calc_date_selection
+
+
+def get_trade_data(bqclient,publish_date):
+    query = f'''
+    SELECT
+                cusip,
+                rtrs_control_number,
+                trade_datetime,
+                trade_date,
+                time_of_trade,
+                trade_type,
+                par_traded,
+                dollar_price,
+                yield,
+                current_coupon_rate as coupon,
+                interest_payment_frequency,
+                accrual_date,
+                settlement_date, 
+                first_coupon_date,
+                is_callable,
+                next_call_date,
+                next_call_price,
+                par_call_date,
+                par_call_price,
+                is_called,
+                called_redemption_type AS redemption_type,
+                refund_date,
+                refund_price,
+                maturity_date,
+                publish_datetime, 
+                next_coupon_payment_date,
+                previous_coupon_payment_date,
+                last_period_accrues_from_date,
+                when_issued,
+                is_non_transaction_based_compensation,
+                brokers_broker,
+                trade_datetime,
+                publish_datetime,
+                issue_key,
+                sequence_number,
+                par_traded,
+                series_name,
+                case when series_name is null then cast(issue_key as string) else
+                concat(issue_key,series_name) end as series_id,
+                msrb_valid_to_date,
+                msrb_valid_from_date
+                FROM `eng-reactor-287421.auxiliary_views.trades_with_ref_data_pd`
+                WHERE
+                publish_date = '{publish_date}'
+                '''
+    dataframe = bqclient.query(query).result().to_dataframe()
+    return dataframe
+
+import datetime
+
+def get_latest_sequence_number():
+    publish_date = date.today()
+    query = f'''
+    SELECT
+    sequence_number
+    FROM
+    eng-reactor-287421.auxiliary_views.calculation_date_and_price
+    WHERE
+    date(publish_datetime) = '{publish_date}'
+    order by sequence_number desc  limit 1
+    '''
+    query_job = bqclient.query(query).result().to_dataframe()
+    if query_job.empty:
+        return query_job
+    else:
+        query_job = query_job.values[0][0]
+        return query_job
+
+
+
+from google.cloud import bigquery
+import pandas
+import pytz
+
+def getSchema():
+    schema = [  bigquery.SchemaField("rtrs_control_number", "INTEGER"),
+                bigquery.SchemaField("trade_datetime", "DATETIME"),
+                bigquery.SchemaField("cusip", "STRING"),
+                bigquery.SchemaField('calc_price',"FLOAT"),
+                bigquery.SchemaField('price_to_next_call',"FLOAT"),
+                bigquery.SchemaField('price_to_par_call',"FLOAT"),
+                bigquery.SchemaField('price_to_maturity',"FLOAT"),
+                bigquery.SchemaField('calc_date',"DATE"),
+                bigquery.SchemaField('next_call_date',"DATE"),
+                bigquery.SchemaField('par_call_date',"DATE"),
+                bigquery.SchemaField('maturity_date',"DATE"),
+                bigquery.SchemaField('refund_date',"DATE"),
+                bigquery.SchemaField("calc_date_selection", "INTEGER"),
+                bigquery.SchemaField('price_delta', "FLOAT"),
+                bigquery.SchemaField('publish_datetime', "DATETIME"),
+                bigquery.SchemaField('when_issued', "BOOLEAN"),
+                bigquery.SchemaField("issue_key", "INTEGER"),
+                bigquery.SchemaField("sequence_number", "INTEGER"),
+                bigquery.SchemaField("par_traded", "INTEGER"),
+                bigquery.SchemaField("series_name", "STRING"),
+                bigquery.SchemaField("series_id", "STRING"),
+                bigquery.SchemaField('msrb_valid_to_date', "DATETIME"),
+                bigquery.SchemaField('msrb_valid_from_date', "DATETIME")
+            ]
+    return schema
+
+
+def uploadData(vanilla):
+    client = bigquery.Client(project=PROJECT_ID, location="US")
+    useful_columns = vanilla[["rtrs_control_number", "trade_datetime", "cusip",'calc_price','price_to_next_call','price_to_par_call', 'price_to_maturity','calc_date','next_call_date','par_call_date','maturity_date','refund_date','price_delta','publish_datetime',"when_issued", "calc_date_selection","issue_key","sequence_number","par_traded","series_name","series_id",  'msrb_valid_to_date','msrb_valid_from_date']]
+
+    job_config = bigquery.LoadJobConfig(schema = getSchema(),
+                                       write_disposition="WRITE_APPEND"
+                                       )
+    
+    job = client.load_table_from_dataframe(useful_columns, TABLE_ID,job_config=job_config)
+    
+    try:
+        job.result()
+        print("Upload Successful")
+    except Exception as e:
+        print("Failed to Upload")
+        raise e
+
+import datetime
+from datetime import date
+
+PROJECT_ID = "eng-reactor-287421"
+TABLE_ID = "eng-reactor-287421.auxiliary_views.calculation_date_and_price"
+
+# -*- coding: utf-8 -*-
+# @Author: Developer & Developer
+# @Date:   2021-08-20 11:06:27
+# @Last Modified by:   Developer
+# @Last Modified time: 2022-03-09 22:12:46
+
+
+from google.cloud import bigquery
+import os
+import pandas as pd
+import pickle5 as pickle
+import redis
+import smtplib, ssl
+from email.mime.text import MIMEText
+from google.cloud import secretmanager
+
+
+
+bq_client = bigquery.Client()
+job_config = bigquery.job.QueryJobConfig(allow_large_results=True)
+redis_host = os.environ.get('REDISHOST', '10.14.140.37')
+redis_port = int(os.environ.get('REDISPORT', 6379))
+redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+
+def sqltodf(sql,limit = ""):
+    if limit != "": 
+        limit = f" WHERE trade_date < DATE({limit})"
+    bqr = bq_client.query(sql + limit).result()
+    return bqr.to_dataframe()
+
+
+#The following selects the latest reference data for a given cusip.
+query_for_redis = """
+SELECT
+  coupon,
+  cusip,
+  ref_valid_from_date,
+  ref_valid_to_date,
+  incorporated_state_code,
+  organization_primary_name,
+  instrument_primary_name,
+  issue_key,
+  issue_text,
+  conduit_obligor_name,
+  is_called,
+  is_callable,
+  is_escrowed_or_pre_refunded,
+  first_call_date,
+  call_date_notice,
+  callable_at_cav,
+  par_price,
+  call_defeased,
+  call_timing,
+  call_timing_in_part,
+  extraordinary_make_whole_call,
+  extraordinary_redemption,
+  make_whole_call,
+  next_call_date,
+  next_call_price,
+  call_redemption_id,
+  first_optional_redemption_code,
+  second_optional_redemption_code,
+  third_optional_redemption_code,
+  first_mandatory_redemption_code,
+  second_mandatory_redemption_code,
+  third_mandatory_redemption_code,
+  par_call_date,
+  par_call_price,
+  maximum_call_notice_period,
+  called_redemption_type,
+  muni_issue_type,
+  refund_date,
+  refund_price,
+  redemption_cav_flag,
+  max_notification_days,
+  min_notification_days,
+  next_put_date,
+  put_end_date,
+  put_feature_price,
+  put_frequency,
+  put_start_date,
+  put_type,
+  maturity_date,
+  sp_long,
+  sp_stand_alone,
+  sp_icr_school,
+  sp_prelim_long,
+  sp_outlook_long,
+  sp_watch_long,
+  sp_Short_Rating,
+  sp_Credit_Watch_Short_Rating,
+  sp_Recovery_Long_Rating,
+  moodys_long,
+  moodys_short,
+  moodys_Issue_Long_Rating,
+  moodys_Issue_Short_Rating,
+  moodys_Credit_Watch_Long_Rating,
+  moodys_Credit_Watch_Short_Rating,
+  moodys_Enhanced_Long_Rating,
+  moodys_Enhanced_Short_Rating,
+  moodys_Credit_Watch_Long_Outlook_Rating,
+  has_sink_schedule,
+  next_sink_date,
+  sink_indicator,
+  sink_amount_type_text,
+  sink_amount_type_type,
+  sink_frequency,
+  sink_defeased,
+  additional_next_sink_date,
+  sink_amount_type,
+  additional_sink_frequency,
+  min_amount_outstanding,
+  max_amount_outstanding,
+  default_exists,
+  has_unexpired_lines_of_credit,
+  years_to_loc_expiration,
+  escrow_exists,
+  escrow_obligation_percent,
+  escrow_obligation_agent,
+  escrow_obligation_type,
+  child_linkage_exists,
+  put_exists,
+  floating_rate_exists,
+  bond_insurance_exists,
+  is_general_obligation,
+  has_zero_coupons,
+  delivery_date,
+  issue_price,
+  primary_market_settlement_date,
+  issue_date,
+  outstanding_indicator,
+  federal_tax_status,
+  maturity_amount,
+  available_denom,
+  denom_increment_amount,
+  min_denom_amount,
+  accrual_date,
+  bond_insurance,
+  coupon_type,
+  current_coupon_rate,
+  daycount_basis_type,
+  debt_type,
+  default_indicator,
+  first_coupon_date,
+  interest_payment_frequency,
+  issue_amount,
+  last_period_accrues_from_date,
+  next_coupon_payment_date,
+  odd_first_coupon_date,
+  orig_principal_amount,
+  original_yield,
+  outstanding_amount,
+  previous_coupon_payment_date,
+  sale_type,
+  settlement_type,
+  additional_project_txt,
+  asset_claim_code,
+  additional_state_code,
+  backed_underlying_security_id,
+  bank_qualified,
+  capital_type,
+  conditional_call_date,
+  conditional_call_price,
+  designated_termination_date,
+  DTCC_status,
+  first_execution_date,
+  formal_award_date,
+  maturity_description_code,
+  muni_security_type,
+  mtg_insurance,
+  orig_cusip_status,
+  orig_instrument_enhancement_type,
+  other_enhancement_type,
+  other_enhancement_company,
+  pac_bond_indicator,
+  project_name,
+  purpose_class,
+  purpose_sub_class,
+  refunding_issue_key,
+  refunding_dated_date,
+  sale_date,
+  sec_regulation,
+  secured,
+  series_name,
+  sink_fund_redemption_method,
+  state_tax_status,
+  tax_credit_frequency,
+  tax_credit_percent,
+  use_of_proceeds,
+  use_of_proceeds_supplementary,
+  -- material_event_history, These array functions double the query cost and are not used in the demo.
+  -- default_event_history,  Removed by Developer-25-2023
+  -- most_recent_event,
+  -- event_exists,
+  series_id,
+  security_description,
+  recent
+FROM eng-reactor-287421.auxiliary_views.trade_history_latest_ref_data_minimal_exclusions 
+where date(recent[safe_offset(0)].msrb_valid_from_date) = current_date"""
+
+def upload_data_to_redis(key, value):
+    value =  pickle.dumps(value,protocol=pickle.HIGHEST_PROTOCOL)
+    redis_client.set(key, value)
+
+
+def update_redis():
+    update_redis_start = datetime.datetime.now()
+    df = sqltodf(query_for_redis)
+    time_for_query_redis = datetime.datetime.now()
+    urq_delta = str(time_for_query_redis-update_redis_start)
+    print(f"Update Redis query took {urq_delta}")
+    num_update_cusips = len(df)
+
+    print(f"""This is the number of updated cusips {num_update_cusips}""")
+    print(len(df))
+
+    for _,row in df.iterrows():
+        key = row['cusip']
+        upload_data_to_redis(key,row)
+    time_for_udr = datetime.datetime.now()
+    udr_delta = str(time_for_udr-time_for_query_redis)
+    print(f"Update Redis Update took {udr_delta}")
+    print("Upload to redis done")
+    return "Upload to redis successful!"
+
+
+
+
+def main (args):
+    start_time = datetime.datetime.now()
+    publish_date = date.today()
+    df = get_trade_data(bqclient,publish_date) #gets trade data for today
+    time_for_get_trade_data = datetime.datetime.now()
+    gtd_delta = str(time_for_get_trade_data - start_time)
+    print(f"Get_trade_data took {gtd_delta}")
+    latest_sequence_number = get_latest_sequence_number()
+    time_for_lsn = datetime.datetime.now()
+    lsn_delta = str(time_for_lsn-time_for_get_trade_data)
+    print(f"Latest_seq took {lsn_delta}")
+    if isinstance(latest_sequence_number, int): 
+        df = df[df.sequence_number>latest_sequence_number]
+    elif latest_sequence_number.empty:
+        df = df
+        latest_sequence_number = "First trades of the day!"
+    else: 
+        print(f'latest_sequence_number error for {latest_sequence_number}')
+    vanilla = transform_reference_data(df)
+    time_for_trd = datetime.datetime.now()
+    trd_delta = str(time_for_trd-time_for_lsn)
+    print(f"Transform ref data took {trd_delta}")
+    vanilla['anomaly'] = (vanilla.par_traded < 5000) | (vanilla['yield'] < 0) 
+    vanilla['anomaly'] = vanilla['anomaly'] | pd.isnull(vanilla.settlement_date) | pd.isnull(vanilla.first_coupon_date) & (vanilla.coupon > 0)
+    vanilla['alert'] = False # vanilla.cusip == "89386FAD5" # vanilla.redemption_type == 5 # vanilla.cusip == "803093AM5" # 
+    if df.empty:
+        print('No recent trades.')
+    else: 
+        vanilla['calc_price'], vanilla['calc_date'],vanilla['price_to_next_call'],vanilla['price_to_par_call'],vanilla['price_to_maturity'],vanilla['calc_date_selection'] = zip(*vanilla.apply(lambda x: compute_price(x),axis=1))
+        vanilla['price_delta'] = abs(vanilla.calc_price - vanilla.dollar_price)
+        uploadData(vanilla)
+        number_of_trades = len(vanilla)
+        print(f'Upload sucessful,{number_of_trades} trades since last sequence number: {latest_sequence_number}')
+        update_redis()
+        time_for_ur = datetime.datetime.now()
+        ur_delta = str(time_for_ur-time_for_trd)
+        print(f"Update Redis took {ur_delta}")
+        overall_delta = str(time_for_ur-start_time)
+        print(f"Function took {overall_delta}")

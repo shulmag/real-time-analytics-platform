@@ -1,0 +1,188 @@
+'''
+ # @ Create date: 2021-12-16
+ # @ Modified date: 2025-08-28
+ # The SQL arrays from BigQuery are converted to a dictionary when read as a pandas dataframe. 
+ # 
+ # Normalizations: 
+ # - Multiplying the yield spreads by 100 to convert into basis points
+ # - Taking the log of the size of the trade to reduce the absolute scale 
+ # - Taking the log of the number of seconds between the historical trade and the latest trade
+ '''
+import warnings
+
+import numpy as np
+import pandas as pd
+# from datetime import datetime
+
+from modules.ficc.utils.nelson_siegel_model import yield_curve_level
+from modules.ficc.utils.diff_in_days import diff_in_days_two_dates
+from modules.ficc.utils.auxiliary_variables import NUM_OF_DAYS_IN_YEAR
+from modules.ficc.utils.calendars import get_day_before
+
+
+# EARLIST_DATETIME_OF_REALTIME_YIELD_CURVE_COEFFICIENTS = datetime(2021, 8, 4, 15, 57)
+# EARLIST_DATE_OF_REALTIME_YIELD_CURVE_COEFFICIENTS = EARLIST_DATETIME_OF_REALTIME_YIELD_CURVE_COEFFICIENTS.replace(hour=0, minute=0, second=0)
+
+# directly corresponds to `FEATURES_FOR_EACH_TRADE_IN_HISTORY` in `cloud_functions/fast_trade_history_redis_update/main.py`
+TRADE_FEATURE_TO_INDEX = {'msrb_valid_from_date': 0, 
+                          'msrb_valid_to_date': 1, 
+                          'rtrs_control_number': 2, 
+                          'trade_datetime': 3, 
+                          'publish_datetime': 4, 
+                          'yield': 5, 
+                          'dollar_price': 6, 
+                          'par_traded': 7, 
+                          'trade_type': 8, 
+                          'is_non_transaction_based_compensation': 9, 
+                          'is_lop_or_takedown': 10, 
+                          'brokers_broker': 11, 
+                          'is_alternative_trading_system': 12, 
+                          'is_weighted_average_price': 13, 
+                          'settlement_date': 14, 
+                          'calc_date': 15, 
+                          'calc_day_cat': 16, 
+                          'maturity_date': 17, 
+                          'next_call_date': 18, 
+                          'par_call_date': 19, 
+                          'refund_date': 20, 
+                          'transaction_type': 21, 
+                          'sequence_number': 22}
+
+NECESSARY_FEATURES_FOR_PROCESSING_TRADE_HISTORY = ['rtrs_control_number', 
+                                                   'par_traded', 
+                                                   'trade_type', 
+                                                   'trade_datetime', 
+                                                   'settlement_date', 
+                                                   'maturity_date']
+
+ADDITIONAL_FEATURES_EXTRACTED_FROM_TRADE_IN_TRADE_HISTORY = ['yield', 
+                                                             'dollar_price', 
+                                                             'calc_date', 
+                                                             'next_call_date', 
+                                                             'par_call_date', 
+                                                             'refund_date', 
+                                                             'calc_day_cat']
+
+
+def trade_dict_to_list(trade_array, 
+                       cusip,     # used for printing output in the case of error or for further analysis
+                       trade_idx,    # used for printing output in the case of error or for further analysis
+                       current_datetime,    # represents the trade_datetime of the hypothetical trade being priced at this current time
+                       treasury_rate_df, 
+                       holidays: set, 
+                       stop_processing_trade_history_for_yield_spread_model_and_ui: bool, 
+                       stop_processing_trade_history_for_dollar_price_model: bool, 
+                       verbose: bool = False) -> list:
+    '''If the `verbose` flag is set to `True`, then the procedure prints additional output that may be helpful for debugging.'''
+    trade_type_mapping = {'D': [0, 0], 'S': [0, 1], 'P': [1, 0]}
+    yield_spread_model_trade_list = []    # processed trade for yield spread model trade history
+    dollar_price_model_trade_list = []    # processed trade for dollar price model trade history
+    trade_features = None    # last trade features to be used by yield spread model and displayed on the UI
+    empty_trade_and_have_not_encountered_missing_or_negative_yield = (None, None, None, False)
+    
+    for feature in NECESSARY_FEATURES_FOR_PROCESSING_TRADE_HISTORY:
+        try:
+            if pd.isna(trade_array[TRADE_FEATURE_TO_INDEX[feature]]):
+                print(f'{feature} is missing, skipping this trade')
+                return empty_trade_and_have_not_encountered_missing_or_negative_yield
+        except Exception as e:
+            print(f'When processing CUSIP: {cusip}, we get the following {type(e)}: {e}')
+            print(f'trade_array:\n{trade_array}')
+            return empty_trade_and_have_not_encountered_missing_or_negative_yield
+        if 'date' in feature:
+            date_feature_value = trade_array[TRADE_FEATURE_TO_INDEX[feature]]
+            try:    # sometimes MSRB has errors when entering dates causing a date to be out of bounds or invalid; see Jira task: https://ficcai.atlassian.net/browse/FA-2315
+                pd.to_datetime(date_feature_value)
+            except Exception as e:
+                print(f'When processing CUSIP: {cusip} and RTRS control number: {trade_array[TRADE_FEATURE_TO_INDEX["rtrs_control_number"]]}, when trying to convert {feature} with value: {date_feature_value} we get the following {type(e)}: {e}')
+                return empty_trade_and_have_not_encountered_missing_or_negative_yield
+
+    encountered_trade_with_missing_or_negative_yield = False
+    trade_yield = trade_array[TRADE_FEATURE_TO_INDEX['yield']]
+    if pd.isna(trade_yield): trade_yield = None    # sometimes the yield is `np.nan` and so this converts it to `None` to be properly handled later
+    if trade_yield is None or trade_yield < 0:    # do not add this trade should to the trade history for the yield spread model
+        #COMMENTING OUT AS THIS IS CREATING TOO MUCH LOGGING 2025-08-28
+        #print(f'For CUSIP: {cusip}, trade with RTRS control number: {trade_array[TRADE_FEATURE_TO_INDEX["rtrs_control_number"]]}, has yield of {trade_yield}; skipping trade for use in the yield spread model')
+        encountered_trade_with_missing_or_negative_yield = True
+
+    trade_datetime = trade_array[TRADE_FEATURE_TO_INDEX['trade_datetime']]
+    dollar_price = trade_array[TRADE_FEATURE_TO_INDEX['dollar_price']]
+    if pd.isna(dollar_price): dollar_price = None
+
+    seconds_ago = None
+    if stop_processing_trade_history_for_yield_spread_model_and_ui is False:
+        calc_date = trade_array[TRADE_FEATURE_TO_INDEX['calc_date']]
+        if pd.isna(calc_date): calc_date = None
+        yield_spread = None    # initialize this value so that we can still display this on the UI without processing the trade for the yield spread model trade history
+        yield_at_that_time = None    # initialize this value so that we can still display this on the UI without processing the trade for the yield spread model trade history
+        seconds_ago = (current_datetime - trade_datetime).total_seconds()
+        if seconds_ago < 0:
+            warnings.warn(f'CUSIP {cusip} has a trade in its history at index {trade_idx} which has a negative seconds_ago value of {seconds_ago}. The trade has RTRS control number {trade_array[TRADE_FEATURE_TO_INDEX["rtrs_control_number"]]} and trade_datetime {trade_datetime}. The current_datetime is {current_datetime}. Skipping this trade for processing.')
+            return empty_trade_and_have_not_encountered_missing_or_negative_yield
+        if encountered_trade_with_missing_or_negative_yield is False and calc_date is not None and diff_in_days_two_dates(calc_date, trade_datetime) >= 0:    # if the trade datetime is before the calc date, then we cannot further process this trade and so it should neither be included in the trade history for the yield spread model;     # if `calc_date` does not exist, then we still use the trade for the dollar price model and for displaying on the UI, but do use it for the yield spread model
+            time_to_maturity = diff_in_days_two_dates(calc_date, trade_datetime) / NUM_OF_DAYS_IN_YEAR
+            if time_to_maturity > 0:    # if `time_to_maturity` is nonpositive, then we cannot further process this trade and so it should not be included in the trade history for the yield
+                yield_at_that_time = yield_curve_level(time_to_maturity, trade_datetime.strftime('%Y-%m-%d:%H:%M'))    # calculating the time to maturity in years from the trade_date
+                yield_spread = trade_yield * 100 - yield_at_that_time
+                yield_spread_model_trade_list.append(yield_spread)
+            
+                ###### Adding the treasury spreads ######
+                treasury_maturities = np.array([1, 2, 3, 5, 7, 10, 20, 30])
+                maturity = min(treasury_maturities, key=lambda treasury_maturity: abs(treasury_maturity - time_to_maturity))
+                maturity = 'year_' + str(maturity)
+                day_before = get_day_before(trade_datetime, holidays)
+                # t_rate = treasury_rate_df.iloc[treasury_rate_df.index.get_loc(day_before, method='backfill')][maturity]
+                treasury_rate_df_idx = treasury_rate_df.index.get_indexer([day_before], method='backfill')[0]    # use `.get_indexer(...)` instead of `.get_loc(...)` to get rid of `FutureWarning: Passing method to Index.get_loc is deprecated and will raise in a future version.`
+                t_rate = treasury_rate_df.iloc[treasury_rate_df_idx][maturity]
+                t_spread = (trade_yield - t_rate) * 100
+                yield_spread_model_trade_list.append(np.round(t_spread, 3))
+                ##########################################
+
+                ####### Adding par traded and trade type ######
+                yield_spread_model_trade_list.append(np.float32(np.log10(trade_array[TRADE_FEATURE_TO_INDEX['par_traded']])))        
+                yield_spread_model_trade_list += trade_type_mapping[trade_array[TRADE_FEATURE_TO_INDEX['trade_type']]]
+                ###############################################
+
+                # For some trades the seconds ago feature is negative.
+                # This is because the publish time is after the trade datetime.
+                # We have verified that this is an anomaly on MSRBs end.
+                yield_spread_model_trade_list.append(np.log10(1 + seconds_ago))
+
+                # print out additional features of the trade in the history for debugging purposes
+                if verbose:
+                    cusip_addendum = ''    # in `fast_trade_history_redis_update`, for similar trade history, we keep the CUSIP as the last item in the trade_array, so if that item exists, then add it to the print output
+                    if len(trade_array) == len(TRADE_FEATURE_TO_INDEX) + 1:    # CUSIP exists as the last item in the trade array
+                        cusip_addendum = f'\t\tCUSIP: {trade_array[-1]}'
+
+                    print(f'RTRS control number: {int(trade_array[TRADE_FEATURE_TO_INDEX["rtrs_control_number"]])}{cusip_addendum}\t\tYield: {trade_yield}\t\tTrade datetime: {trade_datetime}')
+            else:
+                print(f'Skipped the following trade because the time to maturity is nonpositive. RTRS control number: {int(trade_array[TRADE_FEATURE_TO_INDEX["rtrs_control_number"]])}\t\tTrade datetime: {trade_datetime}\t\tCalc date: {calc_date}')
+
+        trade_features = (yield_spread,    # this value is `None` if this trade is not in the yield spread model history, which is fine because we neither output this trade in the front end nor do we use it in the model
+                          yield_at_that_time, 
+                          trade_array[TRADE_FEATURE_TO_INDEX['rtrs_control_number']], 
+                          trade_yield, 
+                          dollar_price, 
+                          seconds_ago, 
+                          float(trade_array[TRADE_FEATURE_TO_INDEX['par_traded']]),
+                          calc_date, 
+                          trade_array[TRADE_FEATURE_TO_INDEX['maturity_date']], 
+                          trade_array[TRADE_FEATURE_TO_INDEX['next_call_date']], 
+                          trade_array[TRADE_FEATURE_TO_INDEX['par_call_date']], 
+                          trade_array[TRADE_FEATURE_TO_INDEX['refund_date']], 
+                          trade_datetime, 
+                          trade_array[TRADE_FEATURE_TO_INDEX['calc_day_cat']], 
+                          trade_array[TRADE_FEATURE_TO_INDEX['settlement_date']], 
+                          trade_array[TRADE_FEATURE_TO_INDEX['trade_type']])
+        
+    if stop_processing_trade_history_for_dollar_price_model is False:    # create dollar price model trade history
+        dollar_price_model_trade_list.append(dollar_price)
+        dollar_price_model_trade_list.append(np.float32(np.log10(trade_array[TRADE_FEATURE_TO_INDEX['par_traded']])))        
+        dollar_price_model_trade_list += trade_type_mapping[trade_array[TRADE_FEATURE_TO_INDEX['trade_type']]]
+        if seconds_ago is None: seconds_ago = (current_datetime - trade_datetime).total_seconds()    # reuse the work if already done when processing trade history for the yield spread model
+        dollar_price_model_trade_list.append(np.log10(1 + seconds_ago))
+
+    yield_spread_model_trade_list = np.stack(yield_spread_model_trade_list) if yield_spread_model_trade_list != [] else None
+    dollar_price_model_trade_list = np.stack(dollar_price_model_trade_list) if dollar_price_model_trade_list != [] else None
+
+    return yield_spread_model_trade_list, dollar_price_model_trade_list, trade_features, encountered_trade_with_missing_or_negative_yield

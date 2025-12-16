@@ -1,0 +1,146 @@
+@use "../../styles/lib/" as *;
+
+
+.root {
+  contain: content;
+
+  p {
+    margin-block-start: spacing(4);
+  }
+
+  h4 {
+    margin-block-start: spacing(2);
+  }
+
+  h3 {
+    color: color('text.secondary');
+
+    span {
+      @include underline;
+    }
+  }
+
+  picture + h3 {
+    margin-block-start: spacing(6);
+  }
+
+  img {
+    inline-size: spacing(7);
+    block-size: spacing(7);
+    object-fit: cover;
+    object-position: 0 0;
+
+    @at-root 
+    .root:nth-of-type(2) img {
+      object-position: 0 50%;
+    }
+    
+    @at-root 
+    .root:nth-of-type(3) img {
+      object-position: 0 100%;
+    }
+  }
+
+  a {
+    
+    @include hover {
+      color: color('text.secondary')
+    }
+  }
+}
+
+.form {
+  contain: content;
+  display: flex;
+  flex-direction: column;
+  width: inherit;
+  margin-block-start: spacing(4);
+
+  .hidden {
+    border: 0;
+    clip: rect(0 0 0 0);
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    padding: 0;
+    position: absolute;
+    width: 1px;
+  }
+
+  input {
+    padding-inline: 1rem;
+    padding-block: 0.5rem;
+    margin-block: 0.5rem;
+    border: 1px solid color('surface-primary-1');
+  }
+
+  button {
+    padding-inline: 1rem;
+    padding-block: 0.5rem;
+    margin-block: 0.5rem;
+    border: 1px solid color('surface-primary-1');
+    background: color('surface-primary-1');
+    color: color('text.contrast');
+
+    @include hover {
+      background: color('surface.accent.1');
+    }
+  }
+
+  .sent {
+    background-color: black;
+    color: color('text.secondary');
+
+    @include hover {
+      background-color: black;
+      color: color('text.secondary');
+    }
+  }
+}
+
+
+.parent {
+  @include region-buffer;
+  padding-block-end: spacing(8);
+  
+  div {
+    color: color('text.contrast');
+
+    @include screen {
+      columns: 3;
+      column-gap: spacing();
+      column-fill: balance;
+    }
+  }
+
+  h2 {
+    
+    @include screen {
+      break-after: column;
+
+      @supports (-moz-hyphens: auto) {
+        margin-block-end: 200%;
+      }
+    }
+  }
+
+  p {
+
+    @include screen {
+      break-before: column;
+      margin-block-start: 0;
+    }
+  }
+
+  a {
+    
+    @include hover {
+      color: color('primary')
+    }
+  }
+}
+
+
+.secondary {
+  background: color('surface.secondary.1');
+}

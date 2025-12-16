@@ -1,0 +1,31 @@
+{
+    "attemptDeadline": "300s",
+    "description": "Updates the high-quality and 7-12 year index maturities. Since the timezone is set to America/New_York, the schedule will automatically adjust to daylight savings time.",
+    "httpTarget": {
+        "headers": {
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "Google-Cloud-Scheduler"
+        },
+        "httpMethod": "POST",
+        "oidcToken": {
+            "audience": "https://us-east1-eng-reactor-287421.cloudfunctions.net/update_sp_all_indices_and_maturities",
+            "serviceAccountEmail": "eng-reactor-287421@appspot.gserviceaccount.com"
+        },
+        "uri": "https://us-east1-eng-reactor-287421.cloudfunctions.net/update_sp_all_indices_and_maturities"
+    },
+    "lastAttemptTime": "2025-01-17T04:00:00.651325Z",
+    "name": "projects/eng-reactor-287421/locations/us-central1/jobs/update_all_sp_index_maturities",
+    "retryConfig": {
+        "maxBackoffDuration": "3600s",
+        "maxDoublings": 5,
+        "maxRetryDuration": "300s",
+        "minBackoffDuration": "60s",
+        "retryCount": 1
+    },
+    "schedule": "0 23 * * 1-5",
+    "scheduleTime": "2025-01-18T04:00:00.104439Z",
+    "state": "ENABLED",
+    "status": {},
+    "timeZone": "America/New_York",
+    "userUpdateTime": "2024-11-05T01:19:40Z"
+}

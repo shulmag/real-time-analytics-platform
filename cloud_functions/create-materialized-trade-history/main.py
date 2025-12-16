@@ -1,0 +1,85 @@
+'''
+Description: This function runs queries that produce the table `auxiliary_views_v2.trade_history_same_issue_5_yr_mat_bucket_1_materialized`,
+             which is used for daily model training. The first two queries deduplicate tables from fast_trade_history_redis_update (which sometimes produces duplicates),
+             and the last creates the table above. These queries should run at 4:05AM ET M-F except when the last weekday is a holiday.
+
+            These were formerly scheduled queries, but we now run them from a Cloud Function for:
+            (1) Improved error monitoring.
+            (2) Flexibility in scheduling with Cloud Scheduler (e.g., can avoid running the query on a holiday).
+'''
+import logging as python_logging    # to not confuse with google.cloud.logging
+import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday
+from pytz import timezone
+from datetime import datetime, timedelta
+
+from google.cloud import bigquery, logging
+
+from queries import QUERIES
+
+
+TESTING = False
+if TESTING:
+    import os
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/user/base/ficc/creds.json'
+
+# set up logging client; https://cloud.google.com/logging/docs/setup/python
+logging_client = logging.Client()
+logging_client.setup_logging()
+
+bq_client = bigquery.Client()
+
+
+EASTERN = timezone('US/Eastern')
+YEAR_MONTH_DAY_HOUR_MIN_SEC = '%Y-%m-%d %H:%M:%S'
+
+
+class USHolidayCalendarWithGoodFriday(USFederalHolidayCalendar):
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
+
+
+def last_weekday_is_a_holiday() -> bool:
+    '''Determine whether the last weekday is a US national holiday.'''
+    today = datetime.now(EASTERN).date() 
+    # Find the last weekday (excluding weekends)
+    if today.weekday() == 0:  # Monday → last weekday is Friday
+        days_back = 3
+    elif today.weekday() == 6:  # Sunday → last weekday is Friday
+        days_back = 2
+    else:  # Any other weekday → just subtract one day
+        days_back = 1
+    last_weekday = today - timedelta(days=days_back)
+    
+    current_year = today.year
+    holidays_in_last_year_and_next_year = set(USHolidayCalendarWithGoodFriday().holidays(start=f'{current_year - 1}-01-01',end=f'{current_year + 1}-12-31'))
+    if pd.Timestamp(last_weekday).tz_localize(None).normalize() in holidays_in_last_year_and_next_year:    # `.tz_localize(None)` is to remove the time zone; `.normalize()` is used to remove the time component from the timestamp
+        python_logging.info(f'The last weekday, {last_weekday}, is a holiday, so queries will NOT run.')
+        return True
+    return False
+
+
+def execute_query(client: bigquery.Client, query_name: str, query: str) -> None:
+    try:
+        query_job = client.query(query)
+        python_logging.info(f'[{datetime.now(EASTERN).strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC)}] Query started: {query_name}, ID: {query_job.job_id}')
+        query_job.result() 
+        python_logging.info(f'[{datetime.now(EASTERN).strftime(YEAR_MONTH_DAY_HOUR_MIN_SEC)}] Query completed successfully: {query_name}, ID: {query_job.job_id}')
+    except Exception as e:
+        python_logging.error(f'{type(e)} executing query: {query_name}\n\t{type(e)}: {e}')
+        raise e
+
+
+def main(request):
+    if last_weekday_is_a_holiday(): return 'Skipping execution due to holiday.'
+
+    try: 
+        for query_name, query in QUERIES.items():
+            execute_query(bq_client, query_name, query)
+        return f'All queries: {list(QUERIES.keys())} executed successfully.'
+    except Exception as e:
+        python_logging.error(f'{type(e)} while executing queries: {e}')
+        return f'Execution failed with {type(e)}: {e}'
+
+
+if __name__ == '__main__':
+    main()

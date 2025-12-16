@@ -1,0 +1,22 @@
+'''
+Last Editor: Developer Ray
+Last Edit Date: 2025-03-04
+'''
+from datetime import datetime
+from pytz import timezone
+
+from all_usage import get_usage_count    # , send_all_usage_email
+from usage_summary import send_usage_summary_email
+
+
+# # Uncomment the below lines for testing
+# import os
+# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/user/ficc/ficc/mitas_creds.json'
+
+
+def main(args):
+    today = datetime.now(timezone('US/Eastern')).date()
+    print(f'Date today: {today}')
+    # send_all_usage_email(today)
+    send_usage_summary_email(today, get_usage_count())
+    return 'SUCCESS'

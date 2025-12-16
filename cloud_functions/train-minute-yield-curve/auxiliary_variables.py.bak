@@ -1,0 +1,66 @@
+'''
+Author: Developer Ray
+Date: 2024-12-04
+Last Editor: Developer Watson
+Last Edit Date: 2025-09-19
+'''
+from pytz import timezone
+
+from pandas.tseries.offsets import CustomBusinessDay
+from pandas.tseries.holiday import USFederalHolidayCalendar, GoodFriday    # used to create a business day defined on the US federal holiday calendar that can be added or subtracted to a datetime
+
+from google.cloud import secretmanager
+
+TESTING = False
+
+EASTERN = timezone('US/Eastern')
+
+def access_secret_version(project_id: str, secret_id: str, version_id: str = "latest") -> str:
+    sm = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    resp = sm.access_secret_version(request={"name": name})
+    return resp.payload.data.decode("utf-8")
+
+FINNHUB_API_KEY = access_secret_version(
+    "eng-reactor-287421",   # project ID
+    "finnhub_api_key",      # secret name in Secret Manager
+    "latest"                # Version
+)
+
+PROJECT_ID = 'eng-reactor-287421'
+DATASET_NAME = 'yield_curves_v2'
+
+SP_ETF_DAILY_DATASET = 'ETF_daily_alphavantage'
+SP_ETF_HOURLY_DATASET = 'ETF_hourly_alphavantage'
+SP_INDEX_DATASET = 'spBondIndex'
+SP_MATURITY_DATASET = 'spBondIndexMaturities'
+
+# define the best subset of funds for each index; selected using a separate notebook {to add reference}
+BEST_FUNDS = {'sp_12_22_year_national_amt_free_index': ['FMHI', 'MUB'],
+              'sp_15plus_year_national_amt_free_index': ['FMHI', 'MLN', 'MUB', 'TFI', 'SUB', 'SHYD', 'HYMB', 'HYD'],
+              'sp_7_12_year_national_amt_free_index': ['TFI', 'PZA', 'ITM', 'MLN'],
+              'sp_high_quality_index': ['PZA', 'TFI', 'ITM'],
+              'sp_high_quality_intermediate_managed_amt_free_index': ['TFI', 'PZA', 'ITM', 'MLN'],
+              'sp_high_quality_short_intermediate_index': ['PZA', 'TFI', 'ITM'],
+              'sp_high_quality_short_index': ['PZA', 'HYMB', 'HYD', 'MLN', 'ITM', 'TFI', 'SHYD', 'SHM']}
+DAILY_ETF_WEIGHTS_TABLES = list(BEST_FUNDS.keys())
+
+SP_INDEX_TABLES = ['sp_12_22_year_national_amt_free_index',
+                   'sp_15plus_year_national_amt_free_index',
+                   'sp_7_12_year_national_amt_free_municipal_bond_index_yield',
+                   'sp_muni_high_quality_index_yield',
+                   'sp_high_quality_intermediate_managed_amt_free_municipal_bond_index_yield',
+                   'sp_high_quality_short_intermediate_municipal_bond_index_yield',
+                   'sp_high_quality_short_municipal_bond_index_yield']
+
+SP_INDEX_TABLE_TO_DAILY_ETF_WEIGHTS_TABLE = dict(zip(SP_INDEX_TABLES, DAILY_ETF_WEIGHTS_TABLES))
+
+ETFs = list(set([etf for etfs in BEST_FUNDS.values() for etf in etfs]))
+
+# model hyperparameters
+WINDOW_SIZE = 45    # currently unused
+ALPHA = 0.001
+
+class USHolidayCalendarWithGoodFriday(USFederalHolidayCalendar):
+    rules = USFederalHolidayCalendar.rules + [GoodFriday]
+BUSINESS_DAY = CustomBusinessDay(calendar=USHolidayCalendarWithGoodFriday())    # used to skip over holidays when adding or subtracting business days

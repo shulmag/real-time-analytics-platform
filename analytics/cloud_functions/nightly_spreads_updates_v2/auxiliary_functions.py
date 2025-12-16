@@ -1,0 +1,10 @@
+'''
+'''
+
+from google.cloud import secretmanager
+
+def access_secret_version(secret_id: str, project_id: str = 'eng-reactor-287421', version_id='latest'):
+    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'
+    response = secretmanager.SecretManagerServiceClient().access_secret_version(request={'name': name})
+    payload = response.payload.data.decode('UTF-8')
+    return payload

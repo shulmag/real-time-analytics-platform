@@ -1,0 +1,51 @@
+'''
+Author: Developer Ray
+Date: 2023-04-13
+Last Editor: Developer Ray
+Last Edit Date: 2023-01-03
+'''
+DIRECTORY = '/tmp'
+
+USERNAME = 'cf_test@ficc.ai'
+PASSWORD = 'Luiy7864W1%'
+
+QUANTITY = 500    # in thousands
+TRADE_TYPE = 'S'    # default trade type is customer buy
+
+# Upper and lower bounds for what the user may enter for the quantity; NOTE: this is WET and needs to match those in `modules.finance`
+QUANTITY_LOWER_BOUND = 5    # in thousands
+QUANTITY_UPPER_BOUND = 10000    # in thousands
+
+LOGGING_PRECISION = 5
+
+# the below variables are WET and should be identical to those in `modules.finance`
+FEATURES_FOR_OUTPUT_CSV = ['cusip', 'quantity', 'trade_type', 'ytw', 'price', 'yield_to_worst_date', 'coupon', 'security_description', 'maturity_date']
+NUMERICAL_ERROR = -1
+CUSIP_ERROR_MESSAGE = {'invalid': 'CUSIP is invalid', 
+                       'not_found': 'CUSIP not supported', 
+                       'not_outstanding': 'CUSIP is no longer outstanding', 
+                       'defaulted': 'CUSIP has defaulted', 
+                       'maturing_soon': 'CUSIP is maturing very soon or has already matured', 
+                       'not_bonds': 'CUSIP is not supported because we do not support Anticipation Notes, Certificates of Obligation, Warrants, or Commercial Paper', 
+                       'insufficient_data': 'One or more of the following dates necessary to compute yield has not been reported for this CUSIP: dated date, interest payment/coupon date, maturity date, coupon (interest) rate', 
+                       'negative_yield_in_history': 'MSRB reported yields for this CUSIP are missing or negative. Support for this CUSIP is coming soon!', 
+                       'irregular_coupon_rate': 'This CUSIP has an irregular/variable coupon rate or interest payment frequency. Support for this CUSIP is coming soon!', 
+                       'high_yield_in_history': 'MSRB reported yields for this CUSIP are abnormally high (greater than 10%). Email us at myles@ficc.ai if you would like to see this CUSIP supported!', 
+                       'null_dollar_price_in_history': 'MSRB reported prices are missing for this CUSIP. Support for this CUSIP is coming soon!', 
+                       'bank_loan': 'Private placements and bank loans not yet supported. Support for this CUSIP is coming soon!', 
+                       'under_review': 'This CUSIP is under review. Support for this CUSIP is coming soon!', 
+                       'quantity_greater_than_outstanding_amount': lambda outstanding_amount: f'The quantity attempting to be priced is larger than the amount outstanding of ${"{:,}".format(int(outstanding_amount))} for this CUSIP'}    # '{:,}.format(...) is used to add commas to the number: https://stackoverflow.com/questions/5180365/add-commas-into-number-string
+DOLLAR_PRICE_MODEL_DISPLAY_TEXT = {'missing_or_negative_yields': 'We do not provide an evaluated yield since previous MSRB reported yields for this CUSIP are missing or negative.', 
+                                   'adjustable_rate_coupon': 'For adjustable rate coupon, we do not yet display yield. Yield to conversion date coming soon!', 
+                                   'pac_bond': 'We are developing an option to display yield to average life for Planned Amortization Class (PAC) bonds.'}    # must have the same key and second item in value as `dollarPriceModelDisplayText` in `src/components/pricing.jsx`
+
+LOGGED_OUT_MESSAGE = 'You have been logged out due to a period of inactivity. Refresh the page!'    # must be identical to `loggedOutMessage` in `src/components/pricing.jsx`
+
+REQUEST_URL = 'https://server-3ukzrmokpq-uc.a.run.app'
+
+
+class LoggedOutError(Exception):
+    '''Raised when a test fails because the user was logged out. The error message displayed is 
+    'You have been logged out due to a period of inactivity. Refresh the page!'.'''
+    def __init__(self):
+        super().__init__(LOGGED_OUT_MESSAGE)

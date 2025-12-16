@@ -1,0 +1,102 @@
+@use '../lib' as *;
+
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  background: color('surface.primary.2');
+  color: color('text');
+  -ms-text-size-adjust: 100%;
+  -moz-text-size-adjust: 100%;  
+  -webkit-text-size-adjust: 100%; 
+  text-size-adjust: 100%;
+  touch-action: manipulation;
+  -webkit-overflow-scrolling: touch;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  -ms-overflow-style: -ms-autohiding-scrollbar;
+}
+
+input,
+select,
+button,
+textarea {
+  font: inherit;
+}
+
+details,
+video,
+img,
+object,
+svg,
+iframe,
+embed,
+picture {
+  display: block;
+}
+
+img,
+svg,
+object {
+  font-size: 0;
+}
+
+a {
+  font-weight: 700;
+  color: inherit;
+  white-space: nowrap;
+}
+
+table {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+select,
+button,
+input,
+[role=button] {
+  box-sizing: content-box;
+  font: inherit;
+  cursor: pointer;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  line-height: 1.2;
+  text-rendering: geometricPrecision;
+}
+
+p {
+  letter-spacing: 0.05ch;
+  line-height: 1.6;
+  -ms-hyphens: none;
+  -moz-hyphens: none;
+  -webkit-hyphens: none;
+  hyphens: none;
+}
+
+picture,
+img,
+svg {
+  inline-size: 100%;
+}
+
+h2 {
+  font-size: 2.2rem;
+}
+
+h3 {
+  font-size: 2rem;
+}
+
+

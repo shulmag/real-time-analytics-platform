@@ -1,0 +1,73 @@
+'''
+Description: Transfer data from the old reference data redis to the new reference data redis. The old reference data redis 
+             had the data stored as a dataframe, and this one will have the data stored as a numpy array. Monitoring the 
+             memory usage on the VM when this procedure is run, the procedure uses 1.5 GB of RAM, so no need to use a very 
+             powerful machine when running this script. In the last run, there were 1.5M total CUSIPs that were transfered 
+             and the entire process took 35 mins.
+
+             Use `python -u transfer_old_reference_data_to_new_redis.py >> output.txt` to print output into a file.
+             Use `nohup python -u transfer_old_reference_data_to_new_redis.py >> output.txt 2>&1 &` to run the above procedure in the background (can close the connection to the VM).
+'''
+import os
+import sys
+
+from collections import deque
+import time
+from datetime import timedelta
+
+import pickle
+import redis
+
+import pandas as pd
+
+
+reference_data_redis_update_v2_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))    # get the directory containing the 'cloud_functions/reference_data_redis_v2' package
+sys.path.append(reference_data_redis_update_v2_dir)    # add the directory to sys.path
+
+
+from main import REFERENCE_DATA_FEATURES, REFERENCE_DATA_REDIS_CLIENT
+
+
+OLD_REFERENCE_DATA_REDIS_CLIENT = redis.Redis(host='10.54.87.4', port=6379, db=0)    # using the read endpoint to not accidentally corrupt the redis by attempting to write to it
+
+BATCH_SIZE = 1000    # larger batch size means faster cumulative transfer since there are fewer round trips to the redis, but requires more memory
+
+
+def keep_features_and_convert_to_numpy_array(reference_data: pd.Series):
+    reference_data_as_numpy_array = reference_data[REFERENCE_DATA_FEATURES].to_numpy()
+    reference_data_deque = deque([reference_data_as_numpy_array])
+    return reference_data_deque    # unused return value that can be used for debugging
+
+
+def transfer_old_reference_data_to_new_redis(old_reference_data_redis_client=OLD_REFERENCE_DATA_REDIS_CLIENT, 
+                                             new_reference_data_redis_client=REFERENCE_DATA_REDIS_CLIENT, 
+                                             function_to_apply_to_each_value: callable = None, 
+                                             verbose: bool = True) -> None:
+    num_keys_in_old_redis = old_reference_data_redis_client.dbsize()
+    if verbose: print(f'Number of keys in old redis to be transferred: {num_keys_in_old_redis}')
+    # new_reference_data_redis_client.flushdb()    # clear the new reference data redis to make sure that we are starting from scratch
+
+    cursor = 0
+    total_keys_transferred = 0
+
+    start_time = time.time()
+    while True:
+        cursor, keys = old_reference_data_redis_client.scan(cursor=cursor, match='*', count=BATCH_SIZE)
+        num_keys = len(keys)
+
+        if keys:
+            values = old_reference_data_redis_client.mget(keys)    # use .mget to get all values for the batch of keys
+            if function_to_apply_to_each_value is not None: values = [pickle.dumps(function_to_apply_to_each_value(pickle.loads(value))) for value in values]
+            new_reference_data_redis_client.mset({key: value for key, value in zip(keys, values)})    # `.mset(...)` fails if any of the values are `None`, but we assume that none of the value are `None` and if so, desire to fail
+
+        total_keys_transferred += num_keys
+        if verbose: print(f'Transferring {num_keys} keys in this batch. {total_keys_transferred} keys transferred so far in {timedelta(seconds=time.time() - start_time)}')
+        
+        if cursor == 0:
+            break
+
+    if verbose: print(f'Data transfer complete. Execution time: {timedelta(seconds=time.time() - start_time)}')
+
+
+if __name__ == '__main__':
+    transfer_old_reference_data_to_new_redis(function_to_apply_to_each_value=keep_features_and_convert_to_numpy_array)

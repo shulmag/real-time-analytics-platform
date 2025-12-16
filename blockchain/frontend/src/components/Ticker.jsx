@@ -1,0 +1,137 @@
+/*
+Description: Animated Ticker with Price Changes
+*/
+
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+import { API_BASE_URL } from "../App";
+import "./Ticker.css";
+
+function Ticker({ updateInterval = 600000 }) {
+  const [tickerData, setTickerData] = useState([]);
+  const [previousPrices, setPreviousPrices] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const fetchTickerData = async () => {
+      try {
+        setLoading(true);
+        const response = await axios.get(`${API_BASE_URL}/ticker`);
+        
+        if (response.data?.status === 'success' && Array.isArray(response.data?.ticker)) {
+          // Store current prices for comparison
+          const prevPrices = {};
+          response.data.ticker.forEach((item) => {
+            if (item.price != null) {
+              prevPrices[item.cusip] = item.price;
+            }
+          });
+
+          setPreviousPrices(prev => ({ ...prev, ...prevPrices }));
+          setTickerData(response.data.ticker);
+          setError(null);
+        } else {
+          console.warn('Invalid ticker data:', response.data);
+          setError('Invalid ticker data received');
+        }
+      } catch (err) {
+        console.error("Error fetching ticker data:", err);
+        setError(err.response?.data?.error || 'Failed to fetch ticker data');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchTickerData();
+    const interval = setInterval(fetchTickerData, updateInterval);
+    return () => clearInterval(interval);
+  }, [updateInterval]);
+
+  if (loading && tickerData.length === 0) {
+    return (
+      <div className="text-center my-4">
+        <div className="spinner-border text-primary" role="status">
+          <span className="visually-hidden">Loading...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="alert alert-danger m-3" role="alert">
+        {error}
+      </div>
+    );
+  }
+
+  const renderTickerItem = (item, isDuplicate = false) => {
+    const prevPrice = previousPrices[item.cusip];
+    const currentPrice = item.price;
+    const priceChange = currentPrice != null && prevPrice != null ? 
+                       currentPrice - prevPrice : 0;
+
+    return (
+      <div key={isDuplicate ? `${item.cusip}-dup` : item.cusip} className="ticker-item">
+        <span className="ticker-name">
+          {item.cusip} {item.name}
+        </span>
+        {' '}
+        <span className="ticker-price">
+          {typeof currentPrice === 'number' ? (
+            <>
+              ${currentPrice.toFixed(3)}
+              <span
+                className={`price-indicator ${
+                  priceChange > 0 ? "up" : priceChange < 0 ? "down" : ""
+                }`}
+              >
+                {priceChange > 0 ? "▲" : priceChange < 0 ? "▼" : ""}
+              </span>
+            </>
+          ) : (
+            'N/A'
+          )}
+        </span>
+        {' '}
+        <span className="ticker-ytw">
+          {typeof item.yieldToWorst === 'number' ? 
+            `${item.yieldToWorst.toFixed(3)}%` : 
+            'N/A'
+          }
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <div className="ticker-wrapper">
+      <div className="ticker-container">
+        <div className="ticker-content">
+          {/* Original items - filtered for valid data */}
+          {tickerData
+            .filter(item => 
+              typeof item.price === 'number' && 
+              typeof item.yieldToWorst === 'number' &&
+              !isNaN(item.price) && 
+              !isNaN(item.yieldToWorst)
+            )
+            .map(item => renderTickerItem(item))}
+          
+          {/* Duplicated items - using the same filtered data */}
+          {tickerData
+            .filter(item => 
+              typeof item.price === 'number' && 
+              typeof item.yieldToWorst === 'number' &&
+              !isNaN(item.price) && 
+              !isNaN(item.yieldToWorst)
+            )
+            .map(item => renderTickerItem(item, true))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default Ticker;

@@ -1,0 +1,144 @@
+/*
+ * @Date: 2022-11-10 
+ */
+import React from 'react'
+import Table from 'react-bootstrap/Table'
+import Container from 'react-bootstrap/Container'
+import Spinner from 'react-bootstrap/Spinner'
+
+import { useState, useEffect} from 'react'
+import { useNavigate } from 'react-router-dom'
+import { getYield } from '../services/yieldService'
+
+import { getRealtimeYieldCurve } from '../services/priceService'
+import { getAuth, onAuthStateChanged } from 'firebase/auth'
+
+import RealtimeYieldCurve from './realtimeYieldCurve'
+
+import Tab from 'react-bootstrap/Tab'
+import Tabs from 'react-bootstrap/Tabs'
+import moment from 'moment-timezone'
+import NavBarTop from './navBarTop'
+
+import FONT_SIZE from './pricing/globalVariables'
+
+
+function FiccYieldCurve(props) {
+    let dt = moment.tz('America/New_York').format('YYYY-MM-DD HH:mm')
+
+    var fbToken = ''
+    const nav = useNavigate()
+    // change currentDate back to dt.substr(0,10) as soon as the model is ready:
+    const currentDate = dt.substring(0,10)
+    const currentTime = dt.substring(11)
+
+    const [tableData, setTableData] = useState([])
+    const [curveData, setCurveData] = useState([])
+    const [loadingMessage, setLoadingMessage] = useState()
+    const [key, setKey] = useState('curve')
+    const [userEmail, setUserEmail] = useState('')
+    const [tableLoading, setTableLoading] = useState(true)
+    const [curveLoading, setCurveLoading] = useState(true)
+
+    let isTableLoading, isCurveLoading = true
+
+    function yieldTable(data) {
+        var years = Object.values(data)[0]
+        var yields = Object.values(data)[1]
+
+        var arrYield = years.filter(years => Math.abs(parseInt(years) - years) == 0).map(function(e, i) {
+                return [e, yields[i]]
+        })
+        
+        return arrYield.map((c) => (
+                    <tr>
+                        <td>{c[0]}</td>  
+                        <td>{c[1]}</td>  
+                    </tr>))
+    }
+
+    function isLoaded(){
+        if (isTableLoading === false && isCurveLoading === false) {
+            setLoadingMessage('Updated as of: ' + moment.tz('America/New_York').format('YYYY-MM-DD HH:mm'))
+        }   
+    }
+
+    function redirectToLogin() {
+        nav('/login')
+    }
+
+    async function fetchYield() {
+        //this calls the /realtimeyieldcurve endpoint for getting the TABLE
+            let response = await getRealtimeYieldCurve(fbToken, currentDate, currentTime)
+            setTableData(response)
+        }
+
+    async function fetchYieldCurve() {
+        //this calls /yield? endpoint for getting the PLOT
+            let response = await getYield(fbToken, currentDate, currentTime)
+            setCurveData(response)
+        }
+
+
+    function loadContent(){
+        if (fbToken !== '') {
+            setLoadingMessage('Loading Real Time Yield Curve')
+
+            fetchYield().then(value => {
+                setLoadingMessage('Loaded Real Time Yield Curve')
+                setTableLoading(false)
+                isTableLoading = false
+                isLoaded()
+            })
+
+            fetchYieldCurve().then(value => {
+                setLoadingMessage('Loaded Real Time Yield Curve')
+                setCurveLoading(false)
+                isCurveLoading = false
+                isLoaded()
+            })
+        }
+    }
+
+    useEffect(() => {
+        const auth = getAuth()
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                user.getIdToken(true).then((token) => {
+                    fbToken = token
+                    setUserEmail(user.email)
+                    loadContent()
+                })
+            } else {
+                redirectToLogin()
+            }
+        })
+    }, [])
+
+    return (
+        <Container fluid class='flex' className='justify-content-center' style={{ fontSize: FONT_SIZE }}>
+            <div>
+            <NavBarTop message={loadingMessage} userEmail={userEmail}/>
+                <Tabs id='controlled-tabs' activeKey={key} onSelect={(k) => setKey(k)} className='mb-3'>
+                    <Tab eventKey='curve' title='Curve'>
+                        {curveLoading ? <><Spinner animation='border' role='status'/></>:<RealtimeYieldCurve yield_data={curveData}/>}
+                    </Tab>
+                    <Tab eventKey='table' title='Table'>
+                    {tableLoading ? <><Spinner animation='border' role='status'/></>:
+                        <Table style={{width: '20%'}} striped bordered>
+                            <thead>
+                                <tr><th>Years to Maturity</th><th>Yield</th></tr>
+                            </thead>
+                            <tbody>
+                                {yieldTable(tableData)}
+                            </tbody>
+                        </Table>
+                    }
+                    </Tab>
+                </Tabs>
+            </div>
+        </Container>
+    )
+}
+
+export default (FiccYieldCurve)

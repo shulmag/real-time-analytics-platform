@@ -1,0 +1,115 @@
+'''
+Author: Gil Shulman
+Create date: 2025-01-03
+Last Editor: Developer Ray
+Last Edit Date: 2025-01-06
+'''
+import os
+import zipfile
+from datetime import datetime
+import logging as python_logging    # to not confuse with google.cloud.logging
+import tempfile
+import time
+from pytz import timezone
+
+from google.cloud import storage, logging
+
+
+EASTERN = timezone('US/Eastern')
+
+TESTING = False
+
+# Ensure the environment variable is set correctly
+# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/Users/gil/git/ficc/creds.json'
+
+if TESTING:
+    python_logging.warning = print
+else:
+    logging_client = logging.Client()
+    logging_client.setup_logging()
+
+
+def unzip_sp_municipal_bond_reference_data(data: dict, context, testing: bool = False):
+    '''Background Cloud Function to be triggered by Cloud Storage.
+    This function is triggered when a new zip file is uploaded to the bucket.
+    
+    Args:
+         data (dict): The Cloud Functions event payload.
+         context (google.cloud.functions.Context): Metadata for the event.
+         testing (bool): If True, doesn't unzip or upload; just logs.
+    '''
+    bucket_name = data['bucket']
+    zip_file_name = data['name']
+    
+    # Ignore non-zip objects
+    if not zip_file_name.lower().endswith('.zip'):
+        print(f'Skipping {zip_file_name}, not a ZIP file.')
+        return
+
+    # Initialize the GCS client
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+
+    # Get today's date components
+    today = datetime.now(EASTERN)
+    year, month, day = today.year, today.strftime('%m'), today.strftime('%d')
+    destination_dir = f'{year}/{month}/{day}/'
+    
+    zip_blob = bucket.blob(zip_file_name)    # Create a blob object for the zip file
+    temp_local_path = os.path.join(tempfile.gettempdir(), zip_file_name)    # Download the zip file to a temporary location
+    os.makedirs(os.path.dirname(temp_local_path), exist_ok=True)    # Ensure subdirectories exist if zip_file_name has slashes
+    
+    print(f'Downloading {zip_file_name} to {temp_local_path} ...')
+    zip_blob.download_to_filename(temp_local_path)
+    
+    if testing:
+        print(f'[TESTING] Would unzip {zip_file_name} to {destination_dir}, but skipping.')    # If testing, do not unzip or upload; just print what would happen
+        os.remove(temp_local_path)    # Clean up the temporary file
+        return
+
+    try:
+        # Unzip the file
+        with zipfile.ZipFile(temp_local_path, 'r') as zip_ref:
+            for file_name in zip_ref.namelist():
+                # Extract each file to a destination blob
+                destination_blob_name = f'{destination_dir}{file_name}'
+                blob = bucket.blob(destination_blob_name)
+                print(f'Unzipping {file_name} -> GCS: {destination_blob_name}')
+                with zip_ref.open(file_name) as file_obj:
+                    upload_to_gcs(blob, file_obj)
+                    print(f'Uploaded {file_name} to {destination_dir}')
+    except zipfile.BadZipFile as e:
+        python_logging.warning(f'{type(e)}: {zip_file_name} is not a valid zip file.')
+    finally:
+        os.remove(temp_local_path)    # Clean up the temporary file
+    print(f'Unzipped {zip_file_name} to {destination_dir}')
+
+
+def upload_to_gcs(blob, file_obj, timeout=300, max_retries=3):
+    '''Upload a file object to GCS with retries and timeout.'''
+    if blob.exists():
+        print(f'File {blob.name} already exists in GCS. Skipping upload.')
+        return    # If the file exists, exit the function to avoid redundant upload
+
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            blob.upload_from_file(file_obj, timeout=timeout)
+            return    # Success, exit the function
+        except Exception as e:
+            python_logging.warning(f'{type(e)}: {e}. Retrying... ({attempt + 1}/{max_retries})')
+            attempt += 1
+            time.sleep(5)    # Wait 5 seconds before retrying
+    python_logging.warning(f'Failed to upload {blob.name} after {max_retries} attempts.')
+
+
+def main(event, context):
+    '''Entry point for the cloud function. If you want to run in testing mode locally, 
+    set `TESTING=True` at the top of this file or pass it as an environment variable.'''
+    unzip_sp_municipal_bond_reference_data(event, context, testing=TESTING)
+
+
+if __name__ == '__main__':    # used for testing
+    test_event = {'bucket': 'sp_ref_data',
+                  'name': 'Muni_Standard-20250103.zip'}
+    main(test_event, 'test_context')

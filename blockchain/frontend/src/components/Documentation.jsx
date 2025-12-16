@@ -1,0 +1,66 @@
+/*
+ * @Date: 2025-03-06
+ */
+
+// src/components/Documentation.jsx
+import React from 'react';
+
+function Documentation() {
+  return (
+    <div id="documentation" className="card shadow-sm mb-4">
+      <div className="card-header bg-light">
+        <h5 className="card-title mb-0">Documentation</h5>
+      </div>
+      <div className="card-body">
+        <h6>Getting Started</h6>
+        <p>This Oracle allows you to search for and record municipal bond prices on the Stellar blockchain.</p>
+        
+        <div className="row mt-4">
+          <div className="col-md-6">
+            <div className="card h-100">
+              <div className="card-body">
+                <h6 className="card-title">
+                  <i className="bi bi-search me-2"></i>
+                  Search for Bond Prices
+                </h6>
+                <ol className="ps-3">
+                  <li>Go to the "Latest Blockchain Prices" section</li>
+                  <li>Enter a valid CUSIP in the search box</li>
+                  <li>Click "Search Blockchain"</li>
+                  <li>View historical price data</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+          
+          <div className="col-md-6">
+            <div className="card h-100">
+              <div className="card-body">
+                <h6 className="card-title">
+                  <i className="bi bi-upload me-2"></i>
+                  Add a Live Price
+                </h6>
+                <ol className="ps-3">
+                  <li>Connect your Freighter wallet</li>
+                  <li>Enter CUSIP (default: 047870NE6) or use lookup</li>
+                  <li>Verify quantity (in thousands, multiples of 5)</li>
+                  <li>Click "Get Live Price"</li>
+                  <li>Confirm transaction fee in modal</li>
+                  <li>Sign transaction in Freighter</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>  
+        
+        <h6 className="mt-4">Technical Details</h6>
+        <p>
+          This Oracle uses Soroban smart contracts on Stellar. All price data is stored on-chain,
+          with source data provided by ficc.ai's pricing API. 
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export default Documentation;

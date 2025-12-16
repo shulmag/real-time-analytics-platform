@@ -1,0 +1,1422 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### load ICE data: First part is most recent working code, second part is old code and utility functions, data verification and testing "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 232,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "import os\n",
+    "import xmltodict\n",
+    "import json\n",
+    "import time\n",
+    "import gzip\n",
+    "import shutil\n",
+    "import collections\n",
+    "import re\n",
+    "import tempfile\n",
+    "\n",
+    "from datetime import datetime\n",
+    "from google.cloud import bigquery, storage\n",
+    "from datetime import datetime,timedelta\n",
+    "from google.api_core.exceptions import BadRequest\n",
+    "from dateutil.parser import parse\n",
+    "\n",
+    "os.environ[\"GOOGLE_APPLICATION_CREDENTIALS\"] = \"/Users/Gil/git/ficc/data_loader/Cusip Global Service Importer-2fdcdfc4edba.json\"\n",
+    "\n",
+    "bq_schema = ['ice_file_date','instrument_id',\t'cusip',\t'isin',\t'security_typ',\t'apex_asset_type',\t'instrument_type',\t'primary_name',\t'delivery_date',\t'issue_price',\t'settlement_date',\t'issue_date',\t'outstanding_indicator',\t'primary_currency_code',\t'child_issue_ind',\t'federal_tax_status',\t'id',\t'entity_level',\t'type',\t'type_id',\t'text',\t'incorporated_state_code',\t'primary_name_abbreviated',\t'organization_status',\t'organization_type',\t'org_country_code',\t'country_code',\t'maturity_amount',\t'denom_increment_amount',\t'min_denom_amount',\t'accrual_date',\t'bond_form',\t'bond_insurance',\t'coupon_type',\t'current_coupon_rate',\t'daycount_basis_type',\t'debt_type',\t'default_indicator',\t'depository_type',\t'first_coupon_date',\t'interest_payment_frequency',\t'issue_amount',\t'last_period_accrues_from_date',\t'maturity_date',\t'next_coupon_payment_date',\t'orig_principal_amount',\t'original_yield',\t'outstanding_amount',\t'sale_type',\t'settlement_type',\t'principal_factor',\t'principal_factort1',\t'principal_factort2',\t'principal_factort3',\t'principal_factort4',\t'previous_coupon_payment_date',\t'bank_qualified',\t'capital_type',\t'dtcc_status',\t'first_execution_date',\t'formal_award_date',\t'issue_key',\t'issue_text',\t'maturity_description_code',\t'muni_security_type',\t'other_enhancement_type',\t'sale_date',\t'series_name',\t'state_tax_status',\t'use_of_proceeds',\t'asset_claim_code',\t'purpose_class',\t'purpose_sub_class',\t'num',\t'call_notice',\t'call_timing',\t'call_timing_in_part',\t'extraordinary_make_whole_call',\t'extraordinary_redemption',\t'make_whole_call',\t'mandatory_redemption_code',\t'next_call_date',\t'next_call_price',\t'optional_redemption_code',\t'par_call_date',\t'par_call_price',\t'date',\t'amount_outstanding',\t'amount_outstanding_decimal']\n",
+    "dict_data_type = {'ice_file_date':'timestamp','instrument_id':'integer',\t'cusip':'string',\t'isin':'string',\t'security_typ':'string',\t'apex_asset_type':'integer',\t'instrument_type':'integer',\t'primary_name':'string',\t'delivery_date':'date',\t'issue_price':'numeric',\t'settlement_date':'date',\t'issue_date':'date',\t'outstanding_indicator':'boolean',\t'primary_currency_code':'string',\t'child_issue_ind':'boolean',\t'federal_tax_status':'integer',\t'id':'integer',\t'entity_level':'string',\t'type':'string',\t'type_id':'integer',\t'text':'string',\t'incorporated_state_code':'string',\t'primary_name_abbreviated':'string',\t'organization_status':'integer',\t'organization_type':'integer',\t'org_country_code':'string',\t'country_code':'string',\t'maturity_amount':'numeric',\t'denom_increment_amount':'numeric',\t'min_denom_amount':'numeric',\t'accrual_date':'date',\t'bond_form':'integer',\t'bond_insurance':'string',\t'coupon_type':'integer',\t'current_coupon_rate':'numeric',\t'daycount_basis_type':'integer',\t'debt_type':'integer',\t'default_indicator':'boolean',\t'depository_type':'integer',\t'first_coupon_date':'date',\t'interest_payment_frequency':'integer',\t'issue_amount':'numeric',\t'last_period_accrues_from_date':'date',\t'maturity_date':'date',\t'next_coupon_payment_date':'date',\t'orig_principal_amount':'numeric',\t'original_yield':'numeric',\t'outstanding_amount':'numeric',\t'sale_type':'integer',\t'settlement_type':'integer',\t'principal_factor':'numeric',\t'principal_factort1':'numeric',\t'principal_factort2':'numeric',\t'principal_factort3':'numeric',\t'principal_factort4':'numeric',\t'previous_coupon_payment_date':'date',\t'bank_qualified':'boolean',\t'capital_type':'integer',\t'dtcc_status':'integer',\t'first_execution_date':'timestamp',\t'formal_award_date':'timestamp',\t'issue_key':'integer',\t'issue_text':'string',\t'maturity_description_code':'integer',\t'muni_security_type':'integer',\t'other_enhancement_type':'integer',\t'sale_date':'timestamp',\t'series_name':'string',\t'state_tax_status':'integer',\t'use_of_proceeds':'integer',\t'asset_claim_code':'integer',\t'purpose_class':'integer',\t'purpose_sub_class':'integer',\t'num':'integer',\t'call_notice':'integer',\t'call_timing':'integer',\t'call_timing_in_part':'integer',\t'extraordinary_make_whole_call':'boolean',\t'extraordinary_redemption':'boolean',\t'make_whole_call':'boolean',\t'mandatory_redemption_code':'integer',\t'next_call_date':'date',\t'next_call_price':'numeric',\t'optional_redemption_code':'integer',\t'par_call_date':'date',\t'par_call_price':'numeric',\t'date':'date',\t'amount_outstanding':'integer',\t'amount_outstanding_decimal':'numeric'}\n",
+    "bq_client = bigquery.Client()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "file_name = 'gsm_update_muni_APFICC_GSMF10I.35.1_1.20201221T0800-05.xml.gz'\n",
+    "xmls = get_xmls_list(file_name)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 248,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_ndjson(xmls,timestamp):\n",
+    "    ndjson = ''\n",
+    "    for n in range(10000):   #(len(xmls)-1):\n",
+    "        xml_str = get_instrument_xml(n)\n",
+    "        instrument_dict = xmltodict.parse(xml_str)\n",
+    "        flat = flatten(instrument_dict)\n",
+    "        instrument = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}\n",
+    "        instrument['ice_file_date'] = timestamp\n",
+    "        ndjson+= str(data_type_casting(instrument))+'\\n'\n",
+    "    temp = tempfile.NamedTemporaryFile() \n",
+    "    temp.write(ndjson.encode())   \n",
+    "    return(temp)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 249,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 48.5 s, sys: 109 ms, total: 48.6 s\n",
+      "Wall time: 48.6 s\n"
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "temp_file = build_ndjson(xmls,get_timestamp_from_file_name(file_name))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Functions:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 250,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 368 ms, sys: 204 ms, total: 572 ms\n",
+      "Wall time: 32.4 s\n"
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "\n",
+    "bq_schema = [bigquery.SchemaField(\"ice_file_date\",\"timestamp\"),\tbigquery.SchemaField(\"instrument_id\",\"integer\"),\tbigquery.SchemaField(\"cusip\",\"string\"),\tbigquery.SchemaField(\"isin\",\"string\"),\tbigquery.SchemaField(\"security_typ\",\"string\"),\tbigquery.SchemaField(\"apex_asset_type\",\"integer\"),\tbigquery.SchemaField(\"instrument_type\",\"integer\"),\tbigquery.SchemaField(\"primary_name\",\"string\"),\tbigquery.SchemaField(\"delivery_date\",\"date\"),\tbigquery.SchemaField(\"issue_price\",\"numeric\"),\tbigquery.SchemaField(\"settlement_date\",\"date\"),\tbigquery.SchemaField(\"issue_date\",\"date\"),\tbigquery.SchemaField(\"outstanding_indicator\",\"boolean\"),\tbigquery.SchemaField(\"primary_currency_code\",\"string\"),\tbigquery.SchemaField(\"child_issue_ind\",\"boolean\"),\tbigquery.SchemaField(\"federal_tax_status\",\"integer\"),\tbigquery.SchemaField(\"id\",\"integer\"),\tbigquery.SchemaField(\"entity_level\",\"string\"),\tbigquery.SchemaField(\"type\",\"string\"),\tbigquery.SchemaField(\"type_id\",\"integer\"),\tbigquery.SchemaField(\"text\",\"string\"),\tbigquery.SchemaField(\"incorporated_state_code\",\"string\"),\tbigquery.SchemaField(\"primary_name_abbreviated\",\"string\"),\tbigquery.SchemaField(\"organization_status\",\"integer\"),\tbigquery.SchemaField(\"organization_type\",\"integer\"),\tbigquery.SchemaField(\"org_country_code\",\"string\"),\tbigquery.SchemaField(\"country_code\",\"string\"),\tbigquery.SchemaField(\"maturity_amount\",\"numeric\"),\tbigquery.SchemaField(\"denom_increment_amount\",\"numeric\"),\tbigquery.SchemaField(\"min_denom_amount\",\"numeric\"),\tbigquery.SchemaField(\"accrual_date\",\"date\"),\tbigquery.SchemaField(\"bond_form\",\"integer\"),\tbigquery.SchemaField(\"bond_insurance\",\"string\"),\tbigquery.SchemaField(\"coupon_type\",\"integer\"),\tbigquery.SchemaField(\"current_coupon_rate\",\"numeric\"),\tbigquery.SchemaField(\"daycount_basis_type\",\"integer\"),\tbigquery.SchemaField(\"debt_type\",\"integer\"),\tbigquery.SchemaField(\"default_indicator\",\"boolean\"),\tbigquery.SchemaField(\"depository_type\",\"integer\"),\tbigquery.SchemaField(\"first_coupon_date\",\"date\"),\tbigquery.SchemaField(\"interest_payment_frequency\",\"integer\"),\tbigquery.SchemaField(\"issue_amount\",\"numeric\"),\tbigquery.SchemaField(\"last_period_accrues_from_date\",\"date\"),\tbigquery.SchemaField(\"maturity_date\",\"date\"),\tbigquery.SchemaField(\"next_coupon_payment_date\",\"date\"),\tbigquery.SchemaField(\"orig_principal_amount\",\"numeric\"),\tbigquery.SchemaField(\"original_yield\",\"numeric\"),\tbigquery.SchemaField(\"outstanding_amount\",\"numeric\"),\tbigquery.SchemaField(\"sale_type\",\"integer\"),\tbigquery.SchemaField(\"settlement_type\",\"integer\"),\tbigquery.SchemaField(\"principal_factor\",\"numeric\"),\tbigquery.SchemaField(\"principal_factort1\",\"numeric\"),\tbigquery.SchemaField(\"principal_factort2\",\"numeric\"),\tbigquery.SchemaField(\"principal_factort3\",\"numeric\"),\tbigquery.SchemaField(\"principal_factort4\",\"numeric\"),\tbigquery.SchemaField(\"previous_coupon_payment_date\",\"date\"),\tbigquery.SchemaField(\"bank_qualified\",\"boolean\"),\tbigquery.SchemaField(\"capital_type\",\"integer\"),\tbigquery.SchemaField(\"dtcc_status\",\"integer\"),\tbigquery.SchemaField(\"first_execution_date\",\"timestamp\"),\tbigquery.SchemaField(\"formal_award_date\",\"timestamp\"),\tbigquery.SchemaField(\"issue_key\",\"integer\"),\tbigquery.SchemaField(\"issue_text\",\"string\"),\tbigquery.SchemaField(\"maturity_description_code\",\"integer\"),\tbigquery.SchemaField(\"muni_security_type\",\"integer\"),\tbigquery.SchemaField(\"other_enhancement_type\",\"integer\"),\tbigquery.SchemaField(\"sale_date\",\"timestamp\"),\tbigquery.SchemaField(\"series_name\",\"string\"),\tbigquery.SchemaField(\"state_tax_status\",\"integer\"),\tbigquery.SchemaField(\"use_of_proceeds\",\"integer\"),\tbigquery.SchemaField(\"asset_claim_code\",\"integer\"),\tbigquery.SchemaField(\"purpose_class\",\"integer\"),\tbigquery.SchemaField(\"purpose_sub_class\",\"integer\"),\tbigquery.SchemaField(\"num\",\"integer\"),\tbigquery.SchemaField(\"call_notice\",\"integer\"),\tbigquery.SchemaField(\"call_timing\",\"integer\"),\tbigquery.SchemaField(\"call_timing_in_part\",\"integer\"),\tbigquery.SchemaField(\"extraordinary_make_whole_call\",\"boolean\"),\tbigquery.SchemaField(\"extraordinary_redemption\",\"boolean\"),\tbigquery.SchemaField(\"make_whole_call\",\"boolean\"),\tbigquery.SchemaField(\"mandatory_redemption_code\",\"integer\"),\tbigquery.SchemaField(\"next_call_date\",\"date\"),\tbigquery.SchemaField(\"next_call_price\",\"numeric\"),\tbigquery.SchemaField(\"optional_redemption_code\",\"integer\"),\tbigquery.SchemaField(\"par_call_date\",\"date\"),\tbigquery.SchemaField(\"par_call_price\",\"numeric\"),\tbigquery.SchemaField(\"date\",\"date\"),\tbigquery.SchemaField(\"amount_outstanding\",\"integer\"),\tbigquery.SchemaField(\"amount_outstanding_decimal\",\"numeric\")]\n",
+    "\n",
+    "def load_table_uri_json(table_id,temp_file):\n",
+    "    # [START bigquery_load_table_gcs_json]\n",
+    "    from google.cloud import bigquery\n",
+    "\n",
+    "    # Construct a BigQuery client object.\n",
+    "    client = bigquery.Client()\n",
+    "\n",
+    "    # TODO(developer): Set table_id to the ID of the table to create.\n",
+    "    # table_id = \"your-project.your_dataset.your_table_name\"\n",
+    "\n",
+    "    job_config = bigquery.LoadJobConfig(\n",
+    "        schema=bq_schema,\n",
+    "        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,\n",
+    "    )\n",
+    "    uri = \"gs://cloud-samples-data/bigquery/us-states/us-states.json\"\n",
+    "    temp_file.seek(0)\n",
+    "    load_job = bq_client.load_table_from_file(temp_file, table_id, job_config=job_config)# Make an API request.\n",
+    "\n",
+    "load_table_uri_json('eng-reactor-287421.reference_data.ice_test',temp_file)    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 133,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#%%writefile ice_loader.py\n",
+    "\n",
+    "def is_date(string, fuzzy=False):\n",
+    "    \"\"\"\n",
+    "    Return whether the string can be interpreted as a date.\n",
+    "\n",
+    "    :param string: str, string to check for date\n",
+    "    :param fuzzy: bool, ignore unknown tokens in string if True\n",
+    "    \"\"\"\n",
+    "    try: \n",
+    "        parse(string, fuzzy=fuzzy)\n",
+    "        return True\n",
+    "\n",
+    "    except ValueError:\n",
+    "        return False\n",
+    "    \n",
+    "def is_float(string):\n",
+    "    try: \n",
+    "        float(string)\n",
+    "        return True\n",
+    "\n",
+    "    except ValueError:\n",
+    "        return False\n",
+    "\n",
+    "#not in use: \n",
+    "def get_next_instrument_xml():\n",
+    "    instrument_xml = ''\n",
+    "    while instrument_xml[-13:].find('</instrument>') == -1:\n",
+    "        instrument_xml += f.read(1)\n",
+    "        if instrument_xml[-10:].find('</payload>') != -1: return('EOF')\n",
+    "    if instrument_xml.find('<payload>') != -1: instrument_xml = instrument_xml.split('<payload>')[1]\n",
+    "    return(instrument_xml)\n",
+    "\n",
+    "def get_instrument_xml(i):\n",
+    "    instrument_xml = xmls[i]\n",
+    "    #if i==0: instrument_xml = instrument_xml.split('<payload>')[1]\n",
+    "    return(instrument_xml+'</instrument>')\n",
+    "\n",
+    "def flatten(d, parent_key='', sep='_'):\n",
+    "    items = []\n",
+    "    for k, v in d.items():\n",
+    "        new_key = k\n",
+    "        if isinstance(v, collections.MutableMapping):\n",
+    "            items.extend(flatten(v, new_key, sep=sep).items())\n",
+    "        elif type(v) == list:\n",
+    "            for elem in v:\n",
+    "                try:\n",
+    "                    keys = list(elem.keys())\n",
+    "                    if not is_date(elem[keys[0]], fuzzy=True) and not elem[keys[0]].isdecimal() and not is_float(elem[keys[0]]) and elem[keys[0]].find('/') == -1:\n",
+    "                        items.append((elem[keys[0]].lower(),elem[keys[len(keys)-1]]))\n",
+    "                    elif elem['@security_typ']:\n",
+    "                        items.append(('security_typ',elem['@security_typ']))    \n",
+    "                except Exception as e:\n",
+    "                    pass\n",
+    "        else:\n",
+    "            if new_key == '@id' and parent_key == 'instrument':\n",
+    "                items.append(('instrument_id',v))    \n",
+    "            elif new_key == '@id:':\n",
+    "                pass\n",
+    "            else:\n",
+    "                items.append((new_key.lower(), v))\n",
+    "    return dict(items)  \n",
+    "\n",
+    "def data_type_casting(i_dict):\n",
+    "    dict_ice_instrument = i_dict\n",
+    "    for k,v in dict_ice_instrument.items():\n",
+    "        try:\n",
+    "            if(dict_data_type[k]=='date'):\n",
+    "                if v != None:\n",
+    "                    if len(v) == 10:\n",
+    "                        dict_ice_instrument[k] = v #datetime.strptime(v, '%Y-%m-%d').strftime('%Y-%m-%d')\n",
+    "                    elif len(v) == 20:\n",
+    "                        dict_ice_instrument[k] = v\n",
+    "                    else:\n",
+    "                        dict_ice_instrument[k] = None\n",
+    "            if(dict_data_type[k] == 'numeric' or dict_data_type[k] == 'float'):\n",
+    "                if v != '' and v != None:\n",
+    "                    dict_ice_instrument[k] = float(v)\n",
+    "                else: \n",
+    "                    dict_ice_instrument[k] = None\n",
+    "            if(dict_data_type[k]=='string'):\n",
+    "                dict_ice_instrument[k] = v   \n",
+    "            if(dict_data_type[k]=='integer' and v != None):\n",
+    "                dict_ice_instrument[k] = int(v) \n",
+    "            if(dict_data_type[k]=='boolean'):\n",
+    "                dict_ice_instrument[k] = (v == 'true')\n",
+    "            if(dict_data_type[k]=='timestamp'):\n",
+    "                dict_ice_instrument[k] = time.mktime(datetime.strptime(v, '%Y-%m-%dT%H:%M:%SZ').timetuple())\n",
+    "            elif(dict_data_type[k]=='time'):\n",
+    "                if v != None:\n",
+    "                    dict_ice_instrument[k] = datetime.strftime(datetime.strptime(v,'%H%M%S'),'%H:%M:%S')\n",
+    "        except Exception:\n",
+    "            dict_ice_instrument[k] = None\n",
+    "\n",
+    "    return(dict_ice_instrument)\n",
+    "\n",
+    "def add_to_bigquery(rows_to_insert):\n",
+    "    table_id = 'eng-reactor-287421.reference_data.ice_test'\n",
+    "    bq_client.insert_rows_json(table_id, rows_to_insert)  # Make an API request.\n",
+    "    #print(errors)\n",
+    "   \n",
+    "def stream_instruments(start,number_to_stream,number_of_instruments,timestamp):\n",
+    "    rows_to_insert = []\n",
+    "    end = start+number_to_stream\n",
+    "    if end > number_of_instruments: end = number_of_instruments\n",
+    "    for n in range(start,end):\n",
+    "        xml_str = get_instrument_xml(n)\n",
+    "        instrument_dict = xmltodict.parse(xml_str)\n",
+    "        flat = flatten(instrument_dict)\n",
+    "        instrument = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}\n",
+    "        #add timestamp to instrument\n",
+    "        rows_to_insert.append(data_type_casting(instrument))\n",
+    "    #%time\n",
+    "    add_to_bigquery(rows_to_insert)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### read update files daily from ref_data_1 bucket on cloud  storage: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 176,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "['gsm_init_muni_APFICC_GSMF10I.1.1_1.20201222T1700-05.xml',\n",
+       " 'gsm_init_muni_APFICC_GSMF10I.1.1_1.20201222T1700-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.35.1_1.20201221T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.36.1_1.20201221T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.37.1_1.20201221T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.38.1_1.20201222T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.39.1_1.20201222T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.40.1_1.20201222T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.41.1_1.20201223T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.42.1_1.20201223T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.43.1_1.20201223T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.44.1_1.20201224T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.45.1_1.20201224T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.46.1_1.20201224T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.47.1_1.20201225T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.48.1_1.20201225T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.49.1_1.20201225T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.50.1_1.20201228T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.51.1_1.20201228T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.52.1_1.20201228T2000-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.53.1_1.20201229T0800-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.54.1_1.20201229T1400-05.xml.gz',\n",
+       " 'gsm_update_muni_APFICC_GSMF10I.55.1_1.20201229T2000-05.xml.gz']"
+      ]
+     },
+     "execution_count": 176,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "def get_cloud_storage_files():\n",
+    "    client = storage.Client() #storage_client\n",
+    "    bucket = client.get_bucket('ref_data_1')\n",
+    "    blobs = client.list_blobs('ref_data_1')\n",
+    "    file_list = []\n",
+    "    for blob in blobs:\n",
+    "        file_list.append(blob.name)\n",
+    "    return(file_list)\n",
+    "\n",
+    "get_cloud_storage_files()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 226,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "'2020-12-23T14:00:05Z'"
+      ]
+     },
+     "execution_count": 226,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "def get_timestamp_from_file_name(file_name):\n",
+    "    date = re.search('([0-9]{4}[0-9]{2}[0-9]{2}T[0-9]{4}-[0-9]{2})', file_name)[0]\n",
+    "    date = date.replace('-','')\n",
+    "    return(datetime.strftime(datetime.strptime(date, '%Y%m%dT%H%M%S'),'%Y-%m-%dT%H:%M:%SZ'))\n",
+    "\n",
+    "#get_timestamp_from_file_name('gsm_update_muni_APFICC_GSMF10I.42.1_1.20201223T1400-05.xml.gz')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 144,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_last_data_entry():\n",
+    "    query = \"\"\"\n",
+    "        SELECT MAX(upload_date) AS current_date\n",
+    "        FROM reference_data.ice_files_loading_track_log\n",
+    "    \"\"\"\n",
+    "    query_job = bq_client.query(query)\n",
+    "    query_job.result()\n",
+    "    destination = query_job.destination\n",
+    "    table = bq_client.get_table(destination)\n",
+    "    # Download rows:\n",
+    "    rows = bq_client.list_rows(table, max_results=1)\n",
+    "    for row in rows:\n",
+    "        return(row[\"current_date\"])\n",
+    "        break\n",
+    "        \n",
+    "def update_data_entry_log():\n",
+    "    table_id = 'eng-reactor-287421.\n",
+    "    errors = bq_client.insert_rows_json(table_id, rows_to_insert)  # Make an API request."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 78,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 7min 6s, sys: 1.09 s, total: 7min 7s\n",
+      "Wall time: 11min 7s\n"
+     ]
+    }
+   ],
+   "source": [
+    "xmls = get_xmls_list(file_name)\n",
+    "number_of_instruments = len(xmls)-1\n",
+    "#from tqdm.notebook import tqdm\n",
+    "#pbar = tqdm(total=number_of_instruments)\n",
+    "i = 0\n",
+    "number_to_stream = 4000\n",
+    "while i <= number_of_instruments:\n",
+    "    stream_instruments(i,number_to_stream,number_of_instruments)\n",
+    "    i+=number_to_stream\n",
+    "#    pbar.update(number_to_stream)\n",
+    "#pbar.close()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def main():\n",
+    "    #get_last_data_entry:\n",
+    "    last = get_last_data_entry()\n",
+    "    #get_list_of_new_files:\n",
+    "    all_files = get_cloud_storage_files()\n",
+    "    for file in all_files:\n",
+    "        date,date_obj - get_date_and_hour_from_file_name(file)\n",
+    "        if date_obj > last:\n",
+    "            push_files_to_bq (open_file, close)\n",
+    "            update_log"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 178,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_xmls_list(gz_file_name):\n",
+    "    blob = bucket.get_blob(gz_file_name) #e.g. 'gsm_update_muni_APFICC_GSMF10I.35.1_1.20201221T0800-05.xml.gz')\n",
+    "    file = blob.download_to_filename('/tmp/temp_gz_file.xml.gz')\n",
+    "\n",
+    "    f = gzip.open('/tmp/temp_gz_file.xml.gz', 'rt')\n",
+    "    file_str = f.read()\n",
+    "    clean_file = file_str.split('<payload>')[1]\n",
+    "    return (clean_file.split('</instrument>'))\n",
+    "\n",
+    "def add_xmls_bigquery(rows_to_insert):\n",
+    "    table_id = 'eng-reactor-287421.reference_data.ice_instrument_xmls'\n",
+    "    bq_client.insert_rows_json(table_id, rows_to_insert)  # Make an API request.\n",
+    "\n",
+    "def stream_xmls_str(start,number_to_stream,total_xmls,timestamp):\n",
+    "    rows_to_insert = []\n",
+    "    end = start+number_to_stream\n",
+    "    if end > total_xmls: end = total_xmls\n",
+    "    for n in range(start,end):\n",
+    "        instrument = {'ice_file_date':timestamp,'xml':xmls[i]+'</instrument>'}\n",
+    "        rows_to_insert.append(instrument) \n",
+    "    add_xmls_bigquery(rows_to_insert)    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 180,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "CPU times: user 8.53 s, sys: 2.47 s, total: 11 s\n",
+      "Wall time: 27.6 s\n"
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "file_name = 'gsm_update_muni_APFICC_GSMF10I.35.1_1.20201221T0800-05.xml.gz'\n",
+    "xmls = get_xmls_list(file_name)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 198,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def main():\n",
+    "    #def push_xml_str_to_bigquery(file_name):\n",
+    "    timestamp = get_timestamp_from_file_name(file_name)\n",
+    "    total_xmls = 1000 #len(xmls)-1\n",
+    "    from tqdm.notebook import tqdm\n",
+    "    pbar = tqdm(total=total_xmls)\n",
+    "    i = 0\n",
+    "    number_to_stream = 100\n",
+    "    while i < total_xmls:\n",
+    "        stream_xmls_str(i,number_to_stream,total_xmls,timestamp)\n",
+    "        i+=number_to_stream\n",
+    "        pbar.update(number_to_stream)\n",
+    "    pbar.close()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 199,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "1677ee945d264c6391a3df96f1865b21",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, max=1000), HTML(value='')))"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "Timer unit: 1e-06 s\n",
+      "\n",
+      "Total time: 21.4524 s\n",
+      "File: <ipython-input-178-ba44fcd58c64>\n",
+      "Function: add_xmls_bigquery at line 1\n",
+      "\n",
+      "Line #      Hits         Time  Per Hit   % Time  Line Contents\n",
+      "==============================================================\n",
+      "     1                                           def add_xmls_bigquery(rows_to_insert):\n",
+      "     2        10          2.0      0.2      0.0      table_id = 'eng-reactor-287421.reference_data.ice_instrument_xmls'\n",
+      "     3        10   21452391.0 2145239.1    100.0      bq_client.insert_rows_json(table_id, rows_to_insert)  # Make an API request.\n",
+      "\n",
+      "Total time: 21.4543 s\n",
+      "File: <ipython-input-178-ba44fcd58c64>\n",
+      "Function: stream_xmls_str at line 5\n",
+      "\n",
+      "Line #      Hits         Time  Per Hit   % Time  Line Contents\n",
+      "==============================================================\n",
+      "     5                                           def stream_xmls_str(start,number_to_stream,total_xmls,timestamp):\n",
+      "     6        10         11.0      1.1      0.0      rows_to_insert = []\n",
+      "     7        10          8.0      0.8      0.0      end = start+number_to_stream\n",
+      "     8        10          6.0      0.6      0.0      if end > total_xmls: end = total_xmls\n",
+      "     9      1010        496.0      0.5      0.0      for n in range(start,end):\n",
+      "    10      1000        733.0      0.7      0.0          instrument = {'ice_file_date':timestamp,'xml':xmls[i]}\n",
+      "    11      1000        608.0      0.6      0.0          rows_to_insert.append(instrument) \n",
+      "    12        10   21452456.0 2145245.6    100.0      add_xmls_bigquery(rows_to_insert)    \n",
+      "\n",
+      "Total time: 21.5256 s\n",
+      "File: <ipython-input-198-b5b71d33ef8a>\n",
+      "Function: main at line 1\n",
+      "\n",
+      "Line #      Hits         Time  Per Hit   % Time  Line Contents\n",
+      "==============================================================\n",
+      "     1                                           def main():\n",
+      "     2                                               #def push_xml_str_to_bigquery(file_name):\n",
+      "     3         1        145.0    145.0      0.0      timestamp = get_timestamp_from_file_name(file_name)\n",
+      "     4         1          1.0      1.0      0.0      total_xmls = 1000 #len(xmls)-1\n",
+      "     5         1          7.0      7.0      0.0      from tqdm.notebook import tqdm\n",
+      "     6         1      35222.0  35222.0      0.2      pbar = tqdm(total=total_xmls)\n",
+      "     7         1          1.0      1.0      0.0      i = 0\n",
+      "     8         1          0.0      0.0      0.0      number_to_stream = 100\n",
+      "     9        11         20.0      1.8      0.0      while i < total_xmls:\n",
+      "    10        10   21455752.0 2145575.2     99.7          stream_xmls_str(i,number_to_stream,total_xmls,timestamp)\n",
+      "    11        10         21.0      2.1      0.0          i+=number_to_stream\n",
+      "    12        10      32184.0   3218.4      0.1          pbar.update(number_to_stream)\n",
+      "    13         1       2246.0   2246.0      0.0      pbar.close()\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "from line_profiler import LineProfiler\n",
+    "lprofiler = LineProfiler()\n",
+    "lprofiler.add_function(stream_xmls_str)\n",
+    "lprofiler.add_function(add_xmls_bigquery)\n",
+    "#lprofiler.add_function(very_slow_random_generator)\n",
+    "lp_wrapper = lprofiler(main)\n",
+    "lp_wrapper()\n",
+    "lprofiler.print_stats()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Everything below is the OLD code:"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### open the init file (~9gb)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 65,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#xmls = []\n",
+    "#f = open('gsm_init_muni_APFICC_GSMF10I.1.1_1.20201222T1700-05.xml','r')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Using Cloud Storage\n",
+    "#f = open('gsm_init_muni_APFICC_GSMF10I.1.1_1.20201222T1700-05.xml','r')\n",
+    "client = storage.Client()\n",
+    "bucket = client.get_bucket('ref_data_1')\n",
+    "\n",
+    "blob = bucket.get_blob('gsm_init_muni_APFICC_GSMF10I.1.1_1.20201222T1700-05.xml')\n",
+    "\n",
+    "#for reset of testing\n",
+    "file = blob.download_to_filename('temp_file')\n",
+    "\n",
+    "f = open('temp_file','r')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 64,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#for reset of testing\n",
+    "f.close()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### if field name is date or number, drop the field (for now):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 727,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "\n",
+    "def is_date(string, fuzzy=False):\n",
+    "    \"\"\"\n",
+    "    Return whether the string can be interpreted as a date.\n",
+    "\n",
+    "    :param string: str, string to check for date\n",
+    "    :param fuzzy: bool, ignore unknown tokens in string if True\n",
+    "    \"\"\"\n",
+    "    try: \n",
+    "        parse(string, fuzzy=fuzzy)\n",
+    "        return True\n",
+    "\n",
+    "    except ValueError:\n",
+    "        return False\n",
+    "    \n",
+    "def is_float(string):\n",
+    "    try: \n",
+    "        float(string)\n",
+    "        return True\n",
+    "\n",
+    "    except ValueError:\n",
+    "        return False"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### read one instrument (byte by byte), return it as string:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_next_instrument_xml():\n",
+    "    instrument_xml = ''\n",
+    "    while instrument_xml[-13:].find('</instrument>') == -1:\n",
+    "        instrument_xml += f.read(1)\n",
+    "    if instrument_xml.find('<payload>') != -1: instrument_xml = instrument_xml.split('<payload>')[1]\n",
+    "    return(instrument_xml)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### function to flatten a deep dict object:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 729,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def flatten(d, parent_key='', sep='_'):\n",
+    "    items = []\n",
+    "    for k, v in d.items():\n",
+    "        new_key = k\n",
+    "        if isinstance(v, collections.MutableMapping):\n",
+    "            items.extend(flatten(v, new_key, sep=sep).items())\n",
+    "        elif type(v) == list:\n",
+    "            for elem in v:\n",
+    "                try:\n",
+    "                    keys = list(elem.keys())\n",
+    "                    if not is_date(elem[keys[0]], fuzzy=True) and not elem[keys[0]].isdecimal() and not is_float(elem[keys[0]]) and elem[keys[0]].find('/') == -1:\n",
+    "                        items.append((elem[keys[0]].lower(),elem[keys[len(keys)-1]]))\n",
+    "                    elif elem['@security_typ']:\n",
+    "                        items.append(('security_typ',elem['@security_typ']))    \n",
+    "                except Exception as e:\n",
+    "                    pass\n",
+    "        else:\n",
+    "            if new_key == '@id' and parent_key == 'instrument':\n",
+    "                items.append(('instrument_id',v))    \n",
+    "            elif new_key == '@id:':\n",
+    "                pass\n",
+    "            else:\n",
+    "                items.append((new_key.lower(), v))\n",
+    "    return dict(items)   "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 785,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "{\"instrument']['@id\": '65477267',\n",
+       " 'cusip': '70917SRA3',\n",
+       " 'isin': 'US70917SRA32',\n",
+       " 'security_typ': 'FIXED',\n",
+       " \"instrument']['master_information']['instrument_master']['apex_asset_type\": '3',\n",
+       " \"instrument']['master_information']['instrument_master']['instrument_type\": '3',\n",
+       " \"instrument']['master_information']['instrument_master']['primary_name\": 'REV BDS 2015',\n",
+       " \"instrument']['master_information']['instrument_master']['delivery_date\": '2015-04-15',\n",
+       " \"instrument']['master_information']['instrument_master']['issue_price\": '104.7080000',\n",
+       " \"instrument']['master_information']['instrument_master']['settlement_date\": '2015-04-15',\n",
+       " \"instrument']['master_information']['instrument_master']['issue_date\": '2015-04-15',\n",
+       " \"instrument']['master_information']['instrument_master']['outstanding_indicator\": 'true',\n",
+       " \"instrument']['master_information']['instrument_master']['primary_currency_code\": 'USD',\n",
+       " \"instrument']['master_information']['instrument_master']['primary_exchange\": 'XOTC',\n",
+       " \"instrument']['master_information']['instrument_master']['child_issue_ind\": 'false',\n",
+       " \"instrument']['master_information']['instrument_master']['eval_quotation_basis\": '2',\n",
+       " \"instrument']['master_information']['instrument_master']['federal_tax_status\": '2',\n",
+       " \"instrument']['master_information']['market_master']['market']['@id\": '223650751',\n",
+       " \"instrument']['master_information']['market_master']['market']['@primary\": 'true',\n",
+       " \"instrument']['master_information']['market_master']['market']['country_of_quotation\": 'US',\n",
+       " \"instrument']['master_information']['market_master']['market']['mic\": 'XOTC',\n",
+       " \"instrument']['master_information']['market_master']['market']['currency_code\": 'USD',\n",
+       " \"instrument']['master_information']['organization_master']['@id\": '3201287',\n",
+       " 'issuer': '70917S',\n",
+       " \"instrument']['master_information']['organization_master']['incorporated_state_code\": 'PA',\n",
+       " \"instrument']['master_information']['organization_master']['primary_name\": 'PENNSYLVANIA ST HIGHER EDL FACS AUTH REV',\n",
+       " \"instrument']['master_information']['organization_master']['primary_name_abbreviated\": 'PENNSYLVANIA ST HIGHER EDL FACS AUT',\n",
+       " \"instrument']['master_information']['organization_master']['organization_status\": '6',\n",
+       " \"instrument']['master_information']['organization_master']['organization_type\": '76',\n",
+       " \"instrument']['master_information']['organization_master']['org_country_code\": 'US',\n",
+       " \"instrument']['global_information']['country_information']['instrument_country_information']['country_code\": 'US',\n",
+       " \"instrument']['global_information']['instrument_details']['maturity_details']['maturity_amount\": '245000.0000000',\n",
+       " \"instrument']['global_information']['instrument_details']['denomination_amounts']['denom_increment_amount\": '5000',\n",
+       " \"instrument']['global_information']['instrument_details']['denomination_amounts']['min_denom_amount\": '5000.000000',\n",
+       " \"instrument']['debt']['fixed_income']['accrual_date\": '2015-04-15',\n",
+       " \"instrument']['debt']['fixed_income']['bond_form\": '3',\n",
+       " \"instrument']['debt']['fixed_income']['bond_insurance\": 'NONE',\n",
+       " \"instrument']['debt']['fixed_income']['coupon_type\": '8',\n",
+       " \"instrument']['debt']['fixed_income']['current_coupon_rate\": '3.0000000',\n",
+       " \"instrument']['debt']['fixed_income']['daycount_basis_type\": '3',\n",
+       " \"instrument']['debt']['fixed_income']['debt_type\": '3',\n",
+       " \"instrument']['debt']['fixed_income']['default_indicator\": 'false',\n",
+       " \"instrument']['debt']['fixed_income']['depository_type\": '1',\n",
+       " \"instrument']['debt']['fixed_income']['first_coupon_date\": '2015-07-01',\n",
+       " \"instrument']['debt']['fixed_income']['interest_payment_frequency\": '1',\n",
+       " \"instrument']['debt']['fixed_income']['issue_amount\": '12160000.0000000',\n",
+       " \"instrument']['debt']['fixed_income']['last_period_accrues_from_date\": '2020-07-01',\n",
+       " \"instrument']['debt']['fixed_income']['maturity_date\": '2021-01-01',\n",
+       " \"instrument']['debt']['fixed_income']['next_coupon_payment_date\": '2021-01-01',\n",
+       " \"instrument']['debt']['fixed_income']['orig_principal_amount\": '245000.0000000',\n",
+       " \"instrument']['debt']['fixed_income']['original_yield\": '2.1200000',\n",
+       " \"instrument']['debt']['fixed_income']['outstanding_amount\": '245000.0000000',\n",
+       " \"instrument']['debt']['fixed_income']['sale_type\": '2',\n",
+       " \"instrument']['debt']['fixed_income']['settlement_type\": '2',\n",
+       " \"instrument']['debt']['fixed_income']['principal_factor\": '1.00000000',\n",
+       " \"instrument']['debt']['fixed_income']['principal_factort1\": '1.00000000',\n",
+       " \"instrument']['debt']['fixed_income']['principal_factort2\": '1.00000000',\n",
+       " \"instrument']['debt']['fixed_income']['principal_factort3\": '1.00000000',\n",
+       " \"instrument']['debt']['fixed_income']['principal_factort4\": '1.00000000',\n",
+       " \"instrument']['debt']['fixed_income']['previous_coupon_payment_date\": '2020-07-01',\n",
+       " \"instrument']['debt']['muni_details']['bank_qualified\": 'false',\n",
+       " \"instrument']['debt']['muni_details']['capital_type\": '2',\n",
+       " \"instrument']['debt']['muni_details']['conduit_obligor_name\": 'URSINUS COLLEGE',\n",
+       " \"instrument']['debt']['muni_details']['dtcc_status\": '4',\n",
+       " \"instrument']['debt']['muni_details']['first_execution_date\": '2015-04-02T17:30:00Z',\n",
+       " \"instrument']['debt']['muni_details']['formal_award_date\": '2015-04-01T21:00:00Z',\n",
+       " \"instrument']['debt']['muni_details']['issue_key\": '1014679',\n",
+       " \"instrument']['debt']['muni_details']['issue_text\": 'REV BDS',\n",
+       " \"instrument']['debt']['muni_details']['maturity_description_code\": '2',\n",
+       " \"instrument']['debt']['muni_details']['muni_security_type\": '8',\n",
+       " \"instrument']['debt']['muni_details']['sale_date\": '2015-04-01',\n",
+       " \"instrument']['debt']['muni_details']['series_name\": '2015',\n",
+       " \"instrument']['debt']['muni_details']['state_tax_status\": '1',\n",
+       " \"instrument']['debt']['muni_details']['use_of_proceeds\": '13',\n",
+       " \"instrument']['debt']['muni_details']['purpose_class\": '9',\n",
+       " \"instrument']['debt']['muni_details']['purpose_sub_class\": '82',\n",
+       " \"instrument']['debt']['sink_details']['mandatory_sink_amount_type']['@type\": 'No sinking fund',\n",
+       " \"instrument']['debt']['sink_details']['mandatory_sink_amount_type']['#text\": '3',\n",
+       " \"instrument']['debt']['amount_outstanding_history']['change']['@date\": '2015-04-15',\n",
+       " \"instrument']['debt']['amount_outstanding_history']['change']['amount_outstanding\": '245000',\n",
+       " \"instrument']['debt']['amount_outstanding_history']['change']['amount_outstanding_decimal\": '245000'}"
+      ]
+     },
+     "execution_count": 785,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "#DELETE: \n",
+    "def vars_to_read(d, parent_key='', sep=\"']['\"):\n",
+    "    items = []\n",
+    "    for k, v in d.items():\n",
+    "        new_key = parent_key + sep + k if parent_key else k\n",
+    "        if isinstance(v, collections.MutableMapping):\n",
+    "            items.extend(vars_to_read(v, new_key, sep=sep).items())\n",
+    "        elif type(v) == list:\n",
+    "            for elem in v:\n",
+    "                try:\n",
+    "                    keys = list(elem.keys())\n",
+    "                    if not is_date(elem[keys[0]], fuzzy=True) and not elem[keys[0]].isdecimal() and not is_float(elem[keys[0]]) and elem[keys[0]].find('/') == -1:\n",
+    "                        items.append((elem[keys[0]].lower(),elem[keys[len(keys)-1]]))\n",
+    "                    elif elem['@security_typ']:\n",
+    "                        items.append(('security_typ',elem['@security_typ']))    \n",
+    "                except Exception as e:\n",
+    "                    pass\n",
+    "        else:\n",
+    "            if new_key == '@id' and parent_key == 'instrument':\n",
+    "                items.append(('instrument_id',v))    \n",
+    "            elif new_key == '@id:':\n",
+    "                pass\n",
+    "            else:\n",
+    "                items.append((new_key.lower(), v))\n",
+    "    return dict(items)   \n",
+    "\n",
+    "vars_to_read(instrument_dict)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### make a temp schema from the the fields in the XML, creating a union between x number of instruments:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 624,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "schema = set()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 625,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "135\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "{'#text',\n",
+       " '@code',\n",
+       " '@date',\n",
+       " '@entity_level',\n",
+       " '@id',\n",
+       " '@num',\n",
+       " '@organization',\n",
+       " '@primary',\n",
+       " '@status',\n",
+       " '@type',\n",
+       " '@type_id',\n",
+       " 'accrual_date',\n",
+       " 'additional_project_txt',\n",
+       " 'amount_outstanding',\n",
+       " 'amount_outstanding_decimal',\n",
+       " 'apex_asset_type',\n",
+       " 'asset_claim_code',\n",
+       " 'backed_underlying_security_id',\n",
+       " 'bank_qualified',\n",
+       " 'bond_form',\n",
+       " 'bond_insurance',\n",
+       " 'call_cav',\n",
+       " 'call_notice',\n",
+       " 'call_timing',\n",
+       " 'call_timing_in_part',\n",
+       " 'called_redemption_type',\n",
+       " 'capital_type',\n",
+       " 'child_issue_ind',\n",
+       " 'country_code',\n",
+       " 'country_of_quotation',\n",
+       " 'coupon_type',\n",
+       " 'currency_code',\n",
+       " 'current_coupon_rate',\n",
+       " 'cusip',\n",
+       " 'daycount_basis_type',\n",
+       " 'debt_type',\n",
+       " 'default_indicator',\n",
+       " 'delivery_date',\n",
+       " 'denom_increment_amount',\n",
+       " 'depository_type',\n",
+       " 'dtcc_status',\n",
+       " 'escrow_obligation_agent',\n",
+       " 'escrow_obligation_type',\n",
+       " 'eval_quotation_basis',\n",
+       " 'extraordinary_make_whole_call',\n",
+       " 'extraordinary_redemption',\n",
+       " 'federal_tax_status',\n",
+       " 'first_coupon_date',\n",
+       " 'first_execution_date',\n",
+       " 'formal_award_date',\n",
+       " 'incorporated_state_code',\n",
+       " 'instrument_id',\n",
+       " 'instrument_type',\n",
+       " 'interest_payment_day',\n",
+       " 'interest_payment_frequency',\n",
+       " 'isin',\n",
+       " 'issue_amount',\n",
+       " 'issue_date',\n",
+       " 'issue_key',\n",
+       " 'issue_price',\n",
+       " 'issue_text',\n",
+       " 'issuer',\n",
+       " 'last_period_accrues_from_date',\n",
+       " 'loc_bank',\n",
+       " 'loc_expiration_date',\n",
+       " 'loc_type',\n",
+       " 'make_whole_benchmark',\n",
+       " 'make_whole_call',\n",
+       " 'make_whole_call_end_date',\n",
+       " 'make_whole_call_spread',\n",
+       " 'mandatory_redemption_code',\n",
+       " 'maturity_amount',\n",
+       " 'maturity_date',\n",
+       " 'maturity_description_code',\n",
+       " 'maximum_call_notice_period',\n",
+       " 'mic',\n",
+       " 'min_denom_amount',\n",
+       " 'min_notification_days',\n",
+       " 'mtg_insurance',\n",
+       " 'muni_issue_type',\n",
+       " 'muni_security_type',\n",
+       " 'next_call_date',\n",
+       " 'next_call_price',\n",
+       " 'next_coupon_payment_date',\n",
+       " 'next_put_date',\n",
+       " 'next_sink_date',\n",
+       " 'next_tender_date',\n",
+       " 'optional_redemption_code',\n",
+       " 'org_country_code',\n",
+       " 'organization_status',\n",
+       " 'organization_type',\n",
+       " 'orig_instrument_enhancement_type',\n",
+       " 'orig_principal_amount',\n",
+       " 'original_yield',\n",
+       " 'other_accrual_date',\n",
+       " 'other_enhancement_type',\n",
+       " 'outstanding_amount',\n",
+       " 'outstanding_indicator',\n",
+       " 'par_call_date',\n",
+       " 'par_call_price',\n",
+       " 'previous_coupon_payment_date',\n",
+       " 'primary_currency_code',\n",
+       " 'primary_exchange',\n",
+       " 'primary_name',\n",
+       " 'primary_name_abbreviated',\n",
+       " 'principal_factor',\n",
+       " 'principal_factort1',\n",
+       " 'principal_factort2',\n",
+       " 'principal_factort3',\n",
+       " 'principal_factort4',\n",
+       " 'project_name',\n",
+       " 'purpose_class',\n",
+       " 'purpose_sub_class',\n",
+       " 'put_end_date',\n",
+       " 'put_feature_price',\n",
+       " 'put_frequency',\n",
+       " 'put_start_date',\n",
+       " 'refund_date',\n",
+       " 'refund_price',\n",
+       " 'refunding_dated_date',\n",
+       " 'refunding_issue_key',\n",
+       " 'sale_date',\n",
+       " 'sale_type',\n",
+       " 'security_typ',\n",
+       " 'series_name',\n",
+       " 'settlement_date',\n",
+       " 'settlement_type',\n",
+       " 'sink_frequency',\n",
+       " 'sink_fund_redemption_method',\n",
+       " 'state_tax_status',\n",
+       " 'tender_frequency',\n",
+       " 'tender_price',\n",
+       " 'tender_start_date',\n",
+       " 'tender_type',\n",
+       " 'use_of_proceeds'}"
+      ]
+     },
+     "execution_count": 625,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "for i in range(50):\n",
+    "    xml_str = get_next_instrument_xml()\n",
+    "    instrument_dict = xmltodict.parse(xml_str)\n",
+    "    flat = flatten(instrument_dict)\n",
+    "    #print(flat)\n",
+    "    schema = schema.union(set(flat.keys()))\n",
+    "\n",
+    "#Code to convert dict to json:     \n",
+    "    #str_instrument_json = json.dumps(instrument_dict,indent=3)\n",
+    "    #instrument_json = json.loads(str_instrument_json)p\n",
+    "print(len(schema))\n",
+    "schema"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    " ### sample code to get a single instrument xml, convert to dict, and flatten. Feel free to print out at the different steps along the way: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 784,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "xml_str = get_next_instrument_xml()\n",
+    "instrument_dict = xmltodict.parse(xml_str)\n",
+    "flat = flatten(instrument_dict)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 781,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "'5.0000000'"
+      ]
+     },
+     "execution_count": 781,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "instrument_dict['instrument']['master_information']['instrument_xref']['xref'][2]['@security_typ']\n",
+    "instrument_dict['instrument']['debt']['fixed_income']['current_coupon_rate']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 635,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "single = [k for k in flat.keys()]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Big query schema & type cast dict: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 730,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "bq_schema = ['instrument_id',\t'cusip',\t'isin',\t'security_typ',\t'apex_asset_type',\t'instrument_type',\t'primary_name',\t'delivery_date',\t'issue_price',\t'settlement_date',\t'issue_date',\t'outstanding_indicator',\t'primary_currency_code',\t'child_issue_ind',\t'federal_tax_status',\t'id',\t'entity_level',\t'type',\t'type_id',\t'text',\t'incorporated_state_code',\t'primary_name_abbreviated',\t'organization_status',\t'organization_type',\t'org_country_code',\t'country_code',\t'maturity_amount',\t'denom_increment_amount',\t'min_denom_amount',\t'accrual_date',\t'bond_form',\t'bond_insurance',\t'coupon_type',\t'current_coupon_rate',\t'daycount_basis_type',\t'debt_type',\t'default_indicator',\t'depository_type',\t'first_coupon_date',\t'interest_payment_frequency',\t'issue_amount',\t'last_period_accrues_from_date',\t'maturity_date',\t'next_coupon_payment_date',\t'orig_principal_amount',\t'original_yield',\t'outstanding_amount',\t'sale_type',\t'settlement_type',\t'principal_factor',\t'principal_factort1',\t'principal_factort2',\t'principal_factort3',\t'principal_factort4',\t'previous_coupon_payment_date',\t'bank_qualified',\t'capital_type',\t'dtcc_status',\t'first_execution_date',\t'formal_award_date',\t'issue_key',\t'issue_text',\t'maturity_description_code',\t'muni_security_type',\t'other_enhancement_type',\t'sale_date',\t'series_name',\t'state_tax_status',\t'use_of_proceeds',\t'asset_claim_code',\t'purpose_class',\t'purpose_sub_class',\t'num',\t'call_notice',\t'call_timing',\t'call_timing_in_part',\t'extraordinary_make_whole_call',\t'extraordinary_redemption',\t'make_whole_call',\t'mandatory_redemption_code',\t'next_call_date',\t'next_call_price',\t'optional_redemption_code',\t'par_call_date',\t'par_call_price',\t'date',\t'amount_outstanding',\t'amount_outstanding_decimal']\n",
+    "dict_data_type = {'instrument_id':'integer',\t'cusip':'string',\t'isin':'string',\t'security_typ':'string',\t'apex_asset_type':'integer',\t'instrument_type':'integer',\t'primary_name':'string',\t'delivery_date':'date',\t'issue_price':'numeric',\t'settlement_date':'date',\t'issue_date':'date',\t'outstanding_indicator':'boolean',\t'primary_currency_code':'string',\t'child_issue_ind':'boolean',\t'federal_tax_status':'integer',\t'id':'integer',\t'entity_level':'string',\t'type':'string',\t'type_id':'integer',\t'text':'string',\t'incorporated_state_code':'string',\t'primary_name_abbreviated':'string',\t'organization_status':'integer',\t'organization_type':'integer',\t'org_country_code':'string',\t'country_code':'string',\t'maturity_amount':'numeric',\t'denom_increment_amount':'numeric',\t'min_denom_amount':'numeric',\t'accrual_date':'date',\t'bond_form':'integer',\t'bond_insurance':'string',\t'coupon_type':'integer',\t'current_coupon_rate':'numeric',\t'daycount_basis_type':'integer',\t'debt_type':'integer',\t'default_indicator':'boolean',\t'depository_type':'integer',\t'first_coupon_date':'date',\t'interest_payment_frequency':'integer',\t'issue_amount':'numeric',\t'last_period_accrues_from_date':'date',\t'maturity_date':'date',\t'next_coupon_payment_date':'date',\t'orig_principal_amount':'numeric',\t'original_yield':'numeric',\t'outstanding_amount':'numeric',\t'sale_type':'integer',\t'settlement_type':'integer',\t'principal_factor':'numeric',\t'principal_factort1':'numeric',\t'principal_factort2':'numeric',\t'principal_factort3':'numeric',\t'principal_factort4':'numeric',\t'previous_coupon_payment_date':'date',\t'bank_qualified':'boolean',\t'capital_type':'integer',\t'dtcc_status':'integer',\t'first_execution_date':'timestamp',\t'formal_award_date':'timestamp',\t'issue_key':'integer',\t'issue_text':'string',\t'maturity_description_code':'integer',\t'muni_security_type':'integer',\t'other_enhancement_type':'integer',\t'sale_date':'timestamp',\t'series_name':'string',\t'state_tax_status':'integer',\t'use_of_proceeds':'integer',\t'asset_claim_code':'integer',\t'purpose_class':'integer',\t'purpose_sub_class':'integer',\t'num':'integer',\t'call_notice':'integer',\t'call_timing':'integer',\t'call_timing_in_part':'integer',\t'extraordinary_make_whole_call':'boolean',\t'extraordinary_redemption':'boolean',\t'make_whole_call':'boolean',\t'mandatory_redemption_code':'integer',\t'next_call_date':'date',\t'next_call_price':'numeric',\t'optional_redemption_code':'integer',\t'par_call_date':'date',\t'par_call_price':'numeric',\t'date':'date',\t'amount_outstanding':'integer',\t'amount_outstanding_decimal':'numeric'}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### sample instrument for debugging: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 709,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#instrument = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### type cast function: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 731,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def data_type_casting(i_dict):\n",
+    "    dict_ice_instrument = i_dict\n",
+    "    for k,v in dict_ice_instrument.items():\n",
+    "        try:\n",
+    "            if(dict_data_type[k]=='date'):\n",
+    "                if v != None:\n",
+    "                    if len(v) == 10:\n",
+    "                        dict_ice_instrument[k] = v #datetime.strptime(v, '%Y-%m-%d').strftime('%Y-%m-%d')\n",
+    "                    elif len(v) == 20:\n",
+    "                        dict_ice_instrument[k] = v\n",
+    "                    else:\n",
+    "                        dict_ice_instrument[k] = None\n",
+    "            if(dict_data_type[k] == 'numeric' or dict_data_type[k] == 'float'):\n",
+    "                if v != '' and v != None:\n",
+    "                    dict_ice_instrument[k] = float(v)\n",
+    "                else: \n",
+    "                    dict_ice_instrument[k] = None\n",
+    "            if(dict_data_type[k]=='string'):\n",
+    "                dict_ice_instrument[k] = v   \n",
+    "            if(dict_data_type[k]=='integer' and v != None):\n",
+    "                dict_ice_instrument[k] = int(v) \n",
+    "            if(dict_data_type[k]=='boolean'):\n",
+    "                dict_ice_instrument[k] = (v == 'true')\n",
+    "            if(dict_data_type[k]=='timestamp'):\n",
+    "                dict_ice_instrument[k] = time.mktime(datetime.strptime(v, '%Y-%m-%dT%H:%M:%SZ').timetuple())\n",
+    "            elif(dict_data_type[k]=='time'):\n",
+    "                if v != None:\n",
+    "                    dict_ice_instrument[k] = datetime.strftime(datetime.strptime(v,'%H%M%S'),'%H:%M:%S')\n",
+    "        except Exception:\n",
+    "            dict_ice_instrument[k] = None\n",
+    "\n",
+    "    return(dict_ice_instrument)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 652,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[('instrument_id', '245612919', 245612919),\n",
+       " ('cusip', '942044TC2', '942044TC2'),\n",
+       " ('isin', 'US942044TC22', 'US942044TC22'),\n",
+       " ('security_typ', 'FIXED', 'FIXED'),\n",
+       " ('apex_asset_type', '3', 3),\n",
+       " ('instrument_type', '3', 3),\n",
+       " ('primary_name', 'WATERTOWN MASS', 'WATERTOWN MASS'),\n",
+       " ('delivery_date', '2019-06-26', '2019-06-26'),\n",
+       " ('issue_price', '110.8970000', 110.897),\n",
+       " ('settlement_date', '2019-06-26', '2019-06-26'),\n",
+       " ('issue_date', '2019-06-26', '2019-06-26'),\n",
+       " ('outstanding_indicator', 'true', True),\n",
+       " ('primary_currency_code', 'USD', 'USD'),\n",
+       " ('child_issue_ind', 'false', False),\n",
+       " ('federal_tax_status', '2', 2),\n",
+       " ('id', None, None),\n",
+       " ('entity_level', None, None),\n",
+       " ('type', None, None),\n",
+       " ('type_id', None, None),\n",
+       " ('text', None, None),\n",
+       " ('incorporated_state_code', 'MA', 'MA'),\n",
+       " ('primary_name_abbreviated', 'WATERTOWN MASS', 'WATERTOWN MASS'),\n",
+       " ('organization_status', '6', 6),\n",
+       " ('organization_type', '76', 76),\n",
+       " ('org_country_code', 'US', 'US'),\n",
+       " ('country_code', 'US', 'US'),\n",
+       " ('maturity_amount', '690000.0000000', 690000.0),\n",
+       " ('denom_increment_amount', '5000', 5000.0),\n",
+       " ('min_denom_amount', '5000.000000', 5000.0),\n",
+       " ('accrual_date', '2019-06-26', '2019-06-26'),\n",
+       " ('bond_form', '3', 3),\n",
+       " ('bond_insurance', 'NONE', 'NONE'),\n",
+       " ('coupon_type', '8', 8),\n",
+       " ('current_coupon_rate', '5.0000000', 5.0),\n",
+       " ('daycount_basis_type', '3', 3),\n",
+       " ('debt_type', '3', 3),\n",
+       " ('default_indicator', 'false', False),\n",
+       " ('depository_type', '1', 1),\n",
+       " ('first_coupon_date', '2019-12-15', '2019-12-15'),\n",
+       " ('interest_payment_frequency', '1', 1),\n",
+       " ('issue_amount', '4835000.0000000', 4835000.0),\n",
+       " ('last_period_accrues_from_date', None, None),\n",
+       " ('maturity_date', '2022-06-15', '2022-06-15'),\n",
+       " ('next_coupon_payment_date', '2021-06-15', '2021-06-15'),\n",
+       " ('orig_principal_amount', '690000.0000000', 690000.0),\n",
+       " ('original_yield', '1.2500000', 1.25),\n",
+       " ('outstanding_amount', '690000.0000000', 690000.0),\n",
+       " ('sale_type', '1', 1),\n",
+       " ('settlement_type', '2', 2),\n",
+       " ('principal_factor', '1.00000000', 1.0),\n",
+       " ('principal_factort1', '1.00000000', 1.0),\n",
+       " ('principal_factort2', '1.00000000', 1.0),\n",
+       " ('principal_factort3', '1.00000000', 1.0),\n",
+       " ('principal_factort4', '1.00000000', 1.0),\n",
+       " ('previous_coupon_payment_date', '2020-12-15', '2020-12-15'),\n",
+       " ('bank_qualified', 'false', False),\n",
+       " ('capital_type', '6', 6),\n",
+       " ('dtcc_status', '4', 4),\n",
+       " ('first_execution_date', '2019-06-18T19:00:00Z', '2019-06-18T19:00:00Z'),\n",
+       " ('formal_award_date', '2019-06-18T16:30:00Z', 1560900600.0),\n",
+       " ('issue_key', '1141582', 1141582),\n",
+       " ('issue_text', 'GO MUN PURP LN BDS', 'GO MUN PURP LN BDS'),\n",
+       " ('maturity_description_code', '2', 2),\n",
+       " ('muni_security_type', '6', 6),\n",
+       " ('other_enhancement_type', None, None),\n",
+       " ('sale_date', '2019-06-18', None),\n",
+       " ('series_name', '2019', '2019'),\n",
+       " ('state_tax_status', '1', 1),\n",
+       " ('use_of_proceeds', '20', 20),\n",
+       " ('asset_claim_code', None, None),\n",
+       " ('purpose_class', '51', 51),\n",
+       " ('purpose_sub_class', None, None),\n",
+       " ('num', None, None),\n",
+       " ('call_notice', None, None),\n",
+       " ('call_timing', None, None),\n",
+       " ('call_timing_in_part', None, None),\n",
+       " ('extraordinary_make_whole_call', None, False),\n",
+       " ('extraordinary_redemption', None, False),\n",
+       " ('make_whole_call', None, False),\n",
+       " ('mandatory_redemption_code', None, None),\n",
+       " ('next_call_date', None, None),\n",
+       " ('next_call_price', None, None),\n",
+       " ('optional_redemption_code', None, None),\n",
+       " ('par_call_date', None, None),\n",
+       " ('par_call_price', None, None),\n",
+       " ('date', None, None),\n",
+       " ('amount_outstanding', '690000', 690000),\n",
+       " ('amount_outstanding_decimal', '690000', 690000.0)]"
+      ]
+     },
+     "execution_count": 652,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "#verify no data loss in type casting: \n",
+    "before = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}\n",
+    "instrument = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}\n",
+    "after = data_type_casting(instrument)\n",
+    "[(key,before[key],after[key]) for key in instrument]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### output schema, if needed: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 636,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import csv\n",
+    "with open('temp.csv', 'w', newline='') as myfile:\n",
+    "     wr = csv.writer(myfile, quoting=csv.QUOTE_ALL)\n",
+    "     wr.writerow(list(single))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### stream instrument rows to BQ: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 732,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def add_to_bigquery(rows_to_insert):\n",
+    "    bq_client = bigquery.Client()\n",
+    "    table_id = 'eng-reactor-287421.reference_data.ice_test'\n",
+    "    bq_client.insert_rows_json(table_id, rows_to_insert)  # Make an API request.\n",
+    "    #print(errors)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### for n instruments: 1) read an instrument 2) make dict 3) flatten 4) make json 5) cast types correctly 6) write to BQ: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 733,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Overwriting simulation.py\n"
+     ]
+    }
+   ],
+   "source": [
+    "def stream_instruments(number_to_stream):\n",
+    "    rows_to_insert = []\n",
+    "    n = number_to_stream\n",
+    "\n",
+    "    for i in range(n):\n",
+    "        xml_str = get_next_instrument_xml()\n",
+    "        instrument_dict = xmltodict.parse(xml_str)\n",
+    "        flat = flatten(instrument_dict)\n",
+    "        instrument = {bq_schema[i]:flat[bq_schema[i]] if bq_schema[i] in flat else None for i in range(len(bq_schema))}\n",
+    "        rows_to_insert.append(data_type_casting(instrument))\n",
+    "    #%time\n",
+    "    add_to_bigquery(rows_to_insert)\n",
+    "    return(rows_to_insert)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 716,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Collecting line_profiler\n",
+      "\u001b[?25l  Downloading https://files.pythonhosted.org/packages/49/6e/f9b68108846582a1c7ec00d4039d46371065812bcbe1dc6a065049620b0b/line_profiler-3.1.0.tar.gz (45kB)\n",
+      "\u001b[K     |████████████████████████████████| 51kB 2.9MB/s eta 0:00:011\n",
+      "\u001b[?25h  Installing build dependencies ... \u001b[?25ldone\n",
+      "\u001b[?25h  Getting requirements to build wheel ... \u001b[?25ldone\n",
+      "\u001b[?25h    Preparing wheel metadata ... \u001b[?25ldone\n",
+      "\u001b[?25hRequirement already satisfied: IPython in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from line_profiler) (7.8.0)\n",
+      "Requirement already satisfied: traitlets>=4.2 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (4.3.3)\n",
+      "Requirement already satisfied: appnope; sys_platform == \"darwin\" in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (0.1.0)\n",
+      "Requirement already satisfied: pexpect; sys_platform != \"win32\" in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (4.7.0)\n",
+      "Requirement already satisfied: decorator in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (4.4.0)\n",
+      "Requirement already satisfied: prompt-toolkit<2.1.0,>=2.0.0 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (2.0.10)\n",
+      "Requirement already satisfied: setuptools>=18.5 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (41.4.0)\n",
+      "Requirement already satisfied: backcall in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (0.1.0)\n",
+      "Requirement already satisfied: jedi>=0.10 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (0.15.1)\n",
+      "Requirement already satisfied: pygments in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (2.4.2)\n",
+      "Requirement already satisfied: pickleshare in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from IPython->line_profiler) (0.7.5)\n",
+      "Requirement already satisfied: ipython-genutils in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from traitlets>=4.2->IPython->line_profiler) (0.2.0)\n",
+      "Requirement already satisfied: six in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from traitlets>=4.2->IPython->line_profiler) (1.15.0)\n",
+      "Requirement already satisfied: ptyprocess>=0.5 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from pexpect; sys_platform != \"win32\"->IPython->line_profiler) (0.6.0)\n",
+      "Requirement already satisfied: wcwidth in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from prompt-toolkit<2.1.0,>=2.0.0->IPython->line_profiler) (0.1.7)\n",
+      "Requirement already satisfied: parso>=0.5.0 in /Users/Gil/opt/anaconda3/lib/python3.7/site-packages (from jedi>=0.10->IPython->line_profiler) (0.5.1)\n",
+      "Building wheels for collected packages: line-profiler\n",
+      "  Building wheel for line-profiler (PEP 517) ... \u001b[?25ldone\n",
+      "\u001b[?25h  Created wheel for line-profiler: filename=line_profiler-3.1.0-cp37-cp37m-macosx_10_16_x86_64.whl size=51917 sha256=1acc9cf9b3abe74aef3ba0a7a9a629b2a598252d073097066ec07eb39114fcbd\n",
+      "  Stored in directory: /Users/Gil/Library/Caches/pip/wheels/28/ba/6e/e1686fd6ca7d0b0686e8fc4a7a1e3deff192a88d653756f9aa\n",
+      "Successfully built line-profiler\n",
+      "Installing collected packages: line-profiler\n",
+      "Successfully installed line-profiler-3.1.0\n"
+     ]
+    }
+   ],
+   "source": [
+    "#!pip install line_profiler"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}

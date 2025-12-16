@@ -1,0 +1,109 @@
+'''
+Author: Developer Ray
+Date: 2025-01-13
+Last Editor: Developer Ray
+Last Edit Date: 2025-01-27
+'''
+import time
+import logging as python_logging    # to not confuse with google.cloud.logging
+from functools import wraps
+from datetime import datetime
+import pickle
+
+import pandas as pd
+import redis
+
+from google.cloud import bigquery
+
+from auxiliary_variables import TESTING, EASTERN, BUSINESS_DAY
+
+
+if TESTING:
+    python_logging.info = print
+    python_logging.warning = print
+
+
+def run_multiple_times_before_failing(error_types: tuple, max_runs: int, exponential_backoff: bool = False):
+    '''This function returns a decorator. It will run `function` over and over again until it does not 
+    raise an Exception for a maximum of `max_runs` times. If `exponential_backoff` is set to `True`, then 
+    the wait time is increased exponentially, otherwise it is a constant value.
+    NOTE: max_runs = 1 is the same functionality as not having this decorator.'''
+    def decorator(function):
+        @wraps(function)    # used to ensure that the function name is still the same after applying the decorator when running tests: https://stackoverflow.com/questions/6312167/python-unittest-cant-call-decorated-test
+        def wrapper(*args, **kwargs):    # using the same formatting from https://docs.python.org/3/library/functools.html
+            runs_so_far = 0
+            while runs_so_far < max_runs:
+                try:
+                    return function(*args, **kwargs)
+                except error_types as e:
+                    runs_so_far += 1
+                    if runs_so_far >= max_runs:
+                        python_logging.warning(f'Already caught {type(e)}: {e}, {max_runs} times in {function.__name__}, so will now raise the error')
+                        raise e
+                    python_logging.warning(f'Caught {type(e)}: {e}, and will retry {function.__name__} {max_runs - runs_so_far} more times')
+                    delay = min(2 ** (runs_so_far - 1), 10) if exponential_backoff else 1
+                    time.sleep(delay)    # have a delay to prevent overloading the server
+        return wrapper
+    return decorator
+
+
+def run_five_times_before_raising_redis_connector_error(function: callable) -> callable:
+    return run_multiple_times_before_failing((redis.exceptions.ConnectionError,), 5)(function)
+
+
+@run_five_times_before_raising_redis_connector_error
+def timestamp_exists_in_redis(timestamp: str, redis_client):
+    '''Creating this function in order to be able to decorate it so that it retries when 
+    `redis.exceptions.ConnectionError` is raised.'''
+    return redis_client.exists(timestamp)
+
+
+@run_five_times_before_raising_redis_connector_error
+def set_timestamp_in_redis(timestamp: str, redis_client, values):
+    '''Creating this function in order to be able to decorate it so that it retries when 
+    `redis.exceptions.ConnectionError` is raised.'''
+    return redis_client.set(timestamp, pickle.dumps(values, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def previous_business_day(date=None, return_as_string: bool = False):
+    if isinstance(date, str): date = datetime.strptime(date, '%Y-%m-%d').date()
+    if date is None: date = datetime.now(EASTERN).date()
+    previous_business_date = date - (BUSINESS_DAY * 1)
+    if return_as_string: previous_business_date = previous_business_date.strftime('%Y-%m-%d')
+    return previous_business_date
+
+
+def sqltodf(sql, limit=''):
+    bq_client = bigquery.Client()
+    if limit != '':
+        limit = f' LIMIT {limit}'
+    bqr = bq_client.query(sql + limit).result()
+    return bqr.to_dataframe()
+
+
+def set_date_as_index(df: pd.DataFrame, ascending: bool = True) -> pd.DataFrame:
+    '''`ascending` is a boolean that determines whether the dates in the index should be ascending or descending.'''
+    assert 'date' in df.columns, f'"date" not in columns: {sorted(df.columns)}'
+    df['date'] = pd.to_datetime(df['date'])
+    return df.sort_values(by='date', ascending=ascending).set_index('date', drop=True)
+
+
+def get_values_for_date_from_df(target_date: str, df: pd.DataFrame, name: str = '') -> pd.Series:
+    '''Get values from `df` at `target_date` if it exists, otherwise the most recent date before `target_date`.'''
+    target_date = pd.to_datetime(target_date)
+    original_target_date = target_date
+    raise_warning_because_target_date_is_unavailable = False
+    num_attempts_so_far, max_attempts = 0, 10
+    while (target_date not in df.index):
+        if num_attempts_so_far == max_attempts: raise RuntimeError(f'Could not find {original_target_date} or the {max_attempts} previous business days (ending in {target_date}) in {name}. This is an error that should be inspected.')
+        target_date = previous_business_day(target_date)
+        raise_warning_because_target_date_is_unavailable = True
+        num_attempts_so_far += 1
+    if raise_warning_because_target_date_is_unavailable: python_logging.warning(f'Expected to find {original_target_date} in {name}, but using {target_date} since this is the most recent date prior to it. This is expected behavior if {original_target_date} is a holiday.')
+    
+    occurrences_of_target_date = df.index.value_counts().get(target_date, 0)     # count the occurrences of `target_date` in the index
+    df = df.loc[target_date]
+    if occurrences_of_target_date > 1:
+        python_logging.warning(f'{target_date} appears multiple times in {name}, so choosing one of these rows arbitrarily')
+        df = df.iloc[0]    # arbitrarily choose the first one
+    return df

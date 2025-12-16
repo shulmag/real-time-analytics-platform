@@ -1,0 +1,69 @@
+'''
+'''
+DIRECTORY = '/tmp'
+
+USERNAME = 'cf_test@ficc.ai'
+PASSWORD = 'Luiy7864W1%'
+
+QUANTITY = 500    # in thousands
+TRADE_TYPE = 'S'    # default trade type is customer buy
+TRADE_TYPE_CODE_TO_TEXT = {'D': 'Inter-Dealer', 'P': 'Bid Side', 'S': 'Offered Side'}    # used to display a human-readable trade type in the output csv for batch pricing; NOTE: this is WET and needs to match the variable of the same name in the server in `modules/auxiliary_variables.py`
+
+# Upper and lower bounds for what the user may enter for the quantity; NOTE: this is WET and needs to match those in `modules.finance`
+QUANTITY_LOWER_BOUND = 5    # in thousands
+QUANTITY_UPPER_BOUND = 10000    # in thousands
+
+# directly from modules.auxiliary_variables.py
+YEAR_MONTH_DAY = '%Y-%m-%d'
+HOUR_MIN_SEC = '%H:%M:%S'
+YEAR_MONTH_DAY_HOUR_MIN_SEC = YEAR_MONTH_DAY + ' ' + HOUR_MIN_SEC
+NUM_CHARS_IN_YEAR_MONTH_DAY = 10    # 4 characters for the year, 2 characters for the month, 2 characters for the day, and two additional characters for the separators
+NUM_CHARS_IN_HOUR_MIN_SEC = 8    # 2 characters for the hour, 2 characters for the minute, 2 characters for the second, and two additional characters for the separators
+
+LOGGING_PRECISION = 5
+
+LOGGED_OUT_MESSAGE = 'You have been logged out due to a period of inactivity. Refresh the page!'    # must be identical to `loggedOutMessage` in `src/components/pricing.jsx`
+
+REQUEST_URL = 'https://api.ficc.ai'    # for testing locally, use: 'http://localhost:5000' and for testing the server as is deployed, use 'https://api.ficc.ai' or 'https://server-3ukzrmokpq-uc.a.run.app'
+# REQUEST_URL = 'http://localhost:5000'
+
+class LoggedOutError(Exception):
+    '''Raised when a test fails because the user was logged out. The error message displayed is 
+    'You have been logged out due to a period of inactivity. Refresh the page!'.'''
+    def __init__(self):
+        super().__init__(LOGGED_OUT_MESSAGE)
+
+
+# below variables are WET and should be identical to those in `modules/finance/auxiliary_variables.py`
+FEATURES_FOR_OUTPUT_CSV = ['cusip', 'quantity', 'trade_type', 'ytw', 'price', 'yield_to_worst_date', 'coupon', 'security_description', 'maturity_date', 'error_message']
+ADDITIONAL_FEATURES_FOR_COMPLIANCE_CSV = ['user_price', 'bid_ask_price_delta', 'compliance_rating', 'trade_datetime'] 
+
+# NUMERICAL_ERROR in test-demo-status-v2 is set to None instead of -1 (which is what NUMERICAL_ERROR is in the server)
+# to verify outputs from the server have the expected error value. The server code removes the -1, and replaces it with
+# None for use on the front end. The values recieved by check-demo-status have been replaced with None in the server, thus the NUMERICAL_ERROR
+# value here is None to match the actual error value recieved.
+NUMERICAL_ERROR = None
+TOLERANCE = 0.002    # used to compare yield values; should be non-zero due to time elapsed between individual pricing and batch pricing which could cause different yield curve values due to realtime yield curve
+CUSIP_ERROR_MESSAGE = {'invalid': 'CUSIP is invalid', 
+                       'invalid_user_price': 'User Price is either missing or invalid (must be a number)', 
+                       'not_found': 'CUSIP not supported', 
+                       'invalid_check_digit': 'The check digit of the input CUSIP is not a digit between 0 and 9', 
+                       'not_outstanding': 'CUSIP is no longer outstanding', 
+                       'maturing_soon': 'CUSIP is maturing very soon or has already matured', 
+                       'not_bonds': 'CUSIP is not supported because we do not support Anticipation Notes, Certificates of Obligation, Warrants, or Commercial Paper', 
+                       'insufficient_data': 'One or more of the following fields necessary to compute yield has not been reported for this CUSIP: dated date, interest payment/coupon date, maturity date, incorporated state code, coupon (interest) rate', 
+                       'negative_yield_in_history': 'MSRB reported yields for this CUSIP are missing or negative. Support for this CUSIP is coming soon!', 
+                       'irregular_coupon_rate': 'This CUSIP has an irregular/variable coupon rate or interest payment frequency. Support for this CUSIP is coming soon!', 
+                       'null_dollar_price_in_history': 'MSRB reported prices are missing for this CUSIP. Support for this CUSIP is coming soon!', 
+                       'bank_loan': 'Private placements and bank loans not yet supported. Support for this CUSIP is coming soon!', 
+                       'under_review': 'This CUSIP is under review. Support for this CUSIP is coming soon!', 
+                       'quantity_greater_than_outstanding_amount': lambda outstanding_amount: f'The quantity attempting to be priced is larger than the amount outstanding of ${"{:,}".format(int(outstanding_amount))} for this CUSIP'}    # '{:,}.format(...) is used to add commas to the number: https://stackoverflow.com/questions/5180365/add-commas-into-number-string
+DOLLAR_PRICE_MODEL_DISPLAY_TEXT = {'missing_or_negative_yields': 'We do not provide an evaluated yield since previous MSRB reported yields for this CUSIP are missing or negative.', 
+                                   'adjustable_rate_coupon': 'For adjustable rate coupon, we do not yet display yield. Yield to conversion date coming soon!', 
+                                   'maturing_soon': 'CUSIP is maturing very soon or has already matured so we only provide a dollar price.', 
+                                   'defaulted': 'CUSIP has defaulted so we only provide a dollar price.', 
+                                   'high_yield_in_history': 'MSRB reported yields for this CUSIP are abnormally high (greater than 10%), so we only provide a dollar price.'}    # must have the same key and second item in value as `dollarPriceModelDisplayText` in `src/components/pricing.jsx`
+
+X_AXIS_LABEL_FOR_YIELD_CURVE = 'x'    # FIXME: change 'x' to a more descriptive name
+Y_AXIS_LABEL_FOR_YIELD_CURVE = 'yield'
+ACCEPTABLE_DISPLAY_TYPES_FOR_YIELD_CURVE = ('plot', 'table')
